@@ -24,17 +24,20 @@ lifting in subprocesses so the same code path runs unattended.
 
 ## Quick start
 
+Requires [uv](https://docs.astral.sh/uv/) (`brew install uv`, or
+`curl -LsSf https://astral.sh/uv/install.sh | sh`) — it manages the Python
+3.13 interpreter and the `.venv` for you (pinned in `.python-version`).
+
 ```bash
-# 1. Install (Python 3.11+; the venv below uses 3.13)
+# 1. Install — creates .venv and installs every extra (ibkr, notebook, dev)
 cd stock-trading-simple
-~/.local/bin/python3.13 -m venv .venv && source .venv/bin/activate
-pip install -e ".[ibkr,notebook,dev]"
+uv sync --all-extras
 
 # 2. Register the Jupyter kernel once, then select "trading-simple" in your editor
-python -m ipykernel install --user --name trading-simple --display-name "trading-simple"
+uv run python -m ipykernel install --user --name trading-simple --display-name "trading-simple"
 
 # 3. Check the shared database is reachable (it must already be running)
-tsim coverage
+uv run tsim coverage
 
 # 4. Build a universe, then load its history
 #    (open in Jupyter/VS Code: notebooks/01_universe_screener.ipynb, then 02_backfill.ipynb)
@@ -43,8 +46,11 @@ tsim coverage
 #    open strategies/volume_momentum/volume_momentum.ipynb  →  Run All
 
 # 6. Offline sanity gates (no DB or network needed)
-pytest -q && ruff check .
+uv run pytest -q && uv run ruff check .
 ```
+
+Prefer an activated shell? `source .venv/bin/activate` after step 1, then drop
+the `uv run` prefix from every command in this README.
 
 ## Repo map
 
@@ -154,6 +160,8 @@ through exactly this recipe with a validation gate at the end.
 
 ## CLI reference
 
+Prefix any of these with `uv run` (or activate `.venv` first):
+
 ```
 tsim coverage  [--universe X] [--bar 1d]      what's stored (inventory / per symbol)
 tsim screen    --name LiquidLeaders --top 100 build + persist a universe
@@ -182,7 +190,7 @@ All output is plain parseable text; `jobs.py` is how notebooks stream it live.
 
 ## Testing & conventions
 
-* `pytest -q` — offline, synthetic data, ~5 seconds. `ruff check .` — style.
+* `uv run pytest -q` — offline, synthetic data, ~5 seconds. `uv run ruff check .` — style.
 * Google-style docstrings on every function; plotly for every figure;
   functions over classes; fewer lines wins.
 * Strategy folders own everything strategy-specific (code, config, docs,

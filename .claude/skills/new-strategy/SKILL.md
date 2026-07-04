@@ -72,8 +72,8 @@ Copy an existing strategy notebook into the new folder, rename it
 ## 7 · VALIDATION GATE (all three must pass before reporting done)
 
 ```bash
-pytest -q && ruff check .
-tsim optimize --strategy <name> --n-trials 5    # end-to-end smoke (needs the DB)
+uv run pytest -q && uv run ruff check .
+uv run tsim optimize --strategy <name> --n-trials 5    # end-to-end smoke (needs the DB)
 ```
 
 If the smoke run prunes every trial, the params/space are inconsistent with

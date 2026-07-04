@@ -13,11 +13,11 @@ existing ones.
 ## Commands
 
 ```bash
-source .venv/bin/activate            # venv is python3.13
-pytest -q                            # ~55 offline tests, ~5 s — the main gate
-ruff check .                         # style gate (line length 100)
-tsim coverage                        # checks the shared DB is reachable
-tsim optimize --strategy <name> --n-trials 5   # smoke-runs a strategy end to end
+uv sync --all-extras                 # installs deps into .venv (Python 3.13, pinned in .python-version)
+uv run pytest -q                     # ~55 offline tests, ~5 s — the main gate
+uv run ruff check .                  # style gate (line length 100)
+uv run tsim coverage                 # checks the shared DB is reachable
+uv run tsim optimize --strategy <name> --n-trials 5   # smoke-runs a strategy end to end
 ```
 
 ## Hard rules
@@ -48,7 +48,7 @@ encodes the full recipe and the validation gate. Summary: copy
 `strategies/_template/`, write `signals()` from `backtest.py` helpers, mirror
 every param in `config.yaml` (`params` + `optuna.space`), write a synthetic-data
 test, adapt a strategy notebook, then pass:
-`pytest -q && ruff check . && tsim optimize --strategy <name> --n-trials 5`.
+`uv run pytest -q && uv run ruff check . && uv run tsim optimize --strategy <name> --n-trials 5`.
 
 ## Gotchas
 
@@ -59,3 +59,5 @@ test, adapt a strategy notebook, then pass:
   the `vectorbt-rust` package (`engine: auto` in settings dispatches to it).
 - Optuna studies are append-only journal files under `strategies/*/studies/`
   (gitignored). Deleting the file resets the study; same name = resume.
+- `uv.lock` is committed for reproducible installs; after changing dependencies
+  in `pyproject.toml` run `uv lock` (or `uv sync`) to refresh it.

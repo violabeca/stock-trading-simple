@@ -11,7 +11,7 @@ Checklist for a new strategy (also see .claude/skills/new-strategy/):
    ``optuna.space:`` (and optionally ``sweep:``).
 3. Add ``valid()`` if some parameter combos are impossible.
 4. Add a test in ``tests/`` with an engineered signal on synthetic data.
-5. Smoke it: ``tsim optimize --strategy <your_name> --n-trials 5``.
+5. Smoke it: ``uv run tsim optimize --strategy <your_name> --n-trials 5``.
 """
 
 from __future__ import annotations

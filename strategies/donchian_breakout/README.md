@@ -27,4 +27,4 @@ expect: many small stop-outs, frequent medium wins, few large losses.
 | `atr_mult` | stop distance in ATRs | **the** knob: tighter = smaller losses but more shake-outs |
 | `direction` | long / short / both | shorts pay in downtrends, cost carry elsewhere |
 
-**Run it:** open `donchian_breakout.ipynb`, or `tsim optimize --strategy donchian_breakout`.
+**Run it:** open `donchian_breakout.ipynb`, or `uv run tsim optimize --strategy donchian_breakout`.
