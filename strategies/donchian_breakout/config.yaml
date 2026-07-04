@@ -1,0 +1,33 @@
+# ===========================================================================
+# donchian_breakout — all tunable settings for this strategy.
+# ===========================================================================
+
+data:
+  universe: starter        # any name from settings.yaml / universes.yaml
+  bar: 1d                  # 1d | 1m
+  start: "2018-01-01"
+  end: null
+  session: regular
+  max_symbols: 20
+
+params:                    # single-backtest defaults; every key is a signals() argument
+  entry_window: 20         # breakout = new N-bar high/low
+  atr_window: 14           # ATR smoothing window (bars)
+  atr_mult: 2.0            # trailing stop distance in ATRs (lower = tighter)
+  direction: both          # long | short | both
+
+sweep:                     # coarse grid for notebook exploration
+  entry_window: [10, 20, 55]
+  atr_window: [14]
+  atr_mult: [1.5, 2.0, 3.0]
+
+optuna:
+  study: donchian-1d-v1    # journal file studies/donchian-1d-v1.log
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 42
+  n_trials: 300
+  space:
+    entry_window: { type: int,   low: 10,  high: 100 }
+    atr_window:   { type: int,   low: 7,   high: 30 }
+    atr_mult:     { type: float, low: 1.0, high: 5.0, step: 0.25 }
+    direction:    { type: categorical, choices: [long, short, both] }

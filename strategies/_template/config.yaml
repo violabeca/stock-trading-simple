@@ -1,0 +1,27 @@
+# TEMPLATE strategy config — every strategy has exactly these four blocks.
+
+data:                      # which panel the notebook / optimizer loads
+  universe: starter        # a name from settings.yaml or universes.yaml
+  bar: 1d                  # 1d | 1m
+  start: "2018-01-01"
+  end: null                # null = everything stored
+  session: regular         # regular | extended | both (rth filter; matters intraday)
+  max_symbols: 20          # cap at the best-covered names
+
+params:                    # single-run defaults = signals() keyword arguments
+  example_window: 20
+
+sweep:                     # value lists for grid exploration (optional block)
+  example_window: [10, 20, 50]
+
+optuna:
+  study: template-v1       # journal file: studies/<study>.log (rename = fresh study)
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 42
+  n_trials: 100
+  space:                   # one entry per tunable parameter
+    example_window: { type: int, low: 5, high: 100 }
+    # other types:
+    #   { type: float, low: 0.5, high: 5.0, step: 0.25 }   # step optional
+    #   { type: int,   low: 1,   high: 60,  log: true }    # log-scaled
+    #   { type: categorical, choices: [long, short, both] }

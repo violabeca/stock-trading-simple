@@ -1,0 +1,43 @@
+# ===========================================================================
+# volume_momentum — all tunable settings for this strategy.
+# Blocks: data (what to load), params (single-run defaults), sweep (grid
+# exploration), optuna (optimization study + search space).
+# ===========================================================================
+
+data:
+  universe: starter        # any name from settings.yaml / universes.yaml
+  bar: 1d                  # 1d | 1m  (1m needs an IBKR backfill first)
+  start: "2018-01-01"
+  end: null                # null = everything stored
+  session: regular         # regular | extended | both (rth flag; matters intraday)
+  max_symbols: 20          # cap at the best-covered names
+
+params:                    # single-backtest defaults; every key is a signals() argument
+  fast: 20                 # fast price-SMA window (bars)
+  slow: 100                # slow price-SMA window (bars); must be > fast
+  threshold: 3.0           # volume must be >= threshold x expected volume
+  horizon: 10              # bars held after entry
+  baseline: auto           # auto | sma | profile (auto: sma on 1d, profile intraday)
+  vol_window: 20           # sma-baseline window (bars)
+  profile_days: 10         # profile-baseline lookback (sessions)
+  direction: both          # long | short | both
+
+sweep:                     # coarse grid for notebook exploration (invalid fast>=slow dropped)
+  fast: [10, 20, 50]
+  slow: [50, 100, 200]
+  vol_window: [20, 60]
+  threshold: [2.0, 3.0, 5.0]
+  horizon: [5, 10, 20]
+
+optuna:
+  study: vm-1d-v1          # journal file studies/vm-1d-v1.log; rename to start fresh
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 42
+  n_trials: 300
+  space:                   # declarative search space -> optimize.suggest_params
+    fast:         { type: int,   low: 5,   high: 60 }
+    slow:         { type: int,   low: 20,  high: 250 }
+    vol_window:   { type: int,   low: 10,  high: 120 }
+    threshold:    { type: float, low: 1.5, high: 8.0, step: 0.25 }
+    horizon:      { type: int,   low: 1,   high: 60, log: true }
+    direction:    { type: categorical, choices: [long, short, both] }

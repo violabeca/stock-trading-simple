@@ -1,0 +1,51 @@
+# ===========================================================================
+# Global settings for trading-simple. Every key maps 1:1 onto the pydantic
+# models in src/trading_simple/config.py. Environment variables override this
+# file: TRADING_<SECTION>__<KEY>, e.g. TRADING_IBKR__PORT=4001.
+# Strategy-specific knobs do NOT live here — see strategies/<name>/config.yaml.
+# ===========================================================================
+
+# The SHARED TimescaleDB (also used by the sibling stock-trading repo).
+# This repo connects to it; it never creates or migrates it.
+db:
+  host: localhost
+  port: 5432
+  user: trading
+  password: trading
+  name: trading
+
+# Interactive Brokers Gateway (1-minute history). 4002 = IB Gateway paper;
+# live GW = 4001, TWS paper = 7497, TWS live = 7496.
+# extended_hours: false -> backfills store regular-session bars only.
+# Set true (or pass --extended-hours to `tsim backfill`) to also store
+# pre/post-market bars; they are tagged rth=false either way.
+ibkr:
+  host: 127.0.0.1
+  port: 4002
+  client_id: 1
+  max_requests_per_10min: 55   # IBKR account-wide cap is ~60/10min; stay under it
+  pace_seconds: 0.5
+  extended_hours: false
+
+# Trading friction charged by every backtest (converted to vectorbt fees/slippage).
+costs:
+  commission_per_share: 0.005
+  min_commission: 1.00
+  spread_bps: 2.0
+  slippage_bps: 1.0
+
+# Backtest engine defaults shared by all strategies.
+backtest:
+  init_cash: 10000
+  chunk_size: 12       # parameter combos stacked per vectorbt call (memory bound)
+  engine: auto         # auto | rust | numba  -> vbt.settings['engine']
+
+# Per-symbol venue overrides for non-US listings, e.g.
+#   NESN: SIX
+# Common Swiss blue chips are already built in (see exchanges.py).
+exchanges: {}
+
+# Hand-edited universes. The screener notebook writes bigger ones to
+# config/universes.yaml, which is merged in on top of this map.
+universe:
+  starter: [AAPL, MSFT, NVDA, JPM, XOM, GLD, SLV, SPY]

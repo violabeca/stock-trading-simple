@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-simple"
+version = "0.1.0"
+description = "A small, readable framework to backtest and optimize trading strategies."
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.2,<3.0",        # vectorbt 1.0 breaks on pandas 3.0
+    "numpy>=1.26,<2.5",        # numba (vectorbt's JIT engine) caps at numpy 2.4
+    "vectorbt[rust]>=1.0",     # the backtest engine; [rust] enables engine='auto' Rust dispatch
+    "optuna>=4.0",             # multi-objective optimization with resumable journal storage
+    "plotly>=6.0",             # all visualization
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    "requests>=2.31",
+    "yfinance>=0.2.40",
+]
+
+[project.optional-dependencies]
+ibkr = ["ib_async>=1.0"]                            # 1-minute history needs a running IB Gateway
+notebook = ["jupyterlab>=4.0", "ipykernel>=6.29", "nbformat>=5.9", "nbclient>=0.9"]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+tsim = "trading_simple.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+trading_simple = ["schema.sql"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/trading_simple/cli.py" = ["B008"]  # typer.Option in defaults is typer's documented idiom
+"*.ipynb" = ["E402", "I001"]            # notebooks interleave imports with narrative on purpose
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
