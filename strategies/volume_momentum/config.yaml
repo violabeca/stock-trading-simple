@@ -1,43 +1,50 @@
 # ===========================================================================
-# volume_momentum — all tunable settings for this strategy.
+# volume_momentum — all tunable settings for this strategy (intraday, 1m).
 # Blocks: data (what to load), params (single-run defaults), sweep (grid
 # exploration), optuna (optimization study + search space).
 # ===========================================================================
 
 data:
   universe: starter        # any name from settings.yaml / universes.yaml
-  bar: 1d                  # 1d | 1m  (1m needs an IBKR backfill first)
-  start: "2018-01-01"
+  bar: 1m                  # intraday; needs an IBKR backfill (see 02_backfill)
+  start: "2026-06-01"      # deliberately short (~1 month) while testing the 1m setup
   end: null                # null = everything stored
-  session: regular         # regular | extended | both (rth flag; matters intraday)
+  session: regular         # profile baseline assumes one consistent session
   max_symbols: 20          # cap at the best-covered names
 
 params:                    # single-backtest defaults; every key is a signals() argument
-  fast: 20                 # fast price-SMA window (bars)
-  slow: 100                # slow price-SMA window (bars); must be > fast
-  threshold: 3.0           # volume must be >= threshold x expected volume
-  horizon: 10              # bars held after entry
-  baseline: auto           # auto | sma | profile (auto: sma on 1d, profile intraday)
-  vol_window: 20           # sma-baseline window (bars)
-  profile_days: 10         # profile-baseline lookback (sessions)
-  direction: both          # long | short | both
+  fast: 15                 # fast price-SMA window (bars = minutes on 1m)
+  slow: 60                 # slow price-SMA window (bars); must be > fast
+  threshold: 4.0           # volume must be >= threshold x expected volume
+  horizon: 30              # bars held after entry (minutes on 1m)
+  baseline: auto           # auto | sma | profile (auto: profile intraday, sma on 1d)
+  vol_window: 20           # sma-baseline window (bars); only used with baseline: sma
+  profile_days: 5          # profile-baseline lookback (sessions)
+  smooth_minutes: 2        # profile compares to ±N minutes around the same time-of-day
+  skip_open: 15            # no entries in the first N minutes of a session
+  skip_close: 15           # no entries in the last N minutes of a session
+  sl_pct: 0.02             # stop-loss distance (fraction of entry price); 0 disables
+  sl_trail: false          # false = fixed at entry, true = trails the best price
+  eod_exit: true           # always flat on each session's final bar
 
 sweep:                     # coarse grid for notebook exploration (invalid fast>=slow dropped)
-  fast: [10, 20, 50]
-  slow: [50, 100, 200]
-  vol_window: [20, 60]
-  threshold: [2.0, 3.0, 5.0]
-  horizon: [5, 10, 20]
+  fast: [10, 30]
+  slow: [60, 180]
+  threshold: [3.0, 5.0, 8.0]
+  horizon: [15, 30, 60]
+  sl_pct: [0.01, 0.02]
 
 optuna:
-  study: vm-1d-v1          # journal file studies/vm-1d-v1.log; rename to start fresh
+  study: vm-1m-v1          # journal file studies/vm-1m-v1.log; rename to start fresh
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
   n_trials: 300
   space:                   # declarative search space -> optimize.suggest_params
-    fast:         { type: int,   low: 5,   high: 60 }
-    slow:         { type: int,   low: 20,  high: 250 }
-    vol_window:   { type: int,   low: 10,  high: 120 }
-    threshold:    { type: float, low: 1.5, high: 8.0, step: 0.25 }
-    horizon:      { type: int,   low: 1,   high: 60, log: true }
-    direction:    { type: categorical, choices: [long, short, both] }
+    fast:           { type: int,   low: 5,     high: 60 }
+    slow:           { type: int,   low: 30,    high: 240 }
+    threshold:      { type: float, low: 2.0,   high: 10.0, step: 0.5 }
+    horizon:        { type: int,   low: 5,     high: 120, log: true }
+    profile_days:   { type: int,   low: 3,     high: 10 }
+    smooth_minutes: { type: int,   low: 0,     high: 5 }
+    sl_pct:         { type: float, low: 0.005, high: 0.04, step: 0.005 }
+    sl_trail:       { type: categorical, choices: [true, false] }

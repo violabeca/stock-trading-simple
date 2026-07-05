@@ -21,7 +21,7 @@ def test_loaded_strategy_shape():
     strat = strategies.load("volume_momentum")
     assert callable(strat.signals) and callable(strat.valid)
     assert strat.data["bar"] in {"1d", "1m"}
-    assert set(strat.optuna["space"]) <= set(strat.params) | {"direction"}
+    assert set(strat.optuna["space"]) <= set(strat.params)
 
 
 # --- volume_momentum signal logic ---------------------------------------------
@@ -34,7 +34,8 @@ def _vm(panel, **overrides):
 
 def test_volume_momentum_spike_routes_by_trend(panel):
     sig = _vm(panel)
-    # Spike at bar 40 -> execution at bar 41; AAA trends up (long), BBB down (short).
+    # Spike at bar 40 -> execution at bar 41; AAA trends up (long), BBB down (short) —
+    # both directions always live, the momentum sign alone picks the side.
     assert sig["entries"].iloc[41]["AAA"] and not sig["entries"].iloc[41]["BBB"]
     assert sig["short_entries"].iloc[41]["BBB"] and not sig["short_entries"].iloc[41]["AAA"]
     assert not sig["entries"].iloc[40].any()              # never same-bar execution
@@ -42,9 +43,44 @@ def test_volume_momentum_spike_routes_by_trend(panel):
     assert int(sig["entries"].values.sum() + sig["short_entries"].values.sum()) == 2
 
 
-def test_volume_momentum_direction_narrowing(panel):
-    assert not _vm(panel, direction="long")["short_entries"].values.any()
-    assert not _vm(panel, direction="short")["entries"].values.any()
+def test_volume_momentum_stop_params_passthrough(panel):
+    sig = _vm(panel, sl_pct=0.02, sl_trail=True)
+    assert sig["sl_stop"] == 0.02 and sig["sl_trail"] is True
+    assert "sl_stop" not in _vm(panel, sl_pct=0.0)        # 0 disables the stop entirely
+
+
+def _intraday_panel():
+    """Two 91-minute sessions; AAA trends up, BBB down; day-2 volume spikes
+    near the open (minute 2), mid-session (minute 45) and near the close
+    (minute 87) so the session guards have something to block."""
+    import numpy as np
+
+    from trading_simple.data import Panel
+
+    tz = "America/New_York"
+    idx = pd.DatetimeIndex([pd.Timestamp(f"2026-06-0{d} 09:30", tz=tz) + pd.Timedelta(minutes=m)
+                            for d in (1, 2) for m in range(91)]).tz_convert("UTC")
+    n = len(idx)
+    close = pd.DataFrame({"AAA": np.linspace(100.0, 110.0, n),
+                          "BBB": np.linspace(100.0, 92.0, n)}, index=idx)
+    volume = pd.DataFrame(1_000.0, index=idx, columns=close.columns)
+    volume.iloc[[91 + 2, 91 + 45, 91 + 87]] = 20_000.0
+    return Panel(close=close, open_=close * 0.999, high=close * 1.001,
+                 low=close * 0.999, volume=volume, bar="1m")
+
+
+def test_volume_momentum_session_guards_intraday():
+    strat = strategies.load("volume_momentum")
+    sig = strat.signals(_intraday_panel(), fast=5, slow=20, threshold=3.0, horizon=5,
+                        baseline="sma", vol_window=10, skip_open=15, skip_close=15,
+                        sl_pct=0.0, eod_exit=True)
+    day2 = 91
+    assert sig["entries"]["AAA"].iloc[day2 + 46]          # mid-session spike fills next bar
+    assert not sig["entries"]["AAA"].iloc[day2 + 3]       # blocked: first 15 minutes
+    assert not sig["entries"]["AAA"].iloc[day2 + 88]      # blocked: last 15 minutes
+    assert sig["short_entries"]["BBB"].iloc[day2 + 46]    # downtrend routes short
+    assert sig["exits"].iloc[90].all()                    # eod_exit: flat on day-1 close
+    assert sig["exits"].iloc[-1].all()                    # ... and on day-2 close
 
 
 def test_volume_momentum_valid_rejects_inverted_mas():
@@ -56,8 +92,12 @@ def test_volume_momentum_valid_rejects_inverted_mas():
 def test_volume_momentum_indicator_overlays(panel):
     strat = strategies.load("volume_momentum")
     out = strat.indicators(panel.close["AAA"], panel.volume["AAA"],
-                           **{**strat.params, "fast": 5, "slow": 20})
-    assert set(out) == {"price", "volume"} and len(out["price"]) == 2
+                           **{**strat.params, "fast": 5, "slow": 20, "vol_window": 10})
+    assert set(out) == {"price", "momentum", "volume", "volume_marks"}
+    assert len(out["price"]) == 2
+    momentum = next(iter(out["momentum"].values()))
+    assert momentum.iloc[-1] > 0                          # AAA trends up -> long bias
+    assert out["volume_marks"].iloc[40] and out["volume_marks"].sum() == 1  # the bar-40 spike
 
 
 # --- donchian_breakout signal logic --------------------------------------------
@@ -91,3 +131,22 @@ def test_donchian_channel_excludes_current_bar(panel):
     # Window nearly as long as the data: only the last bars can break out,
     # and a bar can never break out of a channel that includes itself.
     assert not sig["entries"]["AAA"].iloc[:59].any()
+    assert "exits" not in sig                             # daily bars: no eod_exit frames
+
+
+def test_donchian_session_guards_and_eod_exit_intraday():
+    # Wickless intraday panel: with high/low == close every trend bar breaks
+    # out, so the session guards' effect is directly observable.
+    p = _intraday_panel()
+    panel = type(p)(close=p.close, open_=p.open_, high=p.close, low=p.close,
+                    volume=p.volume, bar="1m")
+    strat = strategies.load("donchian_breakout")
+    sig = strat.signals(panel, entry_window=10, atr_window=5, atr_mult=2.0,
+                        skip_open=15, skip_close=15, eod_exit=True)
+    day2 = 91
+    assert sig["entries"]["AAA"].iloc[day2 + 45]          # mid-session breakout fires
+    assert not sig["entries"]["AAA"].iloc[:15].any()      # blocked: first 15 minutes
+    assert not sig["entries"]["AAA"].iloc[day2 + 76:].any()  # blocked: last 15 minutes
+    assert sig["short_entries"]["BBB"].iloc[day2 + 45]    # downtrend routes short
+    assert sig["exits"].iloc[90].all()                    # eod_exit: flat on day-1 close
+    assert sig["exits"].iloc[-1].all()                    # ... and on day-2 close

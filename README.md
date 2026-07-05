@@ -66,15 +66,15 @@ src/trading_simple/
   universe.py                 Nasdaq screener → filtered, sector-capped lists
   data.py                     DB → Panel (wide adjusted OHLCV matrices)
   backtest.py                 THE engine: run / sweep / metrics / helpers
-  optimize.py                 Optuna: journal storage, Pareto front, pick_best
+  optimize.py                 Optuna: journal storage, Pareto front, pick_best, boundary check
   plots.py                    every figure, one consistent plotly design
   strategies.py               loads a strategy folder by name
   jobs.py                     notebooks → CLI subprocess handoff
   cli.py                      the `tsim` command line
 strategies/
   _template/                  copy me to start a new strategy
-  volume_momentum/            strategy 1: volume spikes + trend  (+ notebook)
-  donchian_breakout/          strategy 2: breakouts + ATR stops  (+ notebook)
+  volume_momentum/            strategy 1: intraday volume spikes + momentum  (+ notebook)
+  donchian_breakout/          strategy 2: intraday breakouts + ATR trailing stops  (+ notebook)
 notebooks/
   01_universe_screener.ipynb  find symbols worth loading
   02_backfill.ipynb           load daily AND intraday history
@@ -97,9 +97,13 @@ averages across all of that is comparing apples to oranges. Two defenses:
 loading a single session (the default) makes ordinary rolling windows fair by
 construction; and for "is this volume abnormal?" questions the engine provides
 `backtest.volume_profile` — the expected volume **at that time of day** over
-the last N sessions, so 09:31 only ever compares to other 09:31s. It groups by
-exchange-local clock (DST-safe) and uses the median (one earnings blowup
-doesn't distort the next two weeks).
+the last N sessions (optionally smoothed ±N minutes around it), so 09:31 only
+ever compares to other 09:31s. It groups by exchange-local clock (DST-safe)
+and uses the median (one earnings blowup doesn't distort the next two weeks).
+For session-edge discipline there are `backtest.session_mask` (no entries in
+the first/last N minutes) and `backtest.session_end` (force intraday
+strategies flat on each day's final bar) — both data-driven, so half-days
+need no session table.
 
 **Adjusted prices, next-bar fills.** All price fields are split/dividend
 adjusted into one consistent space. Signals computed on bar *t* execute at bar
@@ -119,9 +123,11 @@ against the high/low, not just at closes.
 together**. No single "best" exists — the result is the set of parameter sets
 where improving one objective must hurt the other (the Pareto front).
 `optimize.pick_best(study, weights=(1.0, 0.5))` reduces it to one trial under
-an explicit preference. Beware: more trials on the same data = more chances to
-overfit; judge winners on `pct_profitable` (breadth across symbols) and on
-held-out data.
+an explicit preference, and `optimize.boundary_report` flags picked parameters
+sitting on a search-space bound (log-aware) — evidence the optimum may lie
+outside the searched box, so widen that bound and re-run. Beware: more trials
+on the same data = more chances to overfit; judge winners on `pct_profitable`
+(breadth across symbols) and on held-out data.
 
 ## How to add a strategy
 
@@ -130,7 +136,8 @@ No engine edits — ever. Three files in one folder:
 1. **Copy the template:** `cp -r strategies/_template strategies/my_idea`
 2. **Write `signals()`** in `strategy.py` — a pure function from a price
    `Panel` to entry/exit frames, built from the engine helpers
-   (`sma`, `atr`, `volume_profile`, `next_bar`, `exit_after`):
+   (`sma`, `atr`, `volume_profile`, `session_mask`, `session_end`,
+   `next_bar`, `exit_after`):
 
    ```python
    def signals(panel, *, window: int = 20) -> dict:
@@ -165,6 +172,9 @@ Prefix any of these with `uv run` (or activate `.venv` first):
 ```
 tsim coverage  [--universe X] [--bar 1d]      what's stored (inventory / per symbol)
 tsim screen    --name LiquidLeaders --top 100 build + persist a universe
+tsim import-universes [--names A,B]           copy universes built by the sibling repo
+tsim subset    --universe HighOctane --top 20 pin the most liquid names as <U>Top<N>
+                                              (by trailing-90d avg dollar volume)
 tsim backfill  --universe X --bar 1d --since 2015-01-01
                --bar 1m [--extended-hours]    provider picked by bar (yfinance/IBKR)
 tsim optimize  --strategy volume_momentum [--n-trials 300] [--study S] [--sampler tpe]
@@ -172,6 +182,9 @@ tsim init-db                                  apply schema.sql (no-op on the liv
 ```
 
 All output is plain parseable text; `jobs.py` is how notebooks stream it live.
+`tsim optimize` prints one line per finished trial (objectives, front size,
+parameters) and a ready-to-paste `uvx optuna-dashboard <journal>` command for
+a live web view of the running study.
 
 ## Speed
 
@@ -201,6 +214,11 @@ All output is plain parseable text; `jobs.py` is how notebooks stream it live.
 This repo reads and writes the **same TimescaleDB** as the sibling
 `stock-trading` platform (`postgresql://trading:trading@localhost:5432/trading`,
 tables `securities` + `prices_ohlcv`) — so history backfilled by either repo
-serves both. It never creates or migrates that database; `tsim init-db` merely
-re-applies the identical idempotent schema. Do not point it at a fresh Postgres
-without TimescaleDB installed.
+serves both. The sibling's screener also builds richer characteristic
+universes (**HighOctane** = high volatility, **Trailblazers** = momentum,
+**SteadyEddies** = low volatility, **CheapQuality** = value); `tsim
+import-universes` copies those lists here, and `tsim subset` carves a pinned
+liquid top-N out of any of them (how `HighOctaneTop20`, the donchian_breakout
+universe, is defined). It never creates or migrates that database; `tsim
+init-db` merely re-applies the identical idempotent schema. Do not point it at
+a fresh Postgres without TimescaleDB installed.

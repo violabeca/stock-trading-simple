@@ -1,9 +1,16 @@
-"""Universe screening, sector caps, and YAML persistence (no network)."""
+"""Universe screening, sector caps, YAML persistence, sibling imports (no network)."""
 
 import pandas as pd
+import pytest
 import yaml
 
-from trading_simple.universe import _to_float, liquid_leaders, screen_candidates, write_universe
+from trading_simple.universe import (
+    _to_float,
+    import_universes,
+    liquid_leaders,
+    screen_candidates,
+    write_universe,
+)
 
 
 def _listing() -> pd.DataFrame:
@@ -45,6 +52,34 @@ def test_write_universe_merges(tmp_path):
     write_universe("Second", ["C"], path=path)
     loaded = yaml.safe_load(path.read_text())
     assert loaded["universe"] == {"First": ["A", "B"], "Second": ["C"]}  # sorted + merged
+
+
+def test_import_universes_defaults_to_new_only(tmp_path):
+    src, dst = tmp_path / "src.yaml", tmp_path / "dst.yaml"
+    src.write_text(yaml.safe_dump({"universe": {"HighOctane": ["B", "A"], "Steady": ["C"]}}))
+    write_universe("HighOctane", ["OLD"], path=dst)
+    written = import_universes(src, path=dst)
+    assert written == {"Steady": 1}                            # existing one untouched
+    loaded = yaml.safe_load(dst.read_text())["universe"]
+    assert loaded["HighOctane"] == ["OLD"] and loaded["Steady"] == ["C"]
+
+
+def test_import_universes_overwrite_and_named(tmp_path):
+    src, dst = tmp_path / "src.yaml", tmp_path / "dst.yaml"
+    src.write_text(yaml.safe_dump({"universe": {"HighOctane": ["B", "A"], "Steady": ["C"]}}))
+    write_universe("HighOctane", ["OLD"], path=dst)
+    written = import_universes(src, names=["HighOctane"], overwrite=True, path=dst)
+    assert written == {"HighOctane": 2}
+    loaded = yaml.safe_load(dst.read_text())["universe"]
+    assert loaded["HighOctane"] == ["A", "B"]                  # replaced (and sorted)
+    assert "Steady" not in loaded                              # names= limits the import
+
+
+def test_import_universes_unknown_name_lists_available(tmp_path):
+    src = tmp_path / "src.yaml"
+    src.write_text(yaml.safe_dump({"universe": {"X": ["A"]}}))
+    with pytest.raises(KeyError, match="Available"):
+        import_universes(src, names=["Nope"], path=tmp_path / "dst.yaml")
 
 
 def test_to_float_parses_screener_strings():

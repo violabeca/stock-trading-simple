@@ -12,7 +12,10 @@ Pipeline (driven interactively by ``notebooks/01_universe_screener.ipynb``):
 
 :func:`rank_by_dollar_volume` ranks names by trading activity using prices
 already in the database — the cheap way to decide which symbols deserve slow
-1-minute IBKR history.
+1-minute IBKR history (``tsim subset`` pins the top of that ranking as its own
+named universe). :func:`import_universes` copies universes built by the
+sibling ``stock-trading`` repo — same shared database — so its richer
+characteristic universes (HighOctane, Trailblazers, ...) are usable here too.
 """
 
 from __future__ import annotations
@@ -203,10 +206,53 @@ def write_universe(name: str, symbols: list[str], *, path: Path = UNIVERSES_FILE
     existing = existing.get("universe", existing) if isinstance(existing, dict) else {}
     existing[name] = sorted(symbols)
     path.parent.mkdir(parents=True, exist_ok=True)
-    header = ("# Machine-generated universes (see notebooks/01_universe_screener.ipynb).\n"
-              "# Merged into settings.universe by trading_simple.config.load_settings.\n")
+    header = ("# Machine-generated universes (notebooks/01_universe_screener.ipynb,\n"
+              "# tsim import-universes, tsim subset). Merged into settings.universe\n"
+              "# by trading_simple.config.load_settings.\n")
     path.write_text(header + yaml.safe_dump({"universe": existing}, sort_keys=True))
     return path
+
+
+def import_universes(src: Path | str, *, names: list[str] | None = None,
+                     overwrite: bool = False, path: Path = UNIVERSES_FILE) -> dict[str, int]:
+    """Copy named universes from another repo's ``universes.yaml`` into this one.
+
+    The sibling ``stock-trading`` platform builds richer, characteristic
+    universes against the same shared database (HighOctane, Trailblazers,
+    SteadyEddies, CheapQuality — see its ``notebooks/00_universe_screener.ipynb``).
+    This merges chosen lists into this repo's ``config/universes.yaml`` so any
+    strategy here can reference them by name. Lists are copied as a snapshot,
+    not a live link — re-run after the sibling regenerates its file.
+
+    Args:
+        src: Source ``universes.yaml`` (``{universe: {name: [symbols]}}``).
+        names: Universes to import (default: every one not yet defined here).
+        overwrite: Replace universes that already exist in the target file.
+        path: Target YAML file (overridable for tests).
+
+    Returns:
+        ``{name: symbol_count}`` for the universes actually written; names
+        skipped because they already exist (and ``overwrite`` is off) are absent.
+
+    Raises:
+        FileNotFoundError: If ``src`` does not exist.
+        KeyError: If a requested name is missing from ``src`` (message lists
+            what the source offers).
+    """
+    raw = yaml.safe_load(Path(src).read_text()) or {}
+    source = raw.get("universe", raw) if isinstance(raw, dict) else {}
+    missing = [n for n in names or [] if n not in source]
+    if missing:
+        raise KeyError(f"{missing} not in {src}. Available: {sorted(source)}")
+    current = yaml.safe_load(path.read_text()) or {} if path.exists() else {}
+    current = current.get("universe", current) if isinstance(current, dict) else {}
+    written = {}
+    for name in names or sorted(source):
+        if name in current and not overwrite:
+            continue
+        write_universe(name, source[name], path=path)
+        written[name] = len(source[name])
+    return written
 
 
 def register_securities(engine: Engine, screened: pd.DataFrame) -> int:

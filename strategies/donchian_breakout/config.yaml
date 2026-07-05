@@ -1,33 +1,41 @@
 # ===========================================================================
-# donchian_breakout — all tunable settings for this strategy.
+# donchian_breakout — all tunable settings for this strategy (intraday, 1m).
+# Blocks: data (what to load), params (single-run defaults), sweep (grid
+# exploration), optuna (optimization study + search space).
 # ===========================================================================
 
 data:
-  universe: starter        # any name from settings.yaml / universes.yaml
-  bar: 1d                  # 1d | 1m
-  start: "2018-01-01"
-  end: null
-  session: regular
-  max_symbols: 20
+  universe: HighOctaneTop20  # top-20 HighOctane names by 90d dollar volume (tsim subset)
+  bar: 1m                  # intraday; needs an IBKR backfill (see 02_backfill)
+  start: "2026-05-01"      # deliberately short (~2 months) while testing the 1m setup
+  end: null                # null = everything stored
+  session: regular         # channels assume one consistent session
+  max_symbols: 40          # cap at the best-covered names
 
 params:                    # single-backtest defaults; every key is a signals() argument
-  entry_window: 20         # breakout = new N-bar high/low
+  entry_window: 30         # channel lookback (bars = minutes on 1m); breakout = new N-bar extreme
   atr_window: 14           # ATR smoothing window (bars)
   atr_mult: 2.0            # trailing stop distance in ATRs (lower = tighter)
   direction: both          # long | short | both
+  skip_open: 15            # no entries in the first N minutes of a session
+  skip_close: 15           # no entries in the last N minutes of a session
+  eod_exit: true           # default: flat at each session's close. false = hold overnight
+                           # (trailing stop / opposite breakout still exit) — both are swept below
 
 sweep:                     # coarse grid for notebook exploration
-  entry_window: [10, 20, 55]
+  entry_window: [15, 30, 60, 120]
   atr_window: [14]
   atr_mult: [1.5, 2.0, 3.0]
+  eod_exit: [true, false]  # flat-at-close vs hold-overnight, side by side
 
 optuna:
-  study: donchian-1d-v1    # journal file studies/donchian-1d-v1.log
+  study: donchian-1m-v5    # v5 adds eod_exit to the space (v4 held it fixed); rename to start fresh
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
-  n_trials: 300
-  space:
-    entry_window: { type: int,   low: 10,  high: 100 }
-    atr_window:   { type: int,   low: 7,   high: 30 }
-    atr_mult:     { type: float, low: 1.0, high: 5.0, step: 0.25 }
-    direction:    { type: categorical, choices: [long, short, both] }
+  n_trials: 1000
+  space:                   # declarative search space -> optimize.suggest_params
+    entry_window: { type: int,   low: 10,  high: 1000, log: true }
+    atr_window:   { type: int,   low: 7,   high: 100 }
+    atr_mult:     { type: float, low: 1.0, high: 10.0, step: 0.25 }
+    eod_exit:     { type: categorical, choices: [true, false] }  # hold overnight or go flat at the close
+    # direction:    { type: categorical, choices: [long, short, both] }

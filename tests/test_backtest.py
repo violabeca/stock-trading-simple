@@ -47,6 +47,30 @@ def test_volume_profile_time_of_day_baseline():
     assert base.iloc[:6].isna().all().all()                  # warm-up + current-day exclusion
 
 
+def test_volume_profile_smoothing_widens_the_slot():
+    # Day 1 prints [0, 3000, 0] over three minutes; smooth=1 averages ±1 minute
+    # within the session, so day 2's baseline sees [1500, 1000, 1500].
+    tz = "America/New_York"
+    idx = pd.DatetimeIndex([pd.Timestamp(f"2026-06-0{d} 09:30", tz=tz) + pd.Timedelta(minutes=m)
+                            for d in (1, 2) for m in range(3)]).tz_convert("UTC")
+    vol = pd.DataFrame({"AAA": [0.0, 3000.0, 0.0, 500.0, 500.0, 500.0]}, index=idx)
+    base = bt.volume_profile(vol, tz, days=1, min_obs=1, smooth=1)
+    assert base["AAA"].iloc[3:].tolist() == [1500.0, 1000.0, 1500.0]
+    assert base["AAA"].iloc[:3].isna().all()              # day 1 has no prior session
+
+
+def test_session_mask_and_end_block_session_edges():
+    tz = "America/New_York"
+    idx = pd.DatetimeIndex([pd.Timestamp(f"2026-06-0{d} 09:30", tz=tz) + pd.Timedelta(minutes=m)
+                            for d in (1, 2) for m in range(60)]).tz_convert("UTC")
+    ok = bt.session_mask(idx, tz, skip_open=10, skip_close=10)
+    day1 = ok.iloc[:60]
+    assert not day1.iloc[:10].any() and not day1.iloc[50:].any()   # edges blocked
+    assert day1.iloc[10:50].all()                                  # core tradable
+    end = bt.session_end(idx, tz)
+    assert end.iloc[59] and end.iloc[119] and end.sum() == 2       # one final bar per day
+
+
 def test_leg_costs_arithmetic():
     fees, slip = bt.leg_costs(CostSettings())  # 500 shares @ $20 => $2.50 commission
     assert fees == pytest.approx(2.5 / 10_000 + 1.0 / 1e4)   # commission + half spread
@@ -112,6 +136,14 @@ def test_portfolio_stats_and_equity(panel):
     assert stats["n_trades"] == 1
     curve = bt.equity_curve(pf, init_cash=10_000)
     assert curve["value"].iloc[0] == pytest.approx(20_000)  # 2 symbols x 10k
+
+
+def test_symbol_stats_per_symbol_breakdown(panel):
+    pf = bt.run(panel, _one_spike_signals(panel), fees=0.0, slippage=0.0, init_cash=10_000)
+    per = bt.symbol_stats(pf)
+    assert list(per.index) == ["AAA", "BBB"]                # sorted by total_return desc
+    assert per.loc["AAA", "n_trades"] == 1 and per.loc["BBB", "n_trades"] == 0
+    assert per.loc["AAA", "total_return"] > 0               # the engineered winner
 
 
 def test_sweep_one_row_per_combo(panel):

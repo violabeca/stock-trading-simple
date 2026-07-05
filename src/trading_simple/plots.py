@@ -23,8 +23,12 @@ SERIES = ("#2a78d6", "#1baf7a", "#eda100", "#008300", "#4a3aa7", "#e34948", "#e8
 #: Diverging poles for signed metrics (blue = positive, red = negative), gray midpoint.
 DIVERGING = [(0.0, "#d03b3b"), (0.5, "#f0efec"), (1.0, "#2a78d6")]
 _WIN, _LOSS = "#0ca30c", "#d03b3b"          # reserved status colors: profit / loss
+_LONG, _SHORT = "#2a78d6", "#eb6834"        # trade direction pair (blue long, orange short)
 _INK, _MUTED, _GRID = "#0b0b0b", "#898781", "#e1e0d9"
 _GL_THRESHOLD = 10_000
+#: Metric/bookkeeping columns of sweep and trial frames; everything else is a parameter.
+_METRIC_COLS = {"trial", "total_return", "sharpe", "max_drawdown", "win_rate",
+                "pct_profitable", "n_trades"}
 
 
 def _base(fig: go.Figure, *, title: str, height: int = 420) -> go.Figure:
@@ -51,6 +55,26 @@ def _scatter(x, y, **kwargs) -> go.Scatter | go.Scattergl:
     return cls(x=x, y=y, **kwargs)
 
 
+def _intraday_breaks(index: pd.DatetimeIndex) -> list[dict] | None:
+    """Axis rangebreaks hiding the gaps between trading sessions.
+
+    Without them an intraday time axis draws a bridge line from each close to
+    the next open, and overnight/weekend gaps dominate the picture. One break
+    per gap observed in the data, which covers overnights, weekends and
+    holidays alike (all in values+dvalue form: mixing a pattern break with a
+    values break crashes plotly.js). Returns None for daily series — and for
+    series above the WebGL threshold, where Scattergl ignores rangebreaks.
+    """
+    tod = index - index.normalize()
+    if tod.nunique() <= 1 or len(index) > _GL_THRESHOLD:
+        return None
+    diffs = pd.Series(index).diff()
+    step = diffs.median()
+    return [{"values": [str(index[i - 1] + step)],
+             "dvalue": int((gap - step).total_seconds() * 1000)}
+            for i, gap in diffs[diffs > step].items()] or None
+
+
 def plot_sweep(stats: pd.DataFrame, *, metric: str = "sharpe", top: int = 20) -> go.Figure:
     """Ranked horizontal bars of a sweep's best parameter combos.
 
@@ -66,9 +90,7 @@ def plot_sweep(stats: pd.DataFrame, *, metric: str = "sharpe", top: int = 20) ->
     Returns:
         The figure.
     """
-    metric_cols = {"total_return", "sharpe", "max_drawdown", "win_rate",
-                   "pct_profitable", "n_trades"}
-    param_cols = [c for c in stats.columns if c not in metric_cols]
+    param_cols = [c for c in stats.columns if c not in _METRIC_COLS]
     best = stats.dropna(subset=[metric]).nlargest(top, metric).iloc[::-1]
     labels = best[param_cols].astype(str).agg(" ".join, axis=1)
     hover = ("<b>%{customdata[0]}</b><br>" + metric + ": %{x:.3f}<br>"
@@ -115,28 +137,57 @@ def plot_heatmap(stats: pd.DataFrame, *, x: str, y: str, metric: str = "sharpe")
 
 
 def plot_equity(curve: pd.DataFrame, *, title: str = "Portfolio equity") -> go.Figure:
-    """Two stacked panels: portfolio value ($) and cumulative return (%).
+    """Stacked panels: portfolio value ($), cumulative return (%), and — when the
+    curve carries them — the money split into fees paid and realized P&L ($).
+
+    The third panel answers "where did the money go?": cumulative **fees paid**
+    (amber, the total spent on commission+slippage) against cumulative
+    **realized P&L** (green, the profit/loss booked as positions close, net of
+    their own fees). Both final totals are stamped into the panel title. The
+    panel is omitted for curves without the ``fees``/``realized_pnl`` columns.
 
     Args:
-        curve: Output of ``backtest.equity_curve`` (``value`` + ``return``).
+        curve: Output of ``backtest.equity_curve`` (``value``, ``return`` and,
+            optionally, ``fees`` + ``realized_pnl``).
         title: Figure title.
 
     Returns:
         The figure.
     """
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-                        subplot_titles=("Value ($)", "Cumulative return"))
+    has_costs = {"fees", "realized_pnl"} <= set(curve.columns)
+    subtitles = ["Value ($)", "Cumulative return"]
+    if has_costs:
+        won, spent = float(curve["realized_pnl"].iloc[-1]), float(curve["fees"].iloc[-1])
+        won_str = f"-${abs(won):,.0f}" if won < 0 else f"${won:,.0f}"
+        subtitles.append(f"Realized P&L ({won_str}) vs fees paid (${spent:,.0f})")
+    fig = make_subplots(rows=len(subtitles), cols=1, shared_xaxes=True,
+                        vertical_spacing=0.07, subplot_titles=subtitles)
     fig.add_trace(_scatter(curve.index, curve["value"], mode="lines", name="value",
-                           line={"color": SERIES[0], "width": 2},
+                           showlegend=False, line={"color": SERIES[0], "width": 2},
                            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>$%{y:,.0f}<extra></extra>"),
                   row=1, col=1)
     fig.add_trace(_scatter(curve.index, curve["return"], mode="lines", name="return",
-                           line={"color": SERIES[1], "width": 2},
+                           showlegend=False, line={"color": SERIES[1], "width": 2},
                            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y:.1%}<extra></extra>"),
                   row=2, col=1)
     fig.update_yaxes(tickformat=".0%", row=2, col=1)
-    fig.update_layout(showlegend=False, hovermode="x unified")
-    return _base(fig, title=title, height=520)
+    if has_costs:
+        fig.add_trace(_scatter(curve.index, curve["realized_pnl"], mode="lines",
+                               name="realized P&L", line={"color": SERIES[3], "width": 2},
+                               hovertemplate="%{x|%Y-%m-%d %H:%M}<br>"
+                                             "realized $%{y:,.0f}<extra></extra>"),
+                      row=3, col=1)
+        fig.add_trace(_scatter(curve.index, curve["fees"], mode="lines", name="fees paid",
+                               line={"color": SERIES[2], "width": 2},
+                               hovertemplate="%{x|%Y-%m-%d %H:%M}<br>"
+                                             "fees $%{y:,.0f}<extra></extra>"),
+                      row=3, col=1)
+        fig.update_yaxes(tickprefix="$", row=3, col=1)
+    fig.update_layout(showlegend=has_costs, hovermode="x unified")
+    breaks = _intraday_breaks(curve.index)
+    if breaks:
+        fig.update_xaxes(rangebreaks=breaks)
+    return _base(fig, title=title, height=660 if has_costs else 520)
 
 
 def plot_symbol(
@@ -148,33 +199,49 @@ def plot_symbol(
     overlays: dict | None = None,
     equity: pd.Series | None = None,
 ) -> go.Figure:
-    """Per-symbol chart: price with trades, volume, and (optionally) equity.
+    """Per-symbol chart: price with trades, then momentum/volume/equity panels.
 
-    Winning trades draw as green entry→exit segments, losing ones red; entries
-    are triangles, exits are crosses. A strategy's ``indicators()`` hook
-    supplies the ``overlays`` (extra lines on the price and volume panels).
+    Trades draw as entry→exit segments colored by outcome (green win, red
+    loss) with direction-explicit markers: **▲ long entry** (blue), **▼ short
+    entry** (orange), **× exit** (gray). A strategy's ``indicators()`` hook
+    supplies the ``overlays``; every key is optional:
+
+    * ``"price"`` — ``{name: series}`` lines on the price panel,
+    * ``"momentum"`` — ``{name: series}`` in an own panel, filled blue above
+      zero / red below (the up-vs-down direction filter at a glance),
+    * ``"volume"`` — ``{name: series}`` lines on the volume panel,
+    * ``"volume_marks"`` — boolean series; marked bars (e.g. volume spikes)
+      get an amber dot on the volume panel.
 
     Args:
         close: The symbol's adjusted close.
         volume: The symbol's volume.
         trades: ``backtest.trade_records`` output (all symbols; filtered here).
         symbol: Which symbol to draw.
-        overlays: ``{"price": {name: series}, "volume": {name: series}}``.
-        equity: Optional per-symbol equity curve for a third panel.
+        overlays: Overlay dict as above.
+        equity: Optional per-symbol equity curve for an extra panel.
 
     Returns:
         The figure.
     """
-    rows = 3 if equity is not None else 2
-    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                        row_heights=[0.55, 0.25, 0.2][:rows],
-                        subplot_titles=(f"{symbol} price (adjusted)", "Volume",
-                                        "Equity ($)")[:rows])
+    overlays = overlays or {}
+    momentum = overlays.get("momentum") or {}
+    panels = ["price", *(["momentum"] if momentum else []), "volume",
+              *(["equity"] if equity is not None else [])]
+    row = {name: i + 1 for i, name in enumerate(panels)}
+    titles = {"price": "", "momentum": "Momentum — above 0 → long bias, below 0 → short bias",
+              "volume": "Volume — amber dots mark the spikes the strategy acts on",
+              "equity": "Equity ($)"}
+    weights = {"price": 0.46, "momentum": 0.17, "volume": 0.21, "equity": 0.16}
+    heights = [weights[p] for p in panels]
+    fig = make_subplots(rows=len(panels), cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        row_heights=[h / sum(heights) for h in heights],
+                        subplot_titles=[titles[p] for p in panels])
+
     fig.add_trace(_scatter(close.index, close, mode="lines", name="close",
                            line={"color": _INK, "width": 1.2},
                            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y:.2f}<extra>close</extra>"),
                   row=1, col=1)
-    overlays = overlays or {}
     for i, (name, series) in enumerate(overlays.get("price", {}).items()):
         fig.add_trace(_scatter(series.index, series, mode="lines", name=name,
                                line={"color": SERIES[i % len(SERIES)], "width": 1.5}),
@@ -190,34 +257,170 @@ def plot_symbol(
         if xs:
             fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=label,
                                      line={"color": color, "width": 2.5}), row=1, col=1)
+    for direction, marker, color in (("Long", "triangle-up", _LONG),
+                                     ("Short", "triangle-down", _SHORT)):
+        seg = mine[mine["direction"] == direction]
+        if len(seg):
+            fig.add_trace(go.Scatter(
+                x=seg["entry_ts"], y=seg["entry_price"], mode="markers",
+                name=f"{direction.lower()} entry",
+                marker={"symbol": marker, "size": 11, "color": color,
+                        "line": {"color": "white", "width": 1}},
+                hovertemplate=direction + " entry %{x|%Y-%m-%d %H:%M} @ %{y:.2f}"
+                              "<extra></extra>"), row=1, col=1)
     if len(mine):
         fig.add_trace(go.Scatter(
-            x=mine["entry_ts"], y=mine["entry_price"], mode="markers", name="entry",
-            marker={"symbol": "triangle-up", "size": 9, "color": _INK},
-            hovertemplate="entry %{x|%Y-%m-%d %H:%M} @ %{y:.2f}<extra></extra>"), row=1, col=1)
+            x=mine["exit_ts"], y=mine["exit_price"], mode="markers", name="exit",
+            marker={"symbol": "x", "size": 8, "color": _MUTED},
+            customdata=mine[["pnl", "return"]],
+            hovertemplate="exit %{x|%Y-%m-%d %H:%M} @ %{y:.2f}<br>"
+                          "pnl $%{customdata[0]:,.0f} (%{customdata[1]:+.1%})<extra></extra>"),
+            row=1, col=1)
 
-    fig.add_trace(go.Bar(x=volume.index, y=volume, name="volume",
-                         marker={"color": _GRID}, hovertemplate="%{y:,.0f}<extra>volume</extra>"),
-                  row=2, col=1)
+    for name, series in momentum.items():
+        for part, color, show in ((series.clip(lower=0), _LONG, True),
+                                  (series.clip(upper=0), _LOSS, False)):
+            fig.add_trace(_scatter(series.index, part, mode="lines", name=name,
+                                   fill="tozeroy", showlegend=show,
+                                   line={"color": color, "width": 1},
+                                   hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y:+.1%}"
+                                                 f"<extra>{name}</extra>"),
+                          row=row["momentum"], col=1)
+
+    marks = overlays.get("volume_marks")
+    spike = (marks.reindex(volume.index).fillna(False).astype(bool)
+             if marks is not None else pd.Series(False, index=volume.index))
+    fig.add_trace(go.Bar(x=volume.index, y=volume, name="volume", showlegend=False,
+                         marker={"color": _MUTED, "opacity": 0.6},
+                         hovertemplate="%{y:,.0f}<extra>volume</extra>"),
+                  row=row["volume"], col=1)
+    if spike.any():
+        # Markers, not bars: dense daily bars render sub-pixel thin and would hide the spikes.
+        fig.add_trace(go.Scatter(x=volume.index[spike], y=volume[spike], mode="markers",
+                                 name="volume spike",
+                                 marker={"color": SERIES[2], "size": 7,
+                                         "line": {"color": "white", "width": 1}},
+                                 hovertemplate="%{y:,.0f}<extra>volume spike</extra>"),
+                      row=row["volume"], col=1)
+    vol_colors = (SERIES[4], SERIES[2], SERIES[6])  # amber slot 2 matches the spike markers
     for i, (name, series) in enumerate(overlays.get("volume", {}).items()):
         fig.add_trace(_scatter(series.index, series, mode="lines", name=name,
-                               line={"color": SERIES[(i + 2) % len(SERIES)], "width": 1.5,
-                                     "dash": "dot" if i else "solid"}),
-                      row=2, col=1)
+                               line={"color": vol_colors[i % len(vol_colors)], "width": 1.5,
+                                     "dash": "dash" if i else "solid"}),
+                      row=row["volume"], col=1)
+
     if equity is not None:
         fig.add_trace(_scatter(equity.index, equity, mode="lines", name="equity",
-                               line={"color": SERIES[0], "width": 2}), row=rows, col=1)
+                               showlegend=False, line={"color": SERIES[0], "width": 2}),
+                      row=row["equity"], col=1)
+
     n_win, n_loss = int((mine["pnl"] > 0).sum()), int((mine["pnl"] <= 0).sum())
-    return _base(fig, title=f"{symbol} — {len(mine)} trades ({n_win} wins, {n_loss} losses)",
-                 height=250 * rows)
+    fig = _base(fig, title=f"{symbol} — price (adjusted), {len(mine)} trades "
+                           f"({n_win} wins, {n_loss} losses)",
+                height={1: 420, 2: 560, 3: 760, 4: 900}[len(panels)])
+    # Too many series for a horizontal legend row: park it vertically beside the panels.
+    fig.update_layout(legend={"orientation": "v", "yanchor": "top", "y": 1.0,
+                              "xanchor": "left", "x": 1.005},
+                      margin={"r": 175})
+    if momentum:
+        fig.update_yaxes(tickformat="+.0%", row=row["momentum"], col=1)
+    breaks = _intraday_breaks(close.index)
+    if breaks:
+        fig.update_xaxes(rangebreaks=breaks)
+    return fig
+
+
+def _trial_hover(frame: pd.DataFrame) -> pd.DataFrame:
+    """Customdata frame for trial scatters: number + a ``k=v`` parameter string."""
+    params = [c for c in frame.columns if c not in _METRIC_COLS]
+    text = frame[params].apply(lambda r: ", ".join(f"{k}={v}" for k, v in r.items()), axis=1)
+    return pd.DataFrame({"trial": frame["trial"], "params": text})
+
+
+def plot_volume_profile(volume: pd.Series, baseline: pd.Series, tz: str, *, days: int,
+                        threshold: float | None = None, symbol: str = "",
+                        date=None) -> go.Figure:
+    """Validation view of the time-of-day volume baseline for one symbol.
+
+    Overlays, on one exchange-local clock axis: the ``days`` input sessions'
+    raw volume (thin gray lines, darker = more recent), the expected-volume
+    profile in use on the target session (bold purple — pass the
+    ``backtest.volume_profile`` output the strategy actually consumes), the
+    ``threshold``× spike trigger (dashed amber), and the target session's own
+    volume (gray bars, amber dots where they cross the trigger).
+
+    Args:
+        volume: One symbol's volume (UTC index).
+        baseline: Matching expected-volume series for that symbol.
+        tz: Exchange-local timezone (``panel.tz``).
+        days: Number of input sessions the profile averages over.
+        threshold: Spike multiple; draws the trigger when given.
+        symbol: Name for the title.
+        date: Target session (exchange-local date, e.g. ``"2026-06-24"``);
+            default: the last stored session.
+
+    Returns:
+        The figure.
+    """
+    volume = volume.dropna()  # the panel index is a symbol union; keep this symbol's bars
+    baseline = baseline.reindex(volume.index)
+    local = volume.index.tz_convert(tz)
+    sessions = pd.unique(local.date)
+    target = pd.Timestamp(date).date() if date is not None else sessions[-1]
+    inputs = [d for d in sessions if d < target][-days:]
+    clock = pd.Timestamp("2000-01-01") + (local - local.normalize())  # shared clock axis
+    fig = go.Figure()
+    for i, day in enumerate(inputs):
+        m = local.date == day
+        alpha = 0.2 + 0.35 * (i + 1) / len(inputs)
+        fig.add_trace(go.Scatter(
+            x=clock[m], y=volume[m], mode="lines", name=f"input {day}",
+            line={"color": f"rgba(137, 135, 129, {alpha:.2f})", "width": 1},
+            hovertemplate="%{x|%H:%M} — %{y:,.0f}<extra>" + str(day) + "</extra>"))
+    m = local.date == target
+    fig.add_trace(go.Scatter(
+        x=clock[m], y=baseline[m], mode="lines", name="profile used (avg of inputs)",
+        line={"color": SERIES[4], "width": 2.5},
+        hovertemplate="%{x|%H:%M} — %{y:,.0f}<extra>profile</extra>"))
+    if threshold:
+        fig.add_trace(go.Scatter(
+            x=clock[m], y=threshold * baseline[m], mode="lines",
+            name=f"spike trigger ({threshold}x)",
+            line={"color": SERIES[2], "width": 1.5, "dash": "dash"},
+            hovertemplate="%{x|%H:%M} — %{y:,.0f}<extra>trigger</extra>"))
+    fig.add_trace(go.Scatter(x=clock[m], y=volume[m], mode="lines",
+                             name=f"{target} volume (target day)",
+                             line={"color": SERIES[0], "width": 1.3},
+                             hovertemplate="%{x|%H:%M} — %{y:,.0f}<extra>target day</extra>"))
+    if threshold:
+        spike = volume[m] >= (threshold * baseline[m]).to_numpy()
+        if spike.any():
+            fig.add_trace(go.Scatter(
+                x=clock[m][spike.to_numpy()], y=volume[m][spike.to_numpy()], mode="markers",
+                name="volume spike", marker={"color": SERIES[2], "size": 8,
+                                             "line": {"color": "white", "width": 1}},
+                hovertemplate="%{x|%H:%M} — %{y:,.0f}<extra>volume spike</extra>"))
+    fig.update_xaxes(tickformat="%H:%M", title=f"time of day ({tz})")
+    # Log scale: the open/close U-shape would otherwise flatten the mid-day
+    # detail this figure exists to show; 4x above the profile is a constant gap.
+    fig.update_yaxes(title="volume (log)", type="log")
+    fig = _base(fig, title=f"{symbol} — {len(inputs)} input sessions vs the "
+                           f"averaged profile in use on {target}")
+    fig.update_layout(legend={"orientation": "v", "yanchor": "top", "y": 1.0,
+                              "xanchor": "left", "x": 1.005},
+                      margin={"r": 195})
+    return fig
 
 
 def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
                 *, picked: int | None = None) -> go.Figure:
     """The Sharpe-vs-return Pareto front of an optimization study.
 
-    Non-optimal trials draw as recessive gray dots, the front as connected
-    blue markers, and the picked trial as an annotated orange star.
+    Completed trials draw as a recessive gray cloud; the front as a blue
+    staircase (the exact boundary of the dominated region — a diagonal would
+    claim unattained trade-offs), each front trial direct-labeled with its
+    number; the picked trial as an orange star. Hovers carry the full
+    parameter set, so promising trials can be read straight off the figure.
 
     Args:
         front: ``optimize.pareto_frame`` output (needs ``sharpe``,
@@ -228,29 +431,83 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
     Returns:
         The figure.
     """
+    hover = ("<b>trial %{customdata[0]}</b><br>sharpe %{x:.2f} | return %{y:.1%}"
+             "<br>%{customdata[1]}<extra></extra>")
     fig = go.Figure()
     if all_trials is not None and len(all_trials):
         fig.add_trace(go.Scatter(
             x=all_trials["sharpe"], y=all_trials["total_return"], mode="markers",
-            name="all trials", marker={"color": _GRID, "size": 6},
-            hovertemplate="trial %{customdata}<br>sharpe %{x:.2f} | return %{y:.1%}<extra></extra>",
-            customdata=all_trials["trial"]))
+            name=f"all {len(all_trials)} trials",
+            marker={"color": _MUTED, "size": 5, "opacity": 0.35},
+            hovertemplate=hover, customdata=_trial_hover(all_trials)))
     front = front.sort_values("sharpe")
+    # Labels dodge their left neighbor: same-return steps get labeled above, not beside.
+    ys = front["total_return"].to_numpy()
+    span = max(ys.max() - ys.min(), 1e-9) if len(ys) else 1.0
+    positions = ["middle left"] + ["top center" if abs(b - a) / span < 0.08 else "middle left"
+                                   for a, b in zip(ys, ys[1:], strict=False)]
     fig.add_trace(go.Scatter(
-        x=front["sharpe"], y=front["total_return"], mode="lines+markers", name="Pareto front",
-        line={"color": SERIES[0], "width": 2}, marker={"size": 9},
-        hovertemplate="trial %{customdata}<br>sharpe %{x:.2f} | return %{y:.1%}<extra></extra>",
-        customdata=front["trial"]))
+        x=front["sharpe"], y=front["total_return"], mode="lines+markers+text",
+        name="Pareto front", line={"color": SERIES[0], "width": 2, "shape": "vh"},
+        marker={"size": 10, "color": SERIES[0], "line": {"color": "white", "width": 1}},
+        text=[f"trial {t} " for t in front["trial"]], textposition=positions,
+        textfont={"size": 11, "color": _INK},
+        hovertemplate=hover, customdata=_trial_hover(front)))
     if picked is not None and picked in set(front["trial"]):
         row = front[front["trial"] == picked].iloc[0]
         fig.add_trace(go.Scatter(x=[row["sharpe"]], y=[row["total_return"]], mode="markers",
-                                 name="picked", marker={"symbol": "star", "size": 16,
-                                                        "color": SERIES[7]}))
-        fig.add_annotation(x=row["sharpe"], y=row["total_return"], text=f"trial {picked}",
-                           showarrow=True, arrowhead=2, ax=30, ay=-30)
+                                 name=f"picked: trial {picked}",
+                                 marker={"symbol": "star", "size": 17, "color": SERIES[7],
+                                         "line": {"color": "white", "width": 1}},
+                                 hovertemplate=hover, customdata=_trial_hover(front[
+                                     front["trial"] == picked])))
     fig.update_xaxes(title="Sharpe ratio")
     fig.update_yaxes(title="Total return", tickformat=".0%")
     return _base(fig, title="Optimization Pareto front — Sharpe vs total return")
+
+
+def plot_heatmap_grid(stats: pd.DataFrame, *, pairs: list[tuple[str, str]],
+                      metrics: tuple[str, ...] = ("sharpe", "total_return")) -> go.Figure:
+    """Small-multiple heatmaps: one row per metric, one column per parameter pair.
+
+    The multi-objective view of a sweep: the same parameter pairs judged by
+    every metric at once, so a region that pays on return but not on Sharpe
+    (or breadth) is visible immediately. Each row shares one diverging color
+    scale centered at 0 (0.5 for the rate metrics ``win_rate`` /
+    ``pct_profitable``).
+
+    Args:
+        stats: Output of ``backtest.sweep``.
+        pairs: ``[(x_param, y_param), ...]`` — one column of heatmaps per pair.
+        metrics: One row of heatmaps per metric.
+
+    Returns:
+        The figure.
+    """
+    rows, cols = len(metrics), len(pairs)
+    fig = make_subplots(rows=rows, cols=cols, horizontal_spacing=0.09, vertical_spacing=0.16,
+                        subplot_titles=[f"mean {m} — {y} × {x}"
+                                        for m in metrics for x, y in pairs])
+    for r, metric in enumerate(metrics):
+        axis = "coloraxis" if r == 0 else f"coloraxis{r + 1}"
+        for c, (x, y) in enumerate(pairs):
+            grid = stats.pivot_table(index=y, columns=x, values=metric, aggfunc="mean")
+            fig.add_trace(go.Heatmap(
+                z=grid.values, x=grid.columns.astype(str), y=grid.index.astype(str),
+                coloraxis=axis, texttemplate="%{z:.2f}", textfont={"size": 10},
+                hovertemplate=f"{x}=%{{x}} {y}=%{{y}}<br>{metric}=%{{z:.3f}}<extra></extra>"),
+                row=r + 1, col=c + 1)
+            fig.update_xaxes(title_text=x, title_standoff=2, row=r + 1, col=c + 1)
+            fig.update_yaxes(title_text=y, title_standoff=2, row=r + 1, col=c + 1)
+        fig.update_layout({axis: {
+            "colorscale": DIVERGING,
+            "cmid": 0.5 if metric in {"win_rate", "pct_profitable"} else 0.0,
+            "colorbar": {"title": metric, "len": 0.85 / rows, "thickness": 12,
+                         "y": 1 - (r + 0.5) / rows, "yanchor": "middle"}}})
+    fig = _base(fig, title="Sweep response surfaces — every metric × parameter pair",
+                height=290 * rows + 90)
+    fig.update_layout(margin={"t": 80})
+    return fig
 
 
 def plot_coverage(cov: pd.DataFrame) -> go.Figure:

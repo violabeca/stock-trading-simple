@@ -45,6 +45,64 @@ def screen(
 
 
 @app.command()
+def import_universes(
+    path: str = typer.Option(None, help="Source universes.yaml "
+                                        "(default: ../stock-trading/config/universes.yaml)"),
+    names: str = typer.Option(None, help="Comma-separated universe names "
+                                         "(default: all not yet defined here)"),
+    overwrite: bool = typer.Option(False, help="Replace universes already defined here"),
+) -> None:
+    """Copy universes built by the sibling stock-trading repo into this one.
+
+    Both repos share one database, so symbol lists the sibling's screener
+    built (HighOctane, Trailblazers, SteadyEddies, CheapQuality) are directly
+    usable here. Imports are snapshots — re-run after the sibling regenerates.
+    """
+    from trading_simple import universe as uv
+    from trading_simple.config import PROJECT_ROOT
+
+    src = path or PROJECT_ROOT.parent / "stock-trading" / "config" / "universes.yaml"
+    wanted = [n.strip() for n in names.split(",") if n.strip()] if names else None
+    written = uv.import_universes(src, names=wanted, overwrite=overwrite)
+    for name, count in written.items():
+        typer.echo(f"universe {name}: {count} symbols imported")
+    typer.echo(f"universes: {len(written)} imported from {src}")
+
+
+@app.command()
+def subset(
+    universe: str = typer.Option(..., help="Source universe name"),
+    top: int = typer.Option(20, help="How many symbols to keep"),
+    days: int = typer.Option(90, help="Dollar-volume lookback in calendar days"),
+    name: str = typer.Option(None, help="Universe name to write (default: <universe>Top<top>)"),
+) -> None:
+    """Pin a universe's most liquid names as a new universe: <universe>Top<N>.
+
+    THE method for carving a tradable subset out of a big universe (e.g. for
+    slow 1-minute backfills and intraday strategies): rank the members by
+    average daily dollar volume (mean close x volume) over the trailing
+    --days of stored daily bars, keep the --top, and persist the list to
+    config/universes.yaml so backtests are reproducible. Re-running refreshes
+    the snapshot; strategies keep referencing the name.
+    """
+    from trading_simple import universe as uv
+    from trading_simple.config import load_settings
+    from trading_simple.db import make_engine
+
+    settings = load_settings()
+    ranked = uv.rank_by_dollar_volume(make_engine(settings),
+                                      settings.universe_symbols(universe), days=days)
+    if ranked.empty:
+        raise typer.BadParameter(f"no daily bars stored for {universe!r} — backfill 1d first")
+    picks = ranked.head(top)
+    target = name or f"{universe}Top{top}"
+    uv.write_universe(target, list(picks.index))
+    for sym, row in picks.iterrows():
+        typer.echo(f"subset {sym}: ${row['dollar_volume']:,.0f}/day")
+    typer.echo(f"universe {target}: {len(picks)} symbols written")
+
+
+@app.command()
 def backfill(
     universe: str = typer.Option(None, help="Universe name from config"),
     symbols: str = typer.Option(None, help="Comma-separated symbols (overrides --universe)"),
@@ -138,10 +196,20 @@ def optimize(
     panel = load_panel(engine, syms, d["bar"], d["start"], d.get("end"),
                        session=d.get("session", "regular"), exchanges=settings.exchanges)
     typer.echo(f"optimize {strategy}: {len(syms)} symbols, study={strat.optuna['study']}")
+    typer.echo("dashboard: uvx optuna-dashboard "
+               f"{opt.study_path(strat, strat.optuna['study'])}  "
+               "(run in another terminal, live at http://127.0.0.1:8080)")
     result = opt.run_study(strat, panel, settings=settings,
-                           n_trials=n_trials, timeout_s=timeout_s)
+                           n_trials=n_trials, timeout_s=timeout_s, verbose=True)
     typer.echo(f"study {result.study_name}: {len(result.trials)} trials total, "
                f"{len(result.best_trials)} on the Pareto front")
+    if result.best_trials:
+        report = opt.boundary_report(opt.pick_best(result).params,
+                                     strat.optuna.get("space", {}),
+                                     front=opt.pareto_frame(result))
+        for name, row in report[report["action"] != "ok"].iterrows():
+            typer.echo(f"boundary {name}: best={row['best']:g} "
+                       f"searched=[{row['low']:g}, {row['high']:g}] -> {row['action']}")
 
 
 @app.command()

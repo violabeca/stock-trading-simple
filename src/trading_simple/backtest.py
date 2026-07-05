@@ -92,7 +92,8 @@ def atr(panel: Panel, window: int = 14) -> pd.DataFrame:
 
 
 def volume_profile(
-    volume: pd.DataFrame, tz: str, *, days: int = 10, stat: str = "median", min_obs: int = 5
+    volume: pd.DataFrame, tz: str, *, days: int = 10, stat: str = "median",
+    min_obs: int = 5, smooth: int = 0
 ) -> pd.DataFrame:
     """Expected volume per bar from the average *shape* of the trading day.
 
@@ -105,6 +106,12 @@ def volume_profile(
     profile stable across DST changes; the median resists one-off blowups; the
     current bar is excluded (shift by one session).
 
+    ``smooth`` widens each time-of-day slot to ``±smooth`` bars *within the
+    same session* before profiling — 09:35 then compares to the previous days'
+    09:35±2 average rather than the single minute, which steadies the baseline
+    on thin one-minute prints. Smoothing never crosses a day boundary and only
+    ever feeds *past* sessions' values into the baseline, so no look-ahead.
+
     For daily bars every timestamp shares one time-of-day, so this degrades to
     a plain shifted rolling ``stat`` — same semantics as the classic SMA baseline.
 
@@ -113,15 +120,62 @@ def volume_profile(
         tz: Exchange-local timezone (``panel.tz``).
         days: Number of past same-time observations in the baseline.
         stat: Aggregation: ``"median"`` (robust, default) or ``"mean"``.
-        min_obs: Minimum observations before the baseline is defined.
+        min_obs: Minimum observations before the baseline is defined
+            (clamped to ``days`` so a short lookback stays valid).
+        smooth: Half-width (bars) of the centered per-session smoothing window.
 
     Returns:
         Baseline frame aligned with ``volume`` (NaN during warm-up).
     """
-    tod = volume.index.tz_convert(tz).strftime("%H:%M")
-    return volume.groupby(tod).transform(
+    min_obs = min(min_obs, days)
+    local = volume.index.tz_convert(tz)
+    if smooth:
+        volume = volume.groupby(local.date).transform(
+            lambda s: s.rolling(2 * smooth + 1, center=True, min_periods=1).mean())
+    return volume.groupby(local.strftime("%H:%M")).transform(
         lambda s: getattr(s.rolling(days, min_periods=min_obs), stat)().shift(1)
     )
+
+
+def session_mask(index: pd.DatetimeIndex, tz: str, *, skip_open: int = 0,
+                 skip_close: int = 0) -> pd.Series:
+    """True for bars outside the first/last N minutes of each trading day.
+
+    The entry blocker for intraday strategies: the open auction and the
+    closing minutes are structurally chaotic, so signals there are noise. The
+    session is defined by the *data* — each exchange-local day's first and
+    last stored bar — so half-days and venue quirks need no session table.
+
+    Args:
+        index: The panel's UTC bar index.
+        tz: Exchange-local timezone (``panel.tz``).
+        skip_open: Minutes blocked after the session's first bar.
+        skip_close: Minutes blocked before the session's last bar.
+
+    Returns:
+        Boolean Series on ``index`` (True = tradable).
+    """
+    ts = pd.Series(index, index=index)
+    day = ts.groupby(index.tz_convert(tz).date)
+    return ((ts >= day.transform("min") + pd.Timedelta(minutes=skip_open)) &
+            (ts <= day.transform("max") - pd.Timedelta(minutes=skip_close)))
+
+
+def session_end(index: pd.DatetimeIndex, tz: str) -> pd.Series:
+    """True on each exchange-local trading day's final stored bar.
+
+    OR this into an exit frame to force an intraday strategy flat at the end
+    of every session (fills at that bar's open, i.e. before the close).
+
+    Args:
+        index: The panel's UTC bar index.
+        tz: Exchange-local timezone (``panel.tz``).
+
+    Returns:
+        Boolean Series on ``index``.
+    """
+    ts = pd.Series(index, index=index)
+    return ts == ts.groupby(index.tz_convert(tz).date).transform("max")
 
 
 def next_bar(signals: pd.DataFrame) -> pd.DataFrame:
@@ -370,6 +424,25 @@ def portfolio_stats(pf) -> dict:
     }
 
 
+def symbol_stats(pf) -> pd.DataFrame:
+    """Per-symbol metric table — the cross-section behind :func:`portfolio_stats`.
+
+    The verification view: means can hide an edge carried by one name, so
+    judge a parameter set on this breakdown before believing it.
+
+    Args:
+        pf: A ``vectorbt.Portfolio`` (one column per symbol).
+
+    Returns:
+        One row per symbol (``total_return, sharpe, max_drawdown, win_rate,
+        n_trades``), sorted by total return descending.
+    """
+    m = _metric_frame(pf, pf.wrapper.columns).drop(columns="profitable")
+    m["n_trades"] = m["n_trades"].astype(int)
+    m.index.name = "symbol"
+    return m.sort_values("total_return", ascending=False)
+
+
 def _metric_frame(pf, cols: pd.Index) -> pd.DataFrame:
     """Per-column metrics with non-finite values (inf Sharpe etc.) nulled out."""
     def safe(fn) -> pd.Series:
@@ -439,21 +512,34 @@ def trade_records(pf) -> pd.DataFrame:
 
 
 def equity_curve(pf, *, init_cash: float | None = None) -> pd.DataFrame:
-    """Combined ``value`` ($) and cumulative ``return`` over time.
+    """Combined ``value`` ($), cumulative ``return``, ``fees`` and ``realized_pnl``.
 
     Symbols run as independent portfolios, so combined value is the row-sum of
-    per-symbol equity curves.
+    per-symbol equity curves. ``fees`` is the cumulative commission+slippage
+    actually paid across every fill (so an open position's entry fee counts),
+    and ``realized_pnl`` is the cumulative net profit/loss booked as positions
+    close (already net of their own fees; open positions contribute nothing).
+    Both accumulate across symbols and start at zero.
 
     Args:
         pf: A ``vectorbt.Portfolio``.
         init_cash: Per-symbol starting cash (else the first row is the base).
 
     Returns:
-        DataFrame with ``value`` and ``return`` columns.
+        DataFrame with ``value``, ``return``, ``fees`` and ``realized_pnl`` columns.
     """
     value = pf.value()
     if isinstance(value, pd.Series):
         value = value.to_frame()
     total = value.sum(axis=1)
     base = init_cash * value.shape[1] if init_cash is not None else float(total.iloc[0])
-    return pd.DataFrame({"value": total, "return": total / base - 1.0})
+    orders, trades = pf.orders.records_readable, pf.trades.records_readable
+    fees = orders.groupby("Timestamp")["Fees"].sum()
+    closed = trades[trades["Status"] == "Closed"]
+    realized = closed.groupby("Exit Timestamp")["PnL"].sum()
+    return pd.DataFrame({
+        "value": total,
+        "return": total / base - 1.0,
+        "fees": fees.reindex(total.index, fill_value=0.0).cumsum(),
+        "realized_pnl": realized.reindex(total.index, fill_value=0.0).cumsum(),
+    })

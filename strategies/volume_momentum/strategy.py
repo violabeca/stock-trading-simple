@@ -1,21 +1,27 @@
 """Volume momentum: abnormal volume decides WHEN, the price trend decides WHICH WAY.
 
-Thesis: a bar with far more volume than usual marks the arrival of new
-information or a large participant. If the market is already trending, that
-burst tends to continue the move for a short window — so we enter in the
-trend's direction at the next bar's open and exit a fixed number of bars later.
+Intraday thesis: a minute with far more volume than usual marks the arrival of
+new information or a large participant, and the burst tends to continue the
+prevailing move for a short window. All pure pandas, no look-ahead:
 
-Signals (all pure pandas, no look-ahead):
+* **spike** — volume >= ``threshold`` x its expected level. On intraday bars
+  the expectation is the **time-of-day volume profile**: today's 09:35 volume
+  is compared to the average of the last ``profile_days`` sessions at 09:35
+  (``±smooth_minutes`` around it), so the routinely heavy open/close minutes
+  never trigger by themselves (``baseline: profile``; a trailing
+  ``vol_window``-bar SMA remains available as ``baseline: sma``, the classic
+  daily-bar choice; ``auto`` picks by bar size).
+* **momentum** — SMA(fast) − SMA(slow) decides the side from the current
+  market condition alone: positive = long, negative = short. There is no
+  long/short/both switch — both directions are always live.
+* **session guards** (intraday only): no entries within the first
+  ``skip_open`` / last ``skip_close`` minutes of each session, and
+  ``eod_exit`` forces every position flat on the day's final bar.
+* **stop loss** — ``sl_pct`` sets the stop distance as a fraction of entry
+  price (e.g. 0.02 = 2%); ``sl_trail: true`` makes it follow the best price
+  since entry instead of staying fixed. Evaluated intrabar by the engine.
 
-* **spike** — volume >= ``threshold`` x its expected level. The expectation is
-  either a trailing SMA (``baseline: sma``, the classic choice for daily bars)
-  or a time-of-day volume profile (``baseline: profile``, the right choice for
-  intraday bars: it compares 09:31 volume only to other 09:31 volumes, so the
-  U-shaped intraday curve doesn't blind the detector). ``baseline: auto`` picks
-  by bar size.
-* **trend** — sign of SMA(fast) − SMA(slow).
-* Long on spike-in-uptrend, short on spike-in-downtrend (per ``direction``),
-  executed next bar, closed ``horizon`` bars later.
+Entries execute at the next bar's open; time exits ``horizon`` bars later.
 """
 
 from __future__ import annotations
@@ -35,8 +41,13 @@ def signals(
     horizon: int,
     baseline: str = "auto",
     vol_window: int = 20,
-    profile_days: int = 10,
-    direction: str = "both",
+    profile_days: int = 5,
+    smooth_minutes: int = 2,
+    skip_open: int = 15,
+    skip_close: int = 15,
+    sl_pct: float = 0.0,
+    sl_trail: bool = False,
+    eod_exit: bool = True,
 ) -> dict:
     """Build execution-timed entry/exit frames for the volume-momentum rules.
 
@@ -50,24 +61,46 @@ def signals(
             bars, sma for daily).
         vol_window: Trailing window in bars for the SMA baseline.
         profile_days: Trailing sessions for the time-of-day profile baseline.
-        direction: ``"long"`` | ``"short"`` | ``"both"``.
+        smooth_minutes: Profile smoothing half-width (compare to ±N minutes
+            around the same time-of-day; intraday only).
+        skip_open: No entries within the first N minutes of a session
+            (intraday only).
+        skip_close: No entries within the last N minutes of a session
+            (intraday only).
+        sl_pct: Stop-loss distance as a fraction of entry price; 0 disables.
+        sl_trail: True = trailing stop, False = fixed at entry.
+        eod_exit: Force positions flat on each session's final bar
+            (intraday only).
 
     Returns:
-        Dict with ``entries``, ``exits``, ``short_entries``, ``short_exits``.
+        Dict with ``entries``, ``exits``, ``short_entries``, ``short_exits``
+        and, when ``sl_pct`` is set, ``sl_stop`` / ``sl_trail``.
     """
-    base = _volume_baseline(panel, baseline, vol_window, profile_days)
+    base = _volume_baseline(panel, baseline, vol_window, profile_days, smooth_minutes)
     spike = panel.volume >= threshold * base  # NaN baseline (warm-up) compares False
     trend = bt.sma(panel.close, fast) - bt.sma(panel.close, slow)
-    none = pd.DataFrame(False, index=panel.close.index, columns=panel.close.columns)
 
-    entries = bt.next_bar(spike & (trend > 0)) if direction != "short" else none
-    short_entries = bt.next_bar(spike & (trend < 0)) if direction != "long" else none
-    return {
-        "entries": entries,
-        "exits": bt.exit_after(entries, horizon),
-        "short_entries": short_entries,
-        "short_exits": bt.exit_after(short_entries, horizon),
-    }
+    entries = bt.next_bar(spike & (trend > 0))
+    short_entries = bt.next_bar(spike & (trend < 0))
+    intraday = panel.bar != "1d"  # session guards are meaningless on daily bars
+    if intraday and (skip_open or skip_close):
+        ok = bt.session_mask(panel.close.index, panel.tz,
+                             skip_open=skip_open, skip_close=skip_close)
+        entries &= ok.to_numpy()[:, None]
+        short_entries &= ok.to_numpy()[:, None]
+
+    exits = bt.exit_after(entries, horizon)
+    short_exits = bt.exit_after(short_entries, horizon)
+    if intraday and eod_exit:
+        end = bt.session_end(panel.close.index, panel.tz).to_numpy()[:, None]
+        exits |= end
+        short_exits |= end
+
+    out = {"entries": entries, "exits": exits,
+           "short_entries": short_entries, "short_exits": short_exits}
+    if sl_pct:
+        out |= {"sl_stop": float(sl_pct), "sl_trail": bool(sl_trail)}
+    return out
 
 
 def valid(params: dict) -> bool:
@@ -84,7 +117,8 @@ def indicators(
     threshold: float,
     baseline: str = "auto",
     vol_window: int = 20,
-    profile_days: int = 10,
+    profile_days: int = 5,
+    smooth_minutes: int = 2,
     bar: str = "1d",
     tz: str = "America/New_York",
     **_,
@@ -100,20 +134,27 @@ def indicators(
         baseline: Baseline mode (see :func:`signals`).
         vol_window: SMA-baseline window.
         profile_days: Profile-baseline sessions.
+        smooth_minutes: Profile smoothing half-width (see :func:`signals`).
         bar: The panel's bar size (resolves ``baseline="auto"``).
         tz: The panel's exchange timezone (profile grouping).
         **_: Extra params from the config are ignored.
 
     Returns:
-        ``{"price": {...}, "volume": {...}}`` overlay series.
+        ``{"price", "momentum", "volume", "volume_marks"}`` overlay series:
+        the two SMAs, the trend momentum (fast−slow as a fraction of slow,
+        the long/short direction filter), the expected-volume baseline with
+        its spike trigger line, and the boolean spike bars.
     """
     frame = volume.to_frame("v")
     mode = _resolve(baseline, bar)
-    base = (bt.volume_profile(frame, tz, days=profile_days) if mode == "profile"
-            else bt.sma(frame, vol_window).shift(1))["v"]
+    base = (bt.volume_profile(frame, tz, days=profile_days, smooth=smooth_minutes)
+            if mode == "profile" else bt.sma(frame, vol_window).shift(1))["v"]
+    sma_fast, sma_slow = bt.sma(close, fast), bt.sma(close, slow)
     return {
-        "price": {f"SMA {fast}": bt.sma(close, fast), f"SMA {slow}": bt.sma(close, slow)},
+        "price": {f"SMA {fast}": sma_fast, f"SMA {slow}": sma_slow},
+        "momentum": {f"momentum {fast}−{slow} (%)": (sma_fast - sma_slow) / sma_slow},
         "volume": {"expected volume": base, f"spike trigger ({threshold}x)": threshold * base},
+        "volume_marks": volume >= threshold * base,
     }
 
 
@@ -123,8 +164,9 @@ def _resolve(baseline: str, bar: str) -> str:
 
 
 def _volume_baseline(panel: Panel, baseline: str, vol_window: int,
-                     profile_days: int) -> pd.DataFrame:
+                     profile_days: int, smooth_minutes: int) -> pd.DataFrame:
     """Expected-volume frame for the chosen baseline mode."""
     if _resolve(baseline, panel.bar) == "profile":
-        return bt.volume_profile(panel.volume, panel.tz, days=profile_days)
+        return bt.volume_profile(panel.volume, panel.tz, days=profile_days,
+                                 smooth=smooth_minutes)
     return bt.sma(panel.volume, vol_window).shift(1)  # trailing; excludes the current bar
