@@ -110,3 +110,28 @@ If the smoke run prunes every trial, the params/space are inconsistent with
 meaningless — they matter after real runs.) Report the single-backtest stats
 from the notebook (or `backtest.evaluate`) so the user sees the strategy
 actually traded.
+
+## 8 · Commit
+
+Only once the gate is green, and only if the user asked for a commit. Stage the
+whole strategy folder plus its test:
+
+```bash
+git add strategies/<name> tests/test_<name>.py
+git commit -m "add <name> strategy"
+```
+
+The `.githooks/pre-commit` hook clears the notebook's outputs and re-stages it,
+so the committed `.ipynb` is source-only (an un-cleared one runs to tens of MB
+of embedded Plotly data). Two things follow from that:
+
+- **It strips in place.** The user's own copy loses its rendered plots on
+  commit; say so, and remind them a *Run All* brings them back. Never pass
+  `--no-verify` to preserve outputs.
+- **The hook must be enabled** (`git config core.hooksPath .githooks`, once per
+  clone). If `git config core.hooksPath` comes back empty, run it before
+  committing, or the fat notebook lands in history where it is painful to
+  remove.
+
+Check `git show --stat HEAD` afterwards — the notebook should be a few dozen KB,
+not a few dozen MB.

@@ -11,8 +11,10 @@ expression, you can add a strategy.
 ```mermaid
 flowchart LR
     A["📓 01_universe_screener<br>find symbols"] -->|universes.yaml| B["📓 02_backfill<br>load history"]
-    B -->|"1d: yfinance (parallel)<br>1m: IBKR (paced)"| C[("TimescaleDB<br>prices_ohlcv")]
+    B -->|"1d: yfinance (parallel)<br>1m: IBKR (paced)"| C[("TimescaleDB<br>prices_ohlcv + alt-data")]
+    G["📓 03_altdata_update<br>insider · ratings · short interest"] -->|"SEC · Yahoo · FINRA"| C
     C -->|data.load_panel| D["backtest.py<br>ONE vectorbt engine"]
+    C -.->|features.attach_features| D
     S["strategies/&lt;name&gt;/<br>strategy.py + config.yaml"] --> D
     D <--> E["optimize.py<br>Optuna, resumable"]
     D --> F["plots.py<br>plotly figures"]
@@ -35,6 +37,9 @@ uv sync --all-extras
 
 # 2. Register the Jupyter kernel once, then select "trading-simple" in your editor
 uv run python -m ipykernel install --user --name trading-simple --display-name "trading-simple"
+
+# 2b. Enable the git hooks once — clears notebook outputs on commit (see "Committing notebooks")
+git config core.hooksPath .githooks
 
 # 3. Check the shared database is reachable (it must already be running)
 uv run tsim coverage
@@ -61,10 +66,13 @@ src/trading_simple/
   config.py                   loads the YAML + TRADING_* env overrides
   db.py, schema.sql           engine + idempotent UPSERT writers (shared DB)
   exchanges.py                venue registry: sessions, currencies, suffixes
-  providers/yf.py             daily bars from Yahoo (free, parallel-safe)
+  providers/yf.py             daily bars + analyst ratings from Yahoo (free)
   providers/ibkr.py           1-minute bars from Interactive Brokers (paced)
+  providers/sec.py            SEC EDGAR Form 4 insider trades (free, PIT-clean)
+  providers/finra.py          FINRA short interest / days-to-cover (free)
   universe.py                 Nasdaq screener → filtered, sector-capped lists
   data.py                     DB → Panel (wide adjusted OHLCV matrices)
+  features.py                 DB alt-data tables → Panel.features matrices
   backtest.py                 THE engine: run / sweep / metrics / helpers
   optimize.py                 Optuna: journal storage, Pareto front, pick_best, boundary check
   plots.py                    every figure, one consistent plotly design
@@ -75,10 +83,35 @@ strategies/
   _template/                  copy me to start a new strategy
   volume_momentum/            strategy 1: intraday volume spikes + momentum  (+ notebook)
   donchian_breakout/          strategy 2: intraday breakouts + ATR trailing stops  (+ notebook)
+  keltner_reversion/          strategy 3: intraday dip-buying at the lower Keltner band  (+ notebook)
+  squeeze_breakout/           strategy 4: intraday breakouts gated by squeeze/volume/trend confluence  (+ notebook)
+  informed_flow/              strategy 5: DAILY alt-data composite (insider + ratings + short interest)  (+ notebook)
 notebooks/
   01_universe_screener.ipynb  find symbols worth loading
-  02_backfill.ipynb           load daily AND intraday history
-tests/                        55 offline tests (synthetic data, ~5 s)
+  02_backfill.ipynb           load daily AND intraday price history
+  03_altdata_update.ipynb     load/refresh alternative data (insider, ratings, short interest)
+scripts/nbclean.py            clears notebook outputs; run on staged .ipynb by the pre-commit hook
+tests/                        offline tests (synthetic data, ~5 s)
+```
+
+## Committing notebooks
+
+Notebooks are committed as **source only, with their outputs cleared**. A single
+Plotly figure embeds the whole raw series behind it, so one backtest chart can
+weigh tens of megabytes — left unchecked the notebooks here reached 314 MB, and
+cleared they total 212 KB. Nothing is lost: every notebook runs top-to-bottom, so
+its outputs are always one *Run All* away.
+
+`.githooks/pre-commit` enforces this — it runs `scripts/nbclean.py` over any
+staged `.ipynb` and re-stages the cleared file, so a fat notebook cannot reach a
+commit by accident. It strips **in place**, meaning your own copy's plots are
+cleared too when you commit; re-run the notebook to bring them back.
+
+Enable the hook once per clone (step 2b above); to clear notebooks by hand:
+
+```bash
+git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # strip in place
+python3 scripts/nbclean.py --check <nb>                     # exit 1 if it has outputs
 ```
 
 ## Concepts in plain language
@@ -118,6 +151,19 @@ dies from 9 bps of round-trip friction was never an edge.
 fraction of entry price — e.g. an ATR multiple) and `sl_trail: true` to make
 the stop follow the best price since entry. Stops are evaluated *intrabar*
 against the high/low, not just at closes.
+
+**Alternative data.** Beyond prices, the shared database holds *non-OHLCV*
+signals — corporate-insider trades (SEC Form 4), analyst rating changes
+(Yahoo), and short interest (FINRA) — each ingested by this repo's own
+providers (no dependency on the sibling repo) and stored point-in-time: every
+row carries a `known_at` (when it became public), so features never see a value
+before it existed. A strategy opts in with a `data.features:` list in its
+config; `features.attach_features` then rides those matrices on `Panel.features`
+(one wide *date × symbol* frame per signal, already lagged), and `signals()`
+reads them like any price field. The `informed_flow` strategy ranks stocks on
+this composite; `03_altdata_update.ipynb` (or `tsim altdata`) keeps the data
+fresh. Adding a new alt-data strategy needs no engine change — just a folder and
+a `data.features:` line.
 
 **The Pareto front.** Optimization maximizes **Sharpe and total return
 together**. No single "best" exists — the result is the set of parameter sets

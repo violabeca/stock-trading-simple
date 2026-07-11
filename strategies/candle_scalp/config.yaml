@@ -1,0 +1,58 @@
+# ===========================================================================
+# candle_scalp — all tunable settings for this strategy (intraday, 1m).
+# Blocks: data (what to load), params (single-run defaults), sweep (grid
+# exploration), optuna (optimization study + search space).
+# ===========================================================================
+
+data:
+  universe: HighOctaneTop20  # top-20 HighOctane names by 90d dollar volume — "a handful of highly fluctuating stocks"
+  bar: 1m                  # intraday; needs an IBKR backfill (see 02_backfill)
+  start: "2025-07-01"      # ~10 months of stored 1m history for the train window
+  end: "2026-04-30"        # TRAIN cutoff — the ~2-month tail is the notebook's holdout
+  session: regular         # the band/ATR assume one consistent session
+  max_symbols: 40          # cap at the best-covered names
+
+params:                    # single-backtest defaults; every key is a signals() argument
+  pattern: hammer          # hammer | engulfing | any (any = location-only ablation control)
+  wick_mult: 2.0           # hammer strictness: rejection wick >= this x (body + opposite wick)
+  band_window: 120         # midline SMA (bars = minutes on 1m); the mean price overshoots
+  atr_window: 30           # ATR smoothing (bars); sets the stretch + stop scale
+  stretch_mult: 3.0        # entry stretch in ATRs below/above the midline; 0 = location gate off
+                           # shallow stretches churn to death on costs at 1m — go deep
+  trend_window: 960        # regime SMA (bars); ~2.5 sessions. 0 = trend gate off
+  vol_mult: 0.0            # entry-bar volume >= this x its time-of-day expectation; 0 = volume gate off
+  profile_days: 10         # trailing sessions in the time-of-day volume baseline
+  sl_mult: 2.0             # stop-loss distance in ATRs at entry (must be > 0)
+  tp_mult: 3.0             # take-profit distance in ATRs; 0 = no target (run to the time stop)
+  horizon: 60             # time stop (bars held) when neither stop nor target hits
+  direction: both          # long | both (short fades rallies in downtrends)
+  skip_open: 15            # no entries in the first N minutes of a session
+  skip_close: 15           # no entries in the last N minutes of a session
+  eod_exit: true           # flat on each session's final bar (intraday only)
+
+sweep:                     # coarse grid (24 combos; all valid at these band/trend/sl defaults)
+  pattern: [hammer, engulfing, any]
+  stretch_mult: [2.0, 4.0]
+  tp_mult: [2.0, 4.0]
+  horizon: [30, 120]
+
+optuna:
+  study: candle_scalp-1m-v1  # journal file: studies/<study>.log (rename = fresh study)
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 7
+  n_trials: 1000
+  space:                   # declarative search space -> optimize.suggest_params
+    # pattern=any and stretch_mult=0 are the two ablation controls, searched first-class;
+    # trend/volume gates stay ON in the search (ablate them by hand in the notebook).
+    pattern:      { type: categorical, choices: [hammer, engulfing, any] }
+    wick_mult:    { type: float, low: 1.0,  high: 5.0,  step: 0.5 }   # only bites for pattern=hammer
+    band_window:  { type: int,   low: 10,   high: 180,  log: true }   # a scalp's reversion mean is short
+    atr_window:   { type: int,   low: 5,    high: 120,  log: true }
+    stretch_mult: { type: float, low: 0.0,  high: 8.0,  step: 0.25 }  # 0 = location off (tests naked candles)
+    trend_window: { type: int,   low: 180,  high: 2000, log: true }   # regime filter, kept slower than the band
+    vol_mult:     { type: float, low: 0.0,  high: 5.0,  step: 0.5 }    # 0 = volume gate off
+    sl_mult:      { type: float, low: 0.5,  high: 6.0,  step: 0.5 }    # a scalp always keeps a stop
+    tp_mult:      { type: float, low: 0.0,  high: 8.0,  step: 0.5 }    # 0 = no target, run to time/EOD
+    horizon:      { type: int,   low: 10,   high: 480,  log: true }    # up to ~1.25 sessions
+    direction:    { type: categorical, choices: [long, both] }        # fade dips only, or rips too
+    eod_exit:     { type: categorical, choices: [true, false] }        # flat at close vs hold overnight

@@ -88,6 +88,53 @@ def run_backfill(
     return done
 
 
+def altdata_cmd(
+    dataset: str, *, since: str, universe: str | None = None,
+    symbols: list[str] | None = None,
+) -> list[str]:
+    """Compose a ``tsim altdata`` command line (pure; unit-testable).
+
+    Args:
+        dataset: Dataset name (``insider`` | ``ratings`` | ``short_interest`` | ``all``).
+        since: First day, ``YYYY-MM-DD``.
+        universe: Universe name (used when ``symbols`` is omitted).
+        symbols: Explicit symbol list (overrides ``universe``).
+
+    Returns:
+        The argv list.
+    """
+    cmd = [*_CLI, "altdata", "--dataset", dataset, "--since", since]
+    if symbols:
+        cmd += ["--symbols", ",".join(symbols)]
+    elif universe:
+        cmd += ["--universe", universe]
+    return cmd
+
+
+def run_altdata(
+    dataset: str, *, since: str, universe: str | None = None,
+    symbols: list[str] | None = None,
+) -> None:
+    """Ingest one alt-data dataset via a single streamed ``tsim altdata`` subprocess.
+
+    Never fans out: SEC EDGAR and FINRA rate-limit per IP, so one paced process
+    is both the safe and the correct option (the same rule as IBKR). Per-symbol
+    progress lines stream live into the notebook.
+
+    Args:
+        dataset: Dataset name (``insider`` | ``ratings`` | ``short_interest`` | ``all``).
+        since: First day, ``YYYY-MM-DD``.
+        universe: Universe name (used when ``symbols`` is omitted).
+        symbols: Explicit symbol list (overrides ``universe``).
+    """
+    cmd = altdata_cmd(dataset, since=since, universe=universe, symbols=symbols)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, cwd=PROJECT_ROOT)
+    for line in proc.stdout:
+        print(line, end="")
+    proc.wait()
+
+
 def run_ibkr_backfill(
     symbols: list[str], *, since: str, until: str | None = None, bar: str = "1m",
     port: int | None = None, client_id: int = 10, extended_hours: bool | None = None,

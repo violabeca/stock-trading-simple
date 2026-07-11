@@ -1,0 +1,11 @@
+#!/bin/sh
+# Clear notebook outputs before they reach a commit -- see scripts/nbclean.py.
+# Enable with: git config core.hooksPath .githooks
+set -e
+
+notebooks=$(git diff --cached --name-only --diff-filter=ACM -- '*.ipynb')
+[ -z "$notebooks" ] && exit 0
+
+# Strips in place, so re-stage whatever it rewrote.
+echo "$notebooks" | xargs python3 scripts/nbclean.py
+echo "$notebooks" | xargs git add

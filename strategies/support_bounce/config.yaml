@@ -1,0 +1,72 @@
+# ===========================================================================
+# support_bounce — all tunable settings for this strategy (intraday, 1m).
+# Blocks: data (what to load), params (single-run defaults), sweep (grid
+# exploration), optuna (optimization study + search space).
+# NOTE: every window param (level/ema/atr/tf/max_hold) is in MINUTES and is
+# converted to bars inside signals() from panel.bar (1m=1, 5m=5, 1h=60,
+# 1d=390 min/bar) — the same config compares candle intervals via tf_minutes.
+# ===========================================================================
+
+data:
+  universe: HighOctaneTop20  # top-20 HighOctane names by 90d dollar volume (tsim subset)
+  bar: 1m                  # intraday; needs an IBKR backfill (see 02_backfill)
+  start: "2025-07-01"      # ~10 months of stored 1m history for the train window
+  end: "2026-04-30"        # TRAIN cutoff — the ~2-month tail is the notebook's holdout
+  session: regular         # levels assume one consistent session
+  max_symbols: 40          # cap at the best-covered names
+
+params:                    # single-backtest defaults; every key is a signals() argument
+  level_window: 780        # support lookback in MINUTES (~2 sessions): rolling min of low, shifted
+  min_touches: 2           # distinct prior tests the level needs; 0 = tested-level filter off
+  touch_tol: 0.25          # touch band in ATRs above the level — defines "tests" AND the dip target
+  entry_dist: 0.75         # entry zone height in ATRs above the level (smaller = closer = rarer)
+  entry_mode: bounce       # touch = enter on the dip (limit-order stand-in) | bounce = close must
+                           # reclaim the band first (confirmation against adverse selection)
+  tf_minutes: 5            # trigger candle interval derived from 1m bars: dip = lowest low of the
+                           # trailing N minutes; THE "which interval" knob (must be <= skip_open)
+  ema_fast: 240            # regime fast EMA (minutes)
+  ema_slow: 960            # regime slow EMA (minutes, ~2.5 sessions); capped ~5 sessions in the
+                           # space — slower regime filters fit the train tape (keltner lesson)
+  regime_dz: 0.002         # dead zone: bull/bear only when the EMAs diverge this fraction;
+                           # in between = sideways
+  allow_sideways: true     # enter in bull + sideways; false = bull only (bear never enters)
+  atr_window: 30           # ATR smoothing (minutes); fixed — the ATR multipliers are the knobs
+  sl_atr: 3.0              # stop distance in ATRs — deliberately wide, below the level's noise
+                           # band (valid() forces sl_atr > entry_dist + touch_tol); never tight
+  sl_trail: false          # true = trail the stop behind the best price (lock in profit) |
+                           # false = fixed at entry — THE user question, swept and searched
+  tp_mult: 0.0             # take-profit in ATRs; 0 = no target (run to time/regime/EOD exits)
+  max_hold: 240            # time stop (minutes held) when the bounce never comes
+  exit_on_bear: true       # regime flip to bear also exits (next bar open)
+  eod_exit: false          # false = a bounce may ride overnight (the gap carried the edge in the
+                           # keltner study); true = flat on each session's final bar — both searched
+  skip_open: 15            # no entries in the first N minutes of a session
+  skip_close: 15           # no entries in the last N minutes of a session
+
+sweep:                     # coarse grid (12 combos, all valid at the defaults): the user's two
+  entry_mode: [touch, bounce]      # core questions (entry style, trail) x the interval knob
+  tf_minutes: [1, 5, 15]
+  sl_trail: [false, true]
+
+optuna:
+  study: support_bounce-1m-v1  # journal file: studies/<study>.log (rename = fresh study)
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 7
+  n_trials: 1500
+  space:                   # declarative search space -> optimize.suggest_params
+    level_window:   { type: int,   low: 130,  high: 1560, log: true }   # ~1/3 .. 4 sessions
+    min_touches:    { type: int,   low: 0,    high: 4 }                 # 0 = filter off (ablation)
+    touch_tol:      { type: float, low: 0.1,  high: 0.75, step: 0.05 }  # valid() needs < entry_dist
+    entry_dist:     { type: float, low: 0.25, high: 2.5,  step: 0.25 }
+    entry_mode:     { type: categorical, choices: [touch, bounce] }
+    tf_minutes:     { type: categorical, choices: [1, 5, 15] }          # 1m vs 5m vs 15m trigger
+    ema_fast:       { type: int,   low: 30,   high: 600,  log: true }
+    ema_slow:       { type: int,   low: 120,  high: 2000, log: true }   # capped: slow regimes overfit
+    allow_sideways: { type: categorical, choices: [true, false] }
+    sl_atr:         { type: float, low: 1.5,  high: 8.0,  step: 0.25 }  # floor: tight stops on a
+                                                                        # reversion entry = fake Sharpe
+    sl_trail:       { type: categorical, choices: [true, false] }       # trail-to-lock vs fixed
+    tp_mult:        { type: float, low: 0.0,  high: 8.0,  step: 0.5 }   # 0 = no target
+    max_hold:       { type: int,   low: 30,   high: 1560, log: true }   # up to ~4 sessions
+    exit_on_bear:   { type: categorical, choices: [true, false] }
+    eod_exit:       { type: categorical, choices: [true, false] }       # flat at close vs overnight

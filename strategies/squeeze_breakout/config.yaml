@@ -1,0 +1,61 @@
+# ===========================================================================
+# squeeze_breakout — all tunable settings for this strategy (intraday, 1m).
+# Blocks: data (what to load), params (single-run defaults), sweep (grid
+# exploration), optuna (optimization study + search space).
+# ===========================================================================
+
+data:
+  universe: HighOctaneTop20  # top-20 HighOctane names by 90d dollar volume (tsim subset)
+  bar: 1m                  # intraday; needs an IBKR backfill (see 02_backfill)
+  start: "2025-07-01"      # ~10 months of stored 1m history for the train window
+  end: "2026-04-30"        # TRAIN cutoff — the ~2-month tail is the notebook's holdout
+  session: regular         # channel + volume profile assume one consistent session
+  max_symbols: 40          # cap at the best-covered names
+
+params:                    # single-backtest defaults; every key is a signals() argument
+  break_window: 60         # channel lookback (bars = minutes on 1m); breakout = new N-bar extreme
+  trend_window: 390        # regime SMA (bars; 390 = one session); 0 disables the trend gate
+  atr_window: 14           # ATR smoothing (bars); squeeze numerator + spot leg of the stop scale
+  squeeze_window: 390      # ATR baseline (bars) — "normal" volatility for gate AND stop scale
+  squeeze_thresh: 0.6      # squeeze gate: lagged ATR/baseline must be below; 0 disables.
+                           # Measured on this panel the ratio's MEDIAN is ~0.82 — the
+                           # selective regime is ~0.45-0.7, so 0.8 would be a coin-flip gate
+  squeeze_lag: 5           # bars the squeeze ratio is lagged ("quiet before the move STARTED")
+  vol_mult: 3.0            # participation gate: k-bar volume sum vs expected; 0 disables
+  vol_bars: 3              # bars in the participation sums (decorrelates gate from the break bar)
+  profile_days: 10         # sessions in the time-of-day volume baseline
+  sl_mult: 2.0             # stop distance in stop-scale units (max of ATR and its baseline)
+  tp_mult: 0.0             # profit target in the same units; 0 = no target, winners run
+  horizon: 60              # time stop (bars held) when the break goes nowhere
+  direction: both          # long | short | both (gates are symmetric)
+  skip_open: 15            # no entries in the first N minutes of a session
+  skip_close: 15           # no entries in the last N minutes of a session
+  eod_exit: true           # flat on each session's final bar; nothing held overnight
+
+sweep:                     # coarse grid (24 combos; valid() reads trend/break/sl/tp — keep all here)
+  squeeze_thresh: [0.5, 0.6, 0.7]
+  vol_mult: [2.0, 4.0]
+  break_window: [30, 60]
+  trend_window: [390]
+  sl_mult: [2.0]
+  tp_mult: [0.0, 3.0]      # no-target vs 1.5R bracket, side by side
+
+optuna:
+  study: squeeze-1m-v1     # journal file studies/squeeze-1m-v1.log; rename to start fresh
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 42
+  n_trials: 1000
+  space:                   # declarative search space -> optimize.suggest_params
+    # Gates stay ON everywhere in these ranges — turning a gate off is the notebook's
+    # ablation job, not the optimizer's. A front piling on squeeze_thresh's high edge or
+    # vol_mult's low edge means "gate not earning its keep": remove it, don't widen.
+    break_window:   { type: int,   low: 15,   high: 240, log: true }
+    trend_window:   { type: categorical, choices: [240, 390, 780] }  # regime switch, not a fine dial
+    squeeze_thresh: { type: float, low: 0.45, high: 0.85, step: 0.05 }  # 0.45 ~ 2nd pct, 0.85 ~ median
+    vol_mult:       { type: float, low: 1.5,  high: 6.0,  step: 0.25 }
+    sl_mult:        { type: float, low: 1.0,  high: 5.0,  step: 0.25 }  # <1 ATR = noise-floor stops
+    tp_mult:        { type: float, low: 0.0,  high: 10.0, step: 0.5 }
+    # (a boundary "widen low" flag on tp_mult just means the front prefers no target — 0 is the floor)
+    horizon:        { type: int,   low: 15,   high: 390,  log: true }   # <15m rarely clears costs
+    # frozen structural params (not searched): atr_window, squeeze_window, squeeze_lag,
+    # vol_bars, profile_days, direction, skip_open/skip_close, eod_exit

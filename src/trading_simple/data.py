@@ -36,6 +36,11 @@ class Panel:
         tz: Exchange-local timezone of the panel's (first) venue — used by
             time-of-day indicators such as the volume profile.
         rth: Boolean regular-session mask (only set when ``session="both"``).
+        features: Optional alternative-data feature matrices, each a wide
+            ``(index x symbol)`` daily frame aligned to this panel and already
+            point-in-time lagged, keyed by feature name (e.g. ``"insider"``).
+            Populated by :func:`trading_simple.features.attach_features` for
+            alt-data strategies; ``None`` for ordinary price-only strategies.
     """
 
     close: pd.DataFrame
@@ -46,6 +51,7 @@ class Panel:
     bar: str
     tz: str = "America/New_York"
     rth: pd.DataFrame | None = field(default=None)
+    features: dict[str, pd.DataFrame] | None = field(default=None)
 
     @property
     def freq(self) -> str:

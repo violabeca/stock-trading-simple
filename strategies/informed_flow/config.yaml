@@ -1,0 +1,50 @@
+# ===========================================================================
+# informed_flow — daily cross-sectional composite of alternative-data signals
+# (insider buying + analyst rating changes + short-interest avoidance).
+# Blocks: data (what to load, incl. the alt-data feature matrices), params
+# (single-run defaults), sweep (grid exploration), optuna (study + search space).
+# ===========================================================================
+
+data:
+  universe: LiquidLeaders  # ~100 liquid US names — breadth for cross-sectional ranking
+  bar: 1d                  # daily bars (alt-data signals act over weeks–months)
+  start: "2020-01-01"      # history from 2020; the ~63d warm-up trims the first quarter
+  end: "2024-12-31"        # TRAIN cutoff — 2025+ is the notebook's untouched holdout
+  session: regular         # daily bars are all regular-session
+  max_symbols: 100         # cap at the best-covered names
+  features: [insider, ratings, short_interest]  # attached to Panel.features at load time
+
+params:                    # single-backtest defaults; every key is a signals() argument
+  insider_window: 63       # trailing bars for insider dollars, normalizer, eligibility (~1 quarter)
+  rating_halflife: 21      # EMA half-life (bars) for the rating-change stream (~1 month)
+  w_insider: 0.4           # composite weight: insider buying
+  w_rating: 0.3            # composite weight: rating-change momentum
+  w_dtc: 0.3               # composite weight: low days-to-cover (dropped if short interest absent)
+  q_in: 0.8               # enter when composite rank is top 20% cross-sectionally
+  q_out: 0.6               # exit when rank falls below 60% (hysteresis band vs q_in damps turnover)
+  max_hold: 126            # time-stop backstop (~6 months) if the rank never drops out
+  min_events: 1            # min insider+rating events in the window to be rankable
+
+sweep:                     # coarse grid (16 combos; all satisfy valid(): q_out < q_in, weights > 0)
+  w_insider: [0.4, 0.6]
+  w_rating: [0.3]
+  w_dtc: [0.0, 0.3]        # 0.0 ablates short interest, so its marginal value is visible
+  q_in: [0.8, 0.9]
+  q_out: [0.6]
+  insider_window: [63, 126]
+
+optuna:
+  study: informed-flow-1d-v1  # journal file studies/informed-flow-1d-v1.log; rename to start fresh
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 42
+  n_trials: 400
+  space:                   # declarative search space -> optimize.suggest_params
+    insider_window:  { type: int,   low: 21,  high: 189, log: true }
+    rating_halflife: { type: int,   low: 5,   high: 90,  log: true }
+    w_insider:       { type: float, low: 0.0, high: 1.0, step: 0.1 }
+    w_rating:        { type: float, low: 0.0, high: 1.0, step: 0.1 }
+    w_dtc:           { type: float, low: 0.0, high: 1.0, step: 0.1 }
+    q_in:            { type: float, low: 0.6, high: 0.95, step: 0.05 }
+    q_out:           { type: float, low: 0.4, high: 0.9,  step: 0.05 }
+    max_hold:        { type: int,   low: 21,  high: 252, log: true }
+    min_events:      { type: int,   low: 1,   high: 3 }

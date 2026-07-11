@@ -165,6 +165,91 @@ def backfill(
 
 
 @app.command()
+def altdata(
+    dataset: str = typer.Option("all", help="insider | ratings | short_interest | all"),
+    universe: str = typer.Option(None, help="Universe name from config"),
+    symbols: str = typer.Option(None, help="Comma-separated symbols (overrides --universe)"),
+    since: datetime = typer.Option(..., formats=["%Y-%m-%d"], help="First day (YYYY-MM-DD)"),
+) -> None:
+    """Ingest alternative data into the shared database (idempotent UPSERT).
+
+    This repo's own providers — SEC EDGAR Form 4 (insider), Yahoo Finance
+    (analyst rating changes), FINRA (short interest) — populate the alt-data
+    tables consumed by :mod:`trading_simple.features`, with no dependency on the
+    sibling repo. Prints one ``altdata <ds> <SYM>: N rows`` line per symbol and a
+    final ``altdata: N rows written`` (the notebook helpers parse these).
+    """
+    from trading_simple.config import load_settings
+    from trading_simple.db import Security, make_engine, upsert_securities
+
+    logging.basicConfig(level=logging.WARNING)
+    settings = load_settings()
+    syms = ([s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols
+            else settings.universe_symbols(universe or "starter"))
+    start = since.date()
+    datasets = ("insider", "ratings", "short_interest") if dataset == "all" else (dataset,)
+
+    engine = make_engine(settings)
+    upsert_securities(engine, [Security(symbol=s) for s in syms])  # FK before alt-data rows
+    total = sum(_run_altdata(ds, engine, settings, syms, start) for ds in datasets)
+    typer.echo(f"altdata: {total} rows written")
+
+
+def _run_altdata(ds: str, engine, settings, syms: list[str], start: date) -> int:
+    """Ingest one alt-data dataset for ``syms`` since ``start``; return rows written.
+
+    Per-symbol network sources (insider, ratings) are fetched one symbol at a
+    time so a single failure is isolated and reported, never aborting the run.
+    Short interest is one batched FINRA request for the whole symbol list.
+
+    Args:
+        ds: Dataset name (``insider`` | ``ratings`` | ``short_interest``).
+        engine: Database engine.
+        settings: Resolved settings (for exchange overrides).
+        syms: Symbols to ingest.
+        start: Earliest date to fetch.
+
+    Returns:
+        Number of rows written for this dataset.
+    """
+    from trading_simple.db import upsert_insider, upsert_ratings, upsert_short_interest
+
+    total = 0
+    if ds == "insider":
+        from trading_simple.providers.sec import fetch_insider
+        for sym in syms:
+            try:
+                rows = fetch_insider(sym, start)
+            except Exception as exc:  # noqa: BLE001 — isolate a bad symbol
+                typer.echo(f"altdata insider {sym}: 0 rows ({exc})")
+                continue
+            total += upsert_insider(engine, rows)
+            typer.echo(f"altdata insider {sym}: {len(rows)} rows")
+    elif ds == "ratings":
+        from trading_simple.providers.yf import fetch_ratings
+        for sym in syms:
+            try:
+                rows = fetch_ratings(sym, start, exchanges=settings.exchanges)
+            except Exception as exc:  # noqa: BLE001
+                typer.echo(f"altdata ratings {sym}: 0 rows ({exc})")
+                continue
+            total += upsert_ratings(engine, rows)
+            typer.echo(f"altdata ratings {sym}: {len(rows)} rows")
+    elif ds == "short_interest":
+        from trading_simple.providers.finra import fetch_short_interest
+        try:
+            rows = fetch_short_interest(syms, start)
+            total += upsert_short_interest(engine, rows)
+            typer.echo(f"altdata short_interest: {len(rows)} rows across {len(syms)} symbols")
+        except Exception as exc:  # noqa: BLE001
+            typer.echo(f"altdata short_interest: 0 rows ({exc})")
+    else:
+        raise typer.BadParameter(
+            f"Unknown dataset {ds!r} (insider | ratings | short_interest | all)")
+    return total
+
+
+@app.command()
 def optimize(
     strategy: str = typer.Option(..., help="Strategy folder name, e.g. volume_momentum"),
     n_trials: int = typer.Option(None, help="Trials to run (default: strategy config)"),
@@ -195,6 +280,9 @@ def optimize(
                              d["start"], d.get("end"), limit=d.get("max_symbols"))
     panel = load_panel(engine, syms, d["bar"], d["start"], d.get("end"),
                        session=d.get("session", "regular"), exchanges=settings.exchanges)
+    if d.get("features"):  # attach alt-data feature matrices for alt-data strategies
+        from trading_simple import features
+        features.attach_features(panel, engine, d["features"], settings=settings)
     typer.echo(f"optimize {strategy}: {len(syms)} symbols, study={strat.optuna['study']}")
     typer.echo("dashboard: uvx optuna-dashboard "
                f"{opt.study_path(strat, strat.optuna['study'])}  "
