@@ -34,9 +34,39 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 #: The two study objectives, both maximized, in this order.
-OBJECTIVES = ("sharpe", "total_return")
-#: Secondary metrics attached to each trial as user attributes.
-EXTRA_METRICS = ("max_drawdown", "win_rate", "pct_profitable", "n_trades")
+#:
+#: **Benchmark-relative, deliberately.** Optimizing an *absolute* Sharpe and return
+#: rewards market exposure rather than skill: a long-only strategy in a rising market
+#: raises both simply by owning more names for longer, so the optimizer drifts toward
+#: becoming the index. (Observed, not theoretical — `informed_flow` did exactly this:
+#: it pushed its entry quantile to the least selective value allowed and still lost to
+#: buy-and-hold on both train and holdout, while posting a "good" Sharpe of 0.94.)
+#:
+#: **Per-year, equally deliberately.** Both objectives are annualized, so they measure
+#: the same thing per unit of time. A *cumulative* excess return does not: it grows with
+#: the length of the backtest window, so it silently rewards a long window for being
+#: long. That makes it useless for comparing strategies (this repo's windows run from one
+#: month to four years) and — worse, because it is easy to miss — useless for comparing
+#: **walk-forward folds of unequal length within a single strategy**, which is exactly
+#: what the fold-picking code does. Mixing one annualized objective with one cumulative
+#: one, as this study did before, is incoherent on its own terms.
+#:
+#: Both are measured against an equal-weight buy-and-hold of the same panel
+#: (:func:`backtest.benchmark`), so a strategy scores above zero only by beating the
+#: market it trades in. Absolute Sharpe and return are still recorded on every trial —
+#: as diagnostics, not as targets.
+#:
+#: What is deliberately NOT normalized away: **time in market**. Scaling a 30%-invested
+#: strategy's return up by 3x to "compare it fairly" inverts the truth — sitting in cash
+#: is a real cost paid against a fully-invested benchmark, and it is the very thing that
+#: has to be earned back. The benchmark-relative framing prices it correctly already.
+OBJECTIVES = ("info_ratio", "excess_cagr")
+#: Secondary metrics attached to each trial as user attributes. ``years`` and
+#: ``trades_per_year`` are the sample size behind the objectives: annualizing makes a
+#: one-month backtest *comparable*, it does not make it *trustworthy*, so the evidence
+#: rides along with the claim.
+EXTRA_METRICS = ("sharpe", "cagr", "total_return", "max_drawdown", "win_rate",
+                 "pct_profitable", "n_trades", "trades_per_year", "years")
 
 
 def study_path(strategy: LoadedStrategy, study_name: str):
@@ -132,7 +162,7 @@ def suggest_params(trial: optuna.Trial, space: dict[str, dict]) -> dict:
 
 def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
               settings: Settings) -> tuple[float, float]:
-    """Evaluate one trial: suggest params, backtest, return (sharpe, return).
+    """Evaluate one trial: suggest params, backtest, return the benchmark-relative pair.
 
     Invalid parameter combos and degenerate results (NaN metrics — usually
     zero trades) are pruned rather than scored, so they never pollute the
@@ -145,7 +175,8 @@ def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
         settings: Global settings.
 
     Returns:
-        ``(sharpe, total_return)``.
+        ``(info_ratio, excess_cagr)`` — see :data:`OBJECTIVES` for why these and not
+        the absolute Sharpe, and why per-year and not cumulative.
 
     Raises:
         optuna.TrialPruned: For invalid or degenerate parameter sets.
@@ -180,9 +211,12 @@ def progress_callback():
         if trial.state != optuna.trial.TrialState.COMPLETE:
             print(f"trial {trial.number:>4}: {trial.state.name.lower()} | {params}", flush=True)
             return
-        sharpe, total_return = trial.values
-        print(f"trial {trial.number:>4}: sharpe={sharpe:+.3f} return={total_return:+.1%} "
-              f"front={len(study.best_trials)} | {params}", flush=True)
+        # Print the objectives by their real names. Hard-coding "sharpe=" here once meant
+        # the live log claimed to show a metric the study had long since stopped using.
+        scored = " ".join(f"{name}={value:+.3f}"
+                          for name, value in zip(OBJECTIVES, trial.values, strict=True))
+        print(f"trial {trial.number:>4}: {scored} front={len(study.best_trials)} | {params}",
+              flush=True)
 
     return report
 
@@ -279,7 +313,7 @@ def pareto_frame(study: optuna.Study) -> pd.DataFrame:
         study: An Optuna study.
 
     Returns:
-        One row per distinct Pareto trial, sorted by Sharpe descending.
+        One row per distinct Pareto trial, sorted by the first objective descending.
     """
     rows = [
         {"trial": t.number, **t.params,
@@ -295,12 +329,12 @@ def pick_best(study: optuna.Study, *, weights: tuple[float, float] = (1.0, 1.0))
     """Reduce the Pareto front to ONE trial under an explicit preference.
 
     Each objective is min-max normalized across the front, then the trial
-    with the highest weighted sum wins. ``weights=(1, 0)`` = pure Sharpe,
-    ``(1, 1)`` = balanced, ``(0, 1)`` = pure return.
+    with the highest weighted sum wins. ``weights=(1, 0)`` = pure ``info_ratio``,
+    ``(1, 1)`` = balanced, ``(0, 1)`` = pure ``excess_cagr``.
 
     Args:
         study: An Optuna study with at least one completed trial.
-        weights: Importance of (sharpe, total_return).
+        weights: Importance of each entry of :data:`OBJECTIVES`, in that order.
 
     Returns:
         The chosen ``optuna.trial.FrozenTrial`` (its ``.params`` re-runs the

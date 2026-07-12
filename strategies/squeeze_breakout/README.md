@@ -63,9 +63,11 @@ cycles need volatility, 1-minute fills need liquidity. `data.end` is the
 **train cutoff**: Optuna and the sweep only ever see data up to it, and the
 notebook replays the picked parameters once on the untouched ~2-month tail.
 
-**Reading the optimization honestly.** The study's Sharpe objective is a
-per-symbol mean in which silent symbols vanish, and a four-gate strategy owns
-a selectivity dial — so the front's Sharpe end attracts few-trade artifacts.
+**Reading the optimization honestly.** The objectives are now
+benchmark-relative and annualized (`info_ratio` / `excess_cagr` vs equal-weight
+buy-and-hold; the shipped study predates that change, so its journal's values
+are old-objective — re-run before trusting the front). A four-gate strategy
+owns a selectivity dial, so the front's ratio end attracts few-trade artifacts.
 The notebook therefore **filters the front to ≥ 300 train trades** before
 picking, ablates each gate (a gate whose removal doesn't hurt is documented
 as not earning its keep — a front piling on a gate's off-edge means the same

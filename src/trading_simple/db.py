@@ -102,6 +102,29 @@ class RatingChange:
 
 
 @dataclass(slots=True)
+class PriceTarget:
+    """One sell-side analyst price-target event.
+
+    ``known_at`` is the announcement timestamp. ``pt_action`` is Benzinga's raw
+    label (``Raises | Lowers | Maintains | Announces``). ``pt_prior`` is ``None``
+    when the analyst had no previous target — never ``0.0``, which a revision
+    ratio would read as a -100% cut.
+
+    Distinct from :class:`RatingChange` on purpose: most target revisions arrive
+    with the *rating unchanged*, so the two carry near-orthogonal information.
+    """
+
+    symbol: str
+    firm: str | None
+    pt_action: str | None
+    pt_current: float | None
+    pt_prior: float | None
+    rated_at: date
+    known_at: datetime
+    source: str
+
+
+@dataclass(slots=True)
 class ShortInterest:
     """One FINRA bi-monthly consolidated short-interest observation.
 
@@ -137,7 +160,7 @@ def make_engine(settings: Settings | None = None) -> Engine:
 
 
 #: Alt-data tables with a BIGSERIAL ``id`` this repo inserts into.
-_SERIAL_TABLES = ("insider_trades", "analyst_ratings")
+_SERIAL_TABLES = ("insider_trades", "analyst_ratings", "analyst_price_targets")
 
 
 def apply_schema(engine: Engine) -> None:
@@ -271,6 +294,26 @@ def upsert_ratings(engine: Engine, ratings: list[RatingChange]) -> int:
         ON CONFLICT ON CONSTRAINT analyst_ratings_uq DO NOTHING
     """
     return _executemany(engine, sql, [asdict(r) for r in ratings])
+
+
+def upsert_price_targets(engine: Engine, targets: list[PriceTarget]) -> int:
+    """Insert analyst price targets, ignoring duplicates (key: ``analyst_price_targets_uq``).
+
+    Args:
+        engine: Target database engine.
+        targets: Price-target events to write.
+
+    Returns:
+        Number of rows submitted.
+    """
+    sql = """
+        INSERT INTO analyst_price_targets (symbol, firm, pt_action, pt_current, pt_prior,
+                                           rated_at, known_at, source)
+        VALUES (:symbol, :firm, :pt_action, :pt_current, :pt_prior,
+                :rated_at, :known_at, :source)
+        ON CONFLICT ON CONSTRAINT analyst_price_targets_uq DO NOTHING
+    """
+    return _executemany(engine, sql, [asdict(t) for t in targets])
 
 
 def upsert_short_interest(engine: Engine, rows: list[ShortInterest]) -> int:

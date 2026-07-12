@@ -23,7 +23,7 @@ uv run pytest tests/test_backtest.py::test_name -q   # run a single test / file
 uv run ruff check .                  # style gate (line length 100)
 uv run tsim coverage                 # checks the shared DB is reachable
 uv run tsim optimize --strategy <name> --n-trials 5   # smoke-runs a strategy end to end
-uv run tsim altdata --dataset all --universe LiquidLeaders --since 2020-01-01  # ingest alt-data
+uv run tsim altdata --dataset all --universe LiquidLeaders --since 2020-01-01  # ingest alt-data (prefer notebooks/03_altdata_update.ipynb — it audits coverage)
 git config core.hooksPath .githooks   # once per clone — enables the notebook-clearing pre-commit hook
 git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook outputs by hand
 ```
@@ -35,14 +35,62 @@ git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook out
   and a `config.yaml` with `data / params / sweep / optuna` blocks. Adding a
   strategy must never require touching `src/trading_simple/` — if it seems to,
   the design is wrong; stop and reconsider.
+- **Two execution models; pick the one the strategy actually is.** `signals()`
+  returning `entries`/`exits` runs **per-symbol**: every symbol gets its own
+  `init_cash` in its own account. Returning a `weights` frame (target fraction of the
+  book per symbol) runs **portfolio mode**: ONE shared cash account of `init_cash`
+  *total*, so a buy must be funded by a sell (`from_orders`, `group_by=True`,
+  `cash_sharing=True`, `call_seq="auto"`). Per-symbol is right for a per-symbol signal
+  and **fatal for a cross-sectional ranker**: cash attached to a name it is flat in sits
+  idle, so a strategy holding 40 of 100 names is structurally ~30% invested against a
+  100%-invested benchmark and cannot beat it however well it picks. (`informed_flow`
+  lost 500/500 trials to buy-and-hold on exactly this.) In portfolio mode the dollar
+  amount is a *reporting scale* — with fractional shares everything is scale-invariant —
+  so what actually constrains the book is the number of slots, not the $10k.
+  A signal strategy can also return `cash_frac` (a scalar) alongside `entries`/`exits`
+  to run the **cash-shared wallet** variant: ONE `init_cash` book, each entry deploying
+  that fraction of the free cash — total invested can never exceed the wallet, the way
+  a real single account trades a multi-symbol scanner (`support_bounce` does this).
+  Per-symbol books remain the default.
+- **Beat the benchmark, never the zero line — and never on a cumulative number.**
+  Two independent traps, both of which have bitten this repo.
+  *(a) Absolute vs relative.* A long-only strategy in a rising market earns a positive
+  Sharpe *just by being invested*, so an absolute Sharpe cannot separate skill from
+  market exposure, and optimizing it actively rewards exposure. `optimize.OBJECTIVES`
+  therefore maximizes `info_ratio` / `excess_cagr` against an equal-weight buy-and-hold
+  of the same panel (`backtest.benchmark`); absolute Sharpe/return are diagnostics only.
+  (`informed_flow` learned this the hard way: maximizing Sharpe produced a "0.94 holdout
+  Sharpe" strategy that lost to buy-and-hold on both train and holdout.)
+  *(b) Per-year vs cumulative.* Every return metric is **annualized** (`cagr`,
+  `excess_cagr`). A cumulative return grows with the length of the backtest window, so
+  it rewards a long window for being long — it can compare neither two strategies (this
+  repo's windows run from 1 month to 4 years) nor, more insidiously, two **walk-forward
+  folds of unequal length inside one strategy**. Scoring one annualized objective
+  against one cumulative one, as v4 did, is incoherent on its own terms. `years` and
+  `trades_per_year` ride along with every metric: annualizing makes a short backtest
+  *comparable*, never *trustworthy*.
+  What is deliberately **not** normalized away is **time in market** — scaling a
+  30%-invested strategy's return up "to compare fairly" inverts the truth, because
+  sitting in cash is a real cost paid against a fully-invested benchmark.
+  For a cross-sectional ranker, also check the signal itself before the backtest: rank
+  IC and decile spread against **cross-sectionally demeaned** forward returns, which
+  removes the market and leaves only stock selection.
 - **Alternative data rides on `Panel.features`.** Non-OHLCV signals (insider,
-  ratings, short interest) live in the shared DB and reach a strategy as
-  `panel.features[name]` — one wide *date × symbol* daily frame per signal,
-  built by `features.py`, already point-in-time lagged. A strategy opts in with a
-  `data.features:` list in its `config.yaml`; feature builders do only
+  ratings, price targets, short interest) live in the shared DB and reach a
+  strategy as `panel.features[name]` — one wide *date × symbol* daily frame per
+  signal, built by `features.py`, already point-in-time lagged. A strategy opts in
+  with a `data.features:` list in its `config.yaml`; feature builders do only
   DB→daily-aggregate, all modelling stays in `signals()`. Adding an alt-data
   strategy needs no engine change; adding a new *feature type* is one builder in
   `features.py` (proposal-only, like any `src/` change). See `informed_flow`.
+- **ALL alt-data ingestion goes through `notebooks/03_altdata_update.ipynb`** —
+  incremental *and* historic backfill (`MODE = "backfill"`). Do not hand the user an
+  ad-hoc `tsim altdata` recipe for a backfill; add it to the notebook instead. The
+  notebook also audits coverage, and that audit is load-bearing: **a thin alt-data
+  table does not fail loudly, it goes quiet.** A cross-sectional ranker imputes a
+  neutral median rank where a name has no data, so a sleeve covering 3 of 100 names
+  looks scored while actually being a huge arbitrary tilt on those 3 (this shipped,
+  in `short_interest`). Check breadth and depth, never just freshness.
 - **Engine fixes are proposal-only.** When you spot a bug or improvement in
   `src/trading_simple/` while doing other work, report it with a concrete
   suggested fix — implement only after explicit approval. Keeps strategy
@@ -73,6 +121,14 @@ git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook out
   survive. Never work around the hook (`--no-verify`) to keep outputs.
 - **Plotly only** for figures, and only inside `src/trading_simple/plots.py`
   or notebook cells. Follow the palette/design constants already in `plots.py`.
+  Route every long time series through `plots._scatter` (or `_thin` + `_epoch` for
+  a bar/marker trace): it thins to a min/max envelope of `MAX_POINTS` and packs the
+  time axis as epoch ms, which is what keeps an executed 1m notebook at single-digit
+  MB rather than ~80. A figure built inline in a notebook cell bypasses all of that —
+  if it plots a full intraday series, thin it. **Never swap the envelope for `[::k]`
+  striding**: the envelope keeps each bucket's min *and* max, so it cannot hide a
+  spike, wick or drawdown low; striding can, silently. `plots.MAX_POINTS = None`
+  draws every bar when someone genuinely needs to zoom.
 
 ## Adding a strategy
 
@@ -96,6 +152,17 @@ test, adapt a strategy notebook, then pass:
   (gitignored). Deleting the file resets the study; same name = resume.
 - `uv.lock` is committed for reproducible installs; after changing dependencies
   in `pyproject.toml` run `uv lock` (or `uv sync`) to refresh it.
+- **No literal `%` in `schema.sql`** — it is applied via `exec_driver_sql`, and
+  psycopg reads `%` as a parameter placeholder, so even a `%` inside a `--` comment
+  breaks `tsim init-db`.
+- Yahoo's `upgrades_downgrades` frame carries **three undocumented price-target
+  columns** (`priceTargetAction`, `currentPriceTarget`, `priorPriceTarget`) that
+  yfinance forwards but does not document — `providers/yf.fetch_price_targets` reads
+  them from the *same* response as `fetch_ratings`, so the sleeve costs no extra
+  requests. They can vanish without notice; ingested rows stay valid. `priorPriceTarget
+  == 0.0` means *no prior target*, so it is stored NULL — read as zero it becomes a
+  −100% revision. Rank the **revision**, never the target-to-price **level**
+  (Han-Kang 2022: price drifts *against* the level, worst in large caps).
 - SEC EDGAR (insider provider) requires a User-Agent with a contact email or it
   returns 403; a working default is set, override with `TRADING_SEC_USER_AGENT`.
   Form 4 `primaryDocument` points at the XSL-styled HTML — fetch the raw XML at

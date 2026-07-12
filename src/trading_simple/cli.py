@@ -166,18 +166,22 @@ def backfill(
 
 @app.command()
 def altdata(
-    dataset: str = typer.Option("all", help="insider | ratings | short_interest | all"),
+    dataset: str = typer.Option(
+        "all", help="insider | ratings | price_target | short_interest | all"),
     universe: str = typer.Option(None, help="Universe name from config"),
     symbols: str = typer.Option(None, help="Comma-separated symbols (overrides --universe)"),
     since: datetime = typer.Option(..., formats=["%Y-%m-%d"], help="First day (YYYY-MM-DD)"),
 ) -> None:
     """Ingest alternative data into the shared database (idempotent UPSERT).
 
-    This repo's own providers — SEC EDGAR Form 4 (insider), Yahoo Finance
-    (analyst rating changes), FINRA (short interest) — populate the alt-data
-    tables consumed by :mod:`trading_simple.features`, with no dependency on the
-    sibling repo. Prints one ``altdata <ds> <SYM>: N rows`` line per symbol and a
-    final ``altdata: N rows written`` (the notebook helpers parse these).
+    This repo's own providers — SEC EDGAR Form 4 (insider), Yahoo Finance (analyst
+    rating changes and price targets), FINRA (short interest) — populate the
+    alt-data tables consumed by :mod:`trading_simple.features`, with no dependency
+    on the sibling repo. Prints one ``altdata <ds> <SYM>: N rows`` line per symbol
+    and a final ``altdata: N rows written`` (the notebook helpers parse these).
+
+    Historic backfills should be run from ``notebooks/03_altdata_update.ipynb``,
+    which also carries the coverage/gap audit.
     """
     from trading_simple.config import load_settings
     from trading_simple.db import Security, make_engine, upsert_securities
@@ -187,7 +191,8 @@ def altdata(
     syms = ([s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols
             else settings.universe_symbols(universe or "starter"))
     start = since.date()
-    datasets = ("insider", "ratings", "short_interest") if dataset == "all" else (dataset,)
+    datasets = (("insider", "ratings", "price_target", "short_interest")
+                if dataset == "all" else (dataset,))
 
     engine = make_engine(settings)
     upsert_securities(engine, [Security(symbol=s) for s in syms])  # FK before alt-data rows
@@ -212,7 +217,12 @@ def _run_altdata(ds: str, engine, settings, syms: list[str], start: date) -> int
     Returns:
         Number of rows written for this dataset.
     """
-    from trading_simple.db import upsert_insider, upsert_ratings, upsert_short_interest
+    from trading_simple.db import (
+        upsert_insider,
+        upsert_price_targets,
+        upsert_ratings,
+        upsert_short_interest,
+    )
 
     total = 0
     if ds == "insider":
@@ -235,6 +245,16 @@ def _run_altdata(ds: str, engine, settings, syms: list[str], start: date) -> int
                 continue
             total += upsert_ratings(engine, rows)
             typer.echo(f"altdata ratings {sym}: {len(rows)} rows")
+    elif ds == "price_target":
+        from trading_simple.providers.yf import fetch_price_targets
+        for sym in syms:
+            try:
+                rows = fetch_price_targets(sym, start, exchanges=settings.exchanges)
+            except Exception as exc:  # noqa: BLE001
+                typer.echo(f"altdata price_target {sym}: 0 rows ({exc})")
+                continue
+            total += upsert_price_targets(engine, rows)
+            typer.echo(f"altdata price_target {sym}: {len(rows)} rows")
     elif ds == "short_interest":
         from trading_simple.providers.finra import fetch_short_interest
         try:
@@ -245,7 +265,8 @@ def _run_altdata(ds: str, engine, settings, syms: list[str], start: date) -> int
             typer.echo(f"altdata short_interest: 0 rows ({exc})")
     else:
         raise typer.BadParameter(
-            f"Unknown dataset {ds!r} (insider | ratings | short_interest | all)")
+            f"Unknown dataset {ds!r} "
+            "(insider | ratings | price_target | short_interest | all)")
     return total
 
 

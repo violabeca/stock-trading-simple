@@ -42,6 +42,9 @@ params:                    # single-backtest defaults; every key is a signals() 
                            # keltner study); true = flat on each session's final bar — both searched
   skip_open: 15            # no entries in the first N minutes of a session
   skip_close: 15           # no entries in the last N minutes of a session
+  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
+                           # deploys 25% of the FREE cash, so total invested never exceeds
+                           # the book — params-only, not searched
 
 sweep:                     # coarse grid (12 combos, all valid at the defaults): the user's two
   entry_mode: [touch, bounce]      # core questions (entry style, trail) x the interval knob
@@ -49,7 +52,10 @@ sweep:                     # coarse grid (12 combos, all valid at the defaults):
   sl_trail: [false, true]
 
 optuna:
-  study: support_bounce-1m-v1  # journal file: studies/<study>.log (rename = fresh study)
+  study: support_bounce-1m-v2  # v2: capital model changed to one shared wallet — v1 trials
+                               # scored 20 independent $10k books (and its journal mixes in
+                               # 5 pre-overhaul trials with old-objective values); not
+                               # comparable. The v1 journal stays on disk untouched.
   sampler: nsga2           # nsga2 | tpe | random
   seed: 7
   n_trials: 1500
@@ -63,10 +69,12 @@ optuna:
     ema_fast:       { type: int,   low: 30,   high: 600,  log: true }
     ema_slow:       { type: int,   low: 120,  high: 2000, log: true }   # capped: slow regimes overfit
     allow_sideways: { type: categorical, choices: [true, false] }
-    sl_atr:         { type: float, low: 1.5,  high: 8.0,  step: 0.25 }  # floor: tight stops on a
-                                                                        # reversion entry = fake Sharpe
+    sl_atr:         { type: float, low: 1.5,  high: 12.0, step: 0.25 }  # floor: tight stops on a
+                                                                        # reversion entry = fake edge;
+                                                                        # high widened per v1 boundary check
     sl_trail:       { type: categorical, choices: [true, false] }       # trail-to-lock vs fixed
-    tp_mult:        { type: float, low: 0.0,  high: 8.0,  step: 0.5 }   # 0 = no target
+    tp_mult:        { type: float, low: 0.0,  high: 12.0, step: 0.5 }   # 0 = no target; high widened
+                                                                        # per v1 boundary check
     max_hold:       { type: int,   low: 30,   high: 1560, log: true }   # up to ~4 sessions
     exit_on_bear:   { type: categorical, choices: [true, false] }
     eod_exit:       { type: categorical, choices: [true, false] }       # flat at close vs overnight

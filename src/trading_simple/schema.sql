@@ -124,6 +124,34 @@ CREATE TABLE IF NOT EXISTS short_interest (
     CONSTRAINT short_interest_uq UNIQUE NULLS NOT DISTINCT (symbol, settlement_date)
 );
 
+-- Sell-side analyst PRICE-TARGET revisions. Same feed as `analyst_ratings` (Yahoo's
+-- upgrade/downgrade history carries a per-event target), but a separate signal, not a
+-- replacement: the large majority of target revisions (~19 in 20) arrive with the
+-- RATING UNCHANGED, which `analyst_ratings` scores as exactly zero. `known_at` is the
+-- announcement timestamp.
+-- (Keep literal percent signs out of this file: psycopg reads them as placeholders.)
+--
+-- Rank on the REVISION (pt_current/pt_prior - 1), NEVER on the target-to-price LEVEL:
+-- Brav & Lehavy (2003) find the drift in the revision, while Han & Kang (2022) find
+-- price drifts *against* the level — and that inversion is strongest in large, liquid
+-- names, i.e. exactly this universe. `pt_prior` is NULL (never 0) when the analyst had
+-- no previous target, so a first-ever target is not read as a total (-1.0) revision.
+CREATE TABLE IF NOT EXISTS analyst_price_targets (
+    id          BIGSERIAL PRIMARY KEY,
+    symbol      TEXT NOT NULL REFERENCES securities(symbol),
+    firm        TEXT,
+    pt_action   TEXT,                          -- Raises | Lowers | Maintains | Announces
+    pt_current  DOUBLE PRECISION,              -- the new target ($)
+    pt_prior    DOUBLE PRECISION,              -- the analyst's previous target ($), NULL if none
+    rated_at    DATE NOT NULL,
+    known_at    TIMESTAMPTZ NOT NULL,
+    source      TEXT,
+    -- NULLS NOT DISTINCT so rows with a null firm still dedupe.
+    CONSTRAINT analyst_price_targets_uq
+        UNIQUE NULLS NOT DISTINCT (symbol, firm, rated_at)
+);
+
 CREATE INDEX IF NOT EXISTS idx_insider_symbol_known ON insider_trades  (symbol, known_at);
 CREATE INDEX IF NOT EXISTS idx_ratings_symbol_known ON analyst_ratings (symbol, known_at);
 CREATE INDEX IF NOT EXISTS idx_short_int_sym_known  ON short_interest  (symbol, known_at);
+CREATE INDEX IF NOT EXISTS idx_ptarget_symbol_known ON analyst_price_targets (symbol, known_at);

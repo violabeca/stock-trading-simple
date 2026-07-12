@@ -12,7 +12,7 @@ expression, you can add a strategy.
 flowchart LR
     A["📓 01_universe_screener<br>find symbols"] -->|universes.yaml| B["📓 02_backfill<br>load history"]
     B -->|"1d: yfinance (parallel)<br>1m: IBKR (paced)"| C[("TimescaleDB<br>prices_ohlcv + alt-data")]
-    G["📓 03_altdata_update<br>insider · ratings · short interest"] -->|"SEC · Yahoo · FINRA"| C
+    G["📓 03_altdata_update<br>insider · ratings · price targets · short interest"] -->|"SEC · Yahoo · FINRA"| C
     C -->|data.load_panel| D["backtest.py<br>ONE vectorbt engine"]
     C -.->|features.attach_features| D
     S["strategies/&lt;name&gt;/<br>strategy.py + config.yaml"] --> D
@@ -66,7 +66,7 @@ src/trading_simple/
   config.py                   loads the YAML + TRADING_* env overrides
   db.py, schema.sql           engine + idempotent UPSERT writers (shared DB)
   exchanges.py                venue registry: sessions, currencies, suffixes
-  providers/yf.py             daily bars + analyst ratings from Yahoo (free)
+  providers/yf.py             daily bars + analyst ratings AND price targets from Yahoo (free)
   providers/ibkr.py           1-minute bars from Interactive Brokers (paced)
   providers/sec.py            SEC EDGAR Form 4 insider trades (free, PIT-clean)
   providers/finra.py          FINRA short interest / days-to-cover (free)
@@ -85,11 +85,11 @@ strategies/
   donchian_breakout/          strategy 2: intraday breakouts + ATR trailing stops  (+ notebook)
   keltner_reversion/          strategy 3: intraday dip-buying at the lower Keltner band  (+ notebook)
   squeeze_breakout/           strategy 4: intraday breakouts gated by squeeze/volume/trend confluence  (+ notebook)
-  informed_flow/              strategy 5: DAILY alt-data composite (insider + ratings + short interest)  (+ notebook)
+  informed_flow/              strategy 5: DAILY alt-data composite (insider + ratings + price targets + short interest)  (+ notebook)
 notebooks/
   01_universe_screener.ipynb  find symbols worth loading
   02_backfill.ipynb           load daily AND intraday price history
-  03_altdata_update.ipynb     load/refresh alternative data (insider, ratings, short interest)
+  03_altdata_update.ipynb     ingest + audit alternative data (insider, ratings, price targets, short interest)
 scripts/nbclean.py            clears notebook outputs; run on staged .ipynb by the pre-commit hook
 tests/                        offline tests (synthetic data, ~5 s)
 ```
@@ -112,6 +112,31 @@ Enable the hook once per clone (step 2b above); to clear notebooks by hand:
 ```bash
 git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # strip in place
 python3 scripts/nbclean.py --check <nb>                     # exit 1 if it has outputs
+```
+
+### Why an executed notebook stays small
+
+The hook keeps fat notebooks out of git, but it does not make *your* running copy
+pleasant. `plots.py` does that, with two measures that between them took an
+executed 1-minute notebook from ~80 MB to single-digit megabytes:
+
+- **The time axis ships as epoch milliseconds.** Plotly base64-packs float arrays
+  but writes a datetime index out as ISO text — ~29 bytes a point, repeated in
+  *every* trace. Packing it costs nothing: the axis, its ticks and the `%{x|…}`
+  hovers are unchanged.
+- **Long series are thinned to a min/max envelope** of `plots.MAX_POINTS` (10,000)
+  points. Each bucket keeps its minimum *and* its maximum, so **no spike, wick or
+  drawdown low can be hidden** — a guarantee plain `[::k]` striding cannot make.
+  An 82,680-bar panel is ~70 points per pixel at any sane figure width, so there is
+  nothing on screen to lose.
+
+Zooming in then shows the envelope rather than every individual bar. When you want
+the bars, set the knob and re-run the cell — the figure is still half its old size,
+from the epoch packing alone:
+
+```python
+from trading_simple import plots
+plots.MAX_POINTS = None   # draw every bar
 ```
 
 ## Concepts in plain language
@@ -153,27 +178,65 @@ the stop follow the best price since entry. Stops are evaluated *intrabar*
 against the high/low, not just at closes.
 
 **Alternative data.** Beyond prices, the shared database holds *non-OHLCV*
-signals — corporate-insider trades (SEC Form 4), analyst rating changes
-(Yahoo), and short interest (FINRA) — each ingested by this repo's own
-providers (no dependency on the sibling repo) and stored point-in-time: every
-row carries a `known_at` (when it became public), so features never see a value
-before it existed. A strategy opts in with a `data.features:` list in its
-config; `features.attach_features` then rides those matrices on `Panel.features`
-(one wide *date × symbol* frame per signal, already lagged), and `signals()`
-reads them like any price field. The `informed_flow` strategy ranks stocks on
-this composite; `03_altdata_update.ipynb` (or `tsim altdata`) keeps the data
-fresh. Adding a new alt-data strategy needs no engine change — just a folder and
-a `data.features:` line.
+signals — corporate-insider trades (SEC Form 4), analyst rating changes and
+analyst price-target revisions (Yahoo), and short interest (FINRA) — each
+ingested by this repo's own providers (no dependency on the sibling repo) and
+stored point-in-time: every row carries a `known_at` (when it became public), so
+features never see a value before it existed. A strategy opts in with a
+`data.features:` list in its config; `features.attach_features` then rides those
+matrices on `Panel.features` (one wide *date × symbol* frame per signal, already
+lagged), and `signals()` reads them like any price field. The `informed_flow`
+strategy ranks stocks on this composite. Adding a new alt-data strategy needs no
+engine change — just a folder and a `data.features:` line.
 
-**The Pareto front.** Optimization maximizes **Sharpe and total return
-together**. No single "best" exists — the result is the set of parameter sets
-where improving one objective must hurt the other (the Pareto front).
-`optimize.pick_best(study, weights=(1.0, 0.5))` reduces it to one trial under
-an explicit preference, and `optimize.boundary_report` flags picked parameters
-sitting on a search-space bound (log-aware) — evidence the optimum may lie
-outside the searched box, so widen that bound and re-run. Beware: more trials
-on the same data = more chances to overfit; judge winners on `pct_profitable`
-(breadth across symbols) and on held-out data.
+**`03_altdata_update.ipynb` is the single entry point for alt-data ingestion**,
+incremental *and* historic (`MODE = "backfill"`). It also **audits coverage**, which
+matters more than it sounds: a half-ingested table does not fail loudly, it goes
+quiet. Because a cross-sectional ranker imputes a *neutral median* rank wherever a
+name has no data, a sleeve covering a handful of symbols still looks scored — it
+silently becomes a large arbitrary tilt on those few names and noise for everyone
+else. So the notebook checks **breadth and depth, not just freshness**, and
+`informed_flow` drops any sleeve covering less than half the universe.
+
+**Two execution models.** A strategy returning `entries`/`exits` runs **per-symbol**:
+each symbol trades its own `init_cash` in its own account. A strategy returning a
+`weights` frame (target fraction of the book per symbol) runs **portfolio mode**: one
+shared cash account of `init_cash` *total*, so buying a name must be funded by selling
+another. Per-symbol is right for a per-symbol signal — and quietly fatal for a
+cross-sectional ranker, because the cash sitting against a name the strategy is *flat*
+in can never be spent elsewhere. A book holding 40 of 100 names is then structurally
+~30% invested against a 100%-invested benchmark, and cannot beat it however well it
+picks. (`informed_flow` lost 500 out of 500 optimizer trials to buy-and-hold on exactly
+this, and beat it on 928 of 1038 once the money was pooled.) In portfolio mode the
+dollar figure is a *reporting scale* — with fractional shares everything is
+scale-invariant — so what actually constrains the book is the number of positions it
+may hold, not the `$10,000`.
+
+There is a third, wallet-shaped variant of the signal path: a strategy returning a
+scalar `cash_frac` alongside `entries`/`exits` runs against **one cash-shared wallet**
+of `init_cash` *total*, each entry deploying that fraction of the currently free cash —
+so total invested can never exceed the wallet, exactly how a single real account would
+scan many names (`support_bounce` trades this way). Per-symbol books stay the default.
+
+**The objectives: benchmark-relative, and per year.** Optimization maximizes
+`info_ratio` and `excess_cagr` **together**, both measured against an equal-weight
+buy-and-hold of the same panel. Two traps are being avoided at once. *Absolute* Sharpe
+rewards market exposure rather than skill — a long-only strategy in a rising market
+earns one just by being invested. And a *cumulative* excess return rewards a long
+backtest for being long: it can compare neither two strategies (windows here run from
+one month to four years) nor, less obviously, two walk-forward folds of unequal length
+inside one strategy. So every return metric is annualized (`cagr`, `excess_cagr`), and
+`years` and `trades_per_year` travel beside them — annualizing makes a short backtest
+*comparable*, never *trustworthy*.
+
+No single "best" exists — the result is the set of parameter sets where improving one
+objective must hurt the other (the Pareto front). `optimize.pick_best(study,
+weights=(1.0, 0.5))` reduces it to one trial under an explicit preference, and
+`optimize.boundary_report` flags picked parameters sitting on a search-space bound
+(log-aware) — evidence the optimum may lie outside the searched box, so widen that bound
+and re-run. Beware: more trials on the same data = more chances to overfit; judge winners
+on `pct_profitable` (breadth across symbols), on the Deflated Sharpe Ratio, and on
+held-out data.
 
 ## How to add a strategy
 
@@ -181,7 +244,7 @@ No engine edits — ever. Three files in one folder:
 
 1. **Copy the template:** `cp -r strategies/_template strategies/my_idea`
 2. **Write `signals()`** in `strategy.py` — a pure function from a price
-   `Panel` to entry/exit frames, built from the engine helpers
+   `Panel` to signal frames, built from the engine helpers
    (`sma`, `atr`, `volume_profile`, `session_mask`, `session_end`,
    `next_bar`, `exit_after`):
 
@@ -190,6 +253,16 @@ No engine edits — ever. Three files in one folder:
        breakout = panel.close > bt.sma(panel.close, window)
        entries = bt.next_bar(breakout & ~breakout.shift(1, fill_value=False))
        return {"entries": entries, "exits": bt.exit_after(entries, 10)}
+   ```
+
+   Return `weights` instead — a target fraction of the book per symbol — and the
+   strategy runs in **portfolio mode** on one shared cash account. Reach for it when
+   the idea is "own the best K names", not "trade each name on its own signal":
+
+   ```python
+   def signals(panel, *, top_k: int = 10) -> dict:
+       rank = score(panel).rank(axis=1, ascending=False)      # your cross-sectional score
+       return {"weights": bt.next_bar(rank <= top_k).astype(float) / top_k}
    ```
 3. **Fill `config.yaml`** — every `signals()` argument appears under `params:`
    (defaults) and `optuna.space:` (search ranges); optionally `sweep:` lists.

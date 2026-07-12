@@ -39,6 +39,10 @@ Signals:
   price — the lock-in-profit variant; off = fixed), optional ``tp_mult``-ATR
   target, a ``max_hold``-minute time stop, the bear regime flip, and
   (intraday) ``eod_exit`` / session-edge entry blackouts.
+* **Capital** (``cash_frac``) — the whole strategy trades ONE shared
+  ``init_cash`` wallet (engine cash-shared signal mode); each entry deploys
+  this fraction of the free cash, so total invested can never exceed the
+  book — a real single account, not one account per symbol.
 
 Windows are **minutes**, converted to bars from ``panel.bar`` — the same
 ``signals()`` runs on 1m (shipped), 5m/1h/1d panels; an unmapped bar size
@@ -101,6 +105,7 @@ def signals(
     eod_exit: bool = False,
     skip_open: int = 15,
     skip_close: int = 15,
+    cash_frac: float = 0.25,
 ) -> dict:
     """Build support-touch/bounce entries with ATR stops and regime/time exits.
 
@@ -145,13 +150,18 @@ def signals(
             (intraday only).
         skip_close: No entries within the last N minutes of a session
             (intraday only).
+        cash_frac: Fraction of the shared wallet's free cash deployed per
+            entry. Its presence runs the whole strategy as ONE ``init_cash``
+            book (engine cash-shared signal mode) — total invested can never
+            exceed the wallet, the way a single real account would trade a
+            multi-symbol scanner.
 
     Returns:
-        Dict with ``entries`` / ``exits``, ``sl_stop`` and, when enabled,
-        ``sl_trail`` / ``tp_stop`` (stops as ATR fractions of price). Long
-        only — no short keys. Exits fire on the stop/target, the ``max_hold``
-        time stop, the bear flip and, intraday with ``eod_exit``, each
-        session's final bar.
+        Dict with ``entries`` / ``exits``, ``sl_stop``, ``cash_frac`` and,
+        when enabled, ``sl_trail`` / ``tp_stop`` (stops as ATR fractions of
+        price). Long only — no short keys. Exits fire on the stop/target, the
+        ``max_hold`` time stop, the bear flip and, intraday with ``eod_exit``,
+        each session's final bar.
     """
     bar = panel.bar
     close = panel.close
@@ -196,7 +206,8 @@ def signals(
         exits = exits | bt.session_end(close.index, panel.tz).to_numpy()[:, None]
 
     out = {"entries": entries, "exits": exits,
-           "sl_stop": (sl_atr * rng / close).clip(lower=1e-4)}
+           "sl_stop": (sl_atr * rng / close).clip(lower=1e-4),
+           "cash_frac": cash_frac}
     if sl_trail:
         out["sl_trail"] = True
     if tp_mult:

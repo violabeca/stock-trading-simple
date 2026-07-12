@@ -71,6 +71,17 @@ trailing-90d dollar volume (`tsim subset`), the same tape the other 1m
 strategies trade: volatile enough to test levels intraday, liquid enough for
 realistic next-bar-open fills.
 
+**Capital model.** Unlike the per-symbol strategies (each name trading its own
+$10k book), this strategy runs the engine's **cash-shared signal mode**: ONE
+$10k wallet for the whole universe, and each entry deploys `cash_frac` (25%)
+of the currently *free* cash — so total invested can never exceed the wallet,
+exactly like a real single account scanning 20 names. The benchmark it must
+beat is the same $10k book, equal-weight buy-and-hold. One approximation to
+know about: per-leg costs are modeled as a flat fraction assuming ~$10k
+orders; the wallet's ~$2.5k child orders would pay ~4 bp/leg minimum
+commission instead of the modeled ~2.5 — a small constant understatement that
+cannot reorder parameter sets (the notebook's cost-stress rerun brackets it).
+
 **Read the result honestly.** If `touch` with `min_touches: 0` dominates the
 Pareto front, the "tested level" story added nothing over generic dip-buying —
 that is a finding, not a success. If nothing admissible (≥300 train trades)

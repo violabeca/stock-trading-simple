@@ -129,6 +129,9 @@ def test_stop_keys_and_trail_flag():
     assert "sl_trail" not in sig and "tp_stop" not in sig  # both off by default
     trail = _sig(panel, sl_trail=True, tp_mult=3.0)
     assert trail["sl_trail"] is True and "tp_stop" in trail
+    # One shared wallet: the cash fraction rides along unconditionally.
+    assert sig["cash_frac"] == 0.25
+    assert _sig(panel, cash_frac=0.5)["cash_frac"] == 0.5
 
 
 def test_session_guards_and_eod():

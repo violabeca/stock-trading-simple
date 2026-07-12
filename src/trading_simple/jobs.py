@@ -95,7 +95,8 @@ def altdata_cmd(
     """Compose a ``tsim altdata`` command line (pure; unit-testable).
 
     Args:
-        dataset: Dataset name (``insider`` | ``ratings`` | ``short_interest`` | ``all``).
+        dataset: Dataset name (``insider`` | ``ratings`` | ``price_target`` |
+            ``short_interest`` | ``all``).
         since: First day, ``YYYY-MM-DD``.
         universe: Universe name (used when ``symbols`` is omitted).
         symbols: Explicit symbol list (overrides ``universe``).
@@ -122,7 +123,8 @@ def run_altdata(
     progress lines stream live into the notebook.
 
     Args:
-        dataset: Dataset name (``insider`` | ``ratings`` | ``short_interest`` | ``all``).
+        dataset: Dataset name (``insider`` | ``ratings`` | ``price_target`` |
+            ``short_interest`` | ``all``).
         since: First day, ``YYYY-MM-DD``.
         universe: Universe name (used when ``symbols`` is omitted).
         symbols: Explicit symbol list (overrides ``universe``).

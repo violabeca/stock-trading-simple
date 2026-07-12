@@ -1,6 +1,7 @@
 # ===========================================================================
 # informed_flow — daily cross-sectional composite of alternative-data signals
-# (insider buying + analyst rating changes + short-interest avoidance).
+# (insider buying + analyst rating changes + analyst price-target revisions +
+# short-interest avoidance).
 # Blocks: data (what to load, incl. the alt-data feature matrices), params
 # (single-run defaults), sweep (grid exploration), optuna (study + search space).
 # ===========================================================================
@@ -8,43 +9,104 @@
 data:
   universe: LiquidLeaders  # ~100 liquid US names — breadth for cross-sectional ranking
   bar: 1d                  # daily bars (alt-data signals act over weeks–months)
-  start: "2020-01-01"      # history from 2020; the ~63d warm-up trims the first quarter
+  # History is ingested from 2020 (see notebooks/03_altdata_update.ipynb), but we TRAIN
+  # from 2021: the 2020 regime (COVID crash and the reflation melt-up) is unlike today's.
+  # This costs statistical power — ~4y of train, minus up to ~9mo of insider_window
+  # warm-up — so read the DSR and the §10e sub-period table before believing any result.
+  # data.start and the ingested history are separate knobs on purpose: widening back to
+  # 2020 is a one-line change here, with no re-ingestion.
+  start: "2021-01-01"
   end: "2024-12-31"        # TRAIN cutoff — 2025+ is the notebook's untouched holdout
   session: regular         # daily bars are all regular-session
   max_symbols: 100         # cap at the best-covered names
-  features: [insider, ratings, short_interest]  # attached to Panel.features at load time
+  # Attached to Panel.features at load time. A sleeve that is missing, or that covers
+  # too few names to rank (strategy._MIN_COVERAGE), is dropped and its weight
+  # renormalized away — so an un-ingested table degrades gracefully instead of
+  # silently becoming a tilt on the handful of names that do have data.
+  features: [insider, ratings, price_target, short_interest]
 
 params:                    # single-backtest defaults; every key is a signals() argument
   insider_window: 63       # trailing bars for insider dollars, normalizer, eligibility (~1 quarter)
   rating_halflife: 21      # EMA half-life (bars) for the rating-change stream (~1 month)
-  w_insider: 0.4           # composite weight: insider buying
-  w_rating: 0.3            # composite weight: rating-change momentum
-  w_dtc: 0.3               # composite weight: low days-to-cover (dropped if short interest absent)
-  q_in: 0.8               # enter when composite rank is top 20% cross-sectionally
+  ptrev_halflife: 21       # EMA half-life (bars) for the price-target revision stream
+  # Composite weights. signals() divides by their SUM, so only the RATIOS matter:
+  # (1.0, 1.0, 0.4, 0.5) is the same strategy as (0.4, 0.4, 0.16, 0.2). That made the
+  # 4-D weight search really 3-D — a wasted dimension, and it produced bogus "parameter
+  # at boundary" alarms whenever a weight drifted to 1.0. So w_dtc is now the FIXED
+  # numeraire (never searched) and the other three float relative to it. Any relative mix
+  # is still reachable, and the three suspect sleeves can each still be zeroed (ablated).
+  w_insider: 1.0           # composite weight: insider buying
+  w_rating: 1.0            # composite weight: rating-change momentum
+  w_ptrev: 0.5             # composite weight: price-target revisions (NOT the target level)
+  w_dtc: 1.0               # FIXED numeraire — the scale reference; see above
+  q_in: 0.8                # enter when composite rank is top 20% cross-sectionally
   q_out: 0.6               # exit when rank falls below 60% (hysteresis band vs q_in damps turnover)
-  max_hold: 126            # time-stop backstop (~6 months) if the rank never drops out
+  # Time-stop backstop (~6 months). It exists for ONE case: a name parked in the
+  # hysteresis band — too weak to re-qualify, not weak enough to trip q_out — quietly
+  # aging while the evidence that bought it decays out of the trailing windows. It
+  # cannot evict a name currently ranked >= q_in (that name has a fresh thesis).
+  max_hold: 126
   min_events: 1            # min insider+rating events in the window to be rankable
+  # THE capital constraint. The book is ONE shared cash account (engine portfolio mode),
+  # split into max_positions slots of 1/max_positions each — so a new name can only be
+  # bought by selling an existing one, and when fewer names qualify the rest stays in
+  # cash. This replaces per-symbol cash accounts, under which a strategy holding 40 of
+  # 100 names sat ~30% invested against a 100%-invested benchmark and diluted the edge
+  # across four times as many names as it could survive (top decile +5.8%/yr active,
+  # top 40% +0.6%/yr).
+  max_positions: 10
+  # What happens when a qualifying name arrives and all slots are full:
+  # false = it waits for a vacancy (low turnover); true = it evicts the weakest holding
+  # if it outranks it (chases the top of the ranking, pays for it in costs). Searched.
+  displace: false
 
-sweep:                     # coarse grid (16 combos; all satisfy valid(): q_out < q_in, weights > 0)
-  w_insider: [0.4, 0.6]
-  w_rating: [0.3]
-  w_dtc: [0.0, 0.3]        # 0.0 ablates short interest, so its marginal value is visible
+sweep:                     # coarse grid; all satisfy valid(): q_out < q_in, weights > 0
+  # The sweep is where sleeves get ABLATED (a 0.0 column removes that signal), including
+  # w_dtc, which the Optuna space holds fixed as the numeraire.
+  w_insider: [0.0, 1.0]    # 0.0 ablates insider
+  w_rating: [0.0, 1.0]     # 0.0 ablates rating changes
+  w_ptrev: [0.0, 1.0]      # 0.0 ablates price-target revisions
+  w_dtc: [0.0, 1.0]        # 0.0 ablates short interest
   q_in: [0.8, 0.9]
   q_out: [0.6]
-  insider_window: [63, 126]
+  max_positions: [10]      # hold the slot count fixed so the ablation is about sleeves
 
 optuna:
-  study: informed-flow-1d-v1  # journal file studies/informed-flow-1d-v1.log; rename to start fresh
+  # v5: TWO changes, and both make earlier studies incomparable — do not compare them.
+  # 1. The book is now a single shared cash account with max_positions slots (portfolio
+  #    mode). Under v4's per-symbol cash accounts the strategy was structurally ~30%
+  #    invested against a fully-invested benchmark and could not win, whatever it picked.
+  # 2. The second objective is excess_CAGR (per year), not excess_return (cumulative).
+  #    v4 traded an annualized objective against a whole-window one, which is incoherent
+  #    and cannot rank walk-forward folds of different lengths.
+  # v3 maximized absolute Sharpe, which rewarded market exposure over stock selection.
+  study: informed-flow-1d-v5
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
-  n_trials: 400
+  n_trials: 500
   space:                   # declarative search space -> optimize.suggest_params
-    insider_window:  { type: int,   low: 21,  high: 189, log: true }
+    # High bound widened 189 -> 378 (~1.5y): a 5-trial probe pinned the old ceiling.
+    # NOTE the confound when reading the result — insider_window does double duty. It is
+    # the insider lookback AND the eligibility window, so a longer value also makes more
+    # names rankable. A pick at the ceiling may be buying BREADTH, not a longer insider
+    # horizon (the literature puts insider drift at ~1-6 months, i.e. well below 378).
+    insider_window:  { type: int,   low: 21,  high: 378, log: true }
     rating_halflife: { type: int,   low: 5,   high: 90,  log: true }
-    w_insider:       { type: float, low: 0.0, high: 1.0, step: 0.1 }
-    w_rating:        { type: float, low: 0.0, high: 1.0, step: 0.1 }
-    w_dtc:           { type: float, low: 0.0, high: 1.0, step: 0.1 }
+    ptrev_halflife:  { type: int,   low: 5,   high: 90,  log: true }
+    # w_dtc is the fixed numeraire (1.0) and is NOT searched — see the params block.
+    # These three float against it, so 0.0 ablates and 3.0 means "3x short interest".
+    w_insider:       { type: float, low: 0.0, high: 3.0, step: 0.25 }
+    w_rating:        { type: float, low: 0.0, high: 3.0, step: 0.25 }
+    w_ptrev:         { type: float, low: 0.0, high: 3.0, step: 0.25 }
     q_in:            { type: float, low: 0.6, high: 0.95, step: 0.05 }
     q_out:           { type: float, low: 0.4, high: 0.9,  step: 0.05 }
     max_hold:        { type: int,   low: 21,  high: 252, log: true }
     min_events:      { type: int,   low: 1,   high: 3 }
+    # How concentrated the book is. This is the knob the signal cares about most: a
+    # construction-free test put the edge at +5.8%/yr in the top decile and +0.6%/yr by
+    # the top 40%, so fewer slots means a purer signal but a lumpier, riskier book.
+    max_positions:   { type: int,   low: 5,   high: 25 }
+    # Whether a better name may evict the weakest holding, or must wait for a vacancy.
+    # Searched rather than assumed: concentration argues for chasing the top of the
+    # ranking, turnover costs argue against, and which wins is an empirical question.
+    displace:        { type: categorical, choices: [true, false] }

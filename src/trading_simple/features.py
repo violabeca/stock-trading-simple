@@ -49,6 +49,24 @@ _RATINGS_SQL = """
     GROUP BY symbol, d
 """
 
+# One row per (symbol, UTC event-date): summed analyst price-target REVISION.
+#
+# The revision (new/prior - 1), never the target-to-price LEVEL. Brav & Lehavy (2003)
+# locate the drift in the revision — notably on events where the *rating* did not
+# change, which `_RATINGS_SQL` scores as zero — while Han & Kang (2022) show price
+# drifts *against* the level, most strongly in large, liquid names. Ranking on the
+# level would likely invert the sign in exactly this universe.
+#
+# `pt_prior > 0` drops first-ever targets (stored NULL, no prior to revise from).
+_PRICE_TARGET_SQL = """
+    SELECT symbol, (known_at AT TIME ZONE 'UTC')::date AS d,
+           sum(pt_current / pt_prior - 1.0) AS value
+    FROM analyst_price_targets
+    WHERE symbol = ANY(:symbols) AND known_at >= :start AND known_at <= :as_of
+      AND pt_prior > 0 AND pt_current > 0
+    GROUP BY symbol, d
+"""
+
 # One row per (symbol, UTC dissemination-date): days-to-cover level (a stock).
 _SHORT_INTEREST_SQL = """
     SELECT symbol, (known_at AT TIME ZONE 'UTC')::date AS d,
@@ -63,6 +81,7 @@ _SHORT_INTEREST_SQL = """
 _BUILDERS = {
     "insider": (_INSIDER_SQL, "zero"),
     "ratings": (_RATINGS_SQL, "zero"),
+    "price_target": (_PRICE_TARGET_SQL, "zero"),
     "short_interest": (_SHORT_INTEREST_SQL, "ffill"),
 }
 

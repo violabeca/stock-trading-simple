@@ -50,12 +50,21 @@ def test_storage_path_lives_in_strategy_folder():
 
 
 def test_progress_callback_prints_one_line_per_trial(capsys):
+    """The live log must name the objectives it is actually printing.
+
+    It used to hard-code "sharpe=", so once the study moved to benchmark-relative
+    objectives every streamed line labelled an information ratio as a Sharpe — a wrong
+    number in front of you for as long as the run lasts.
+    """
     study = optuna.create_study(directions=["maximize", "maximize"],
                                 sampler=optuna.samplers.RandomSampler(seed=3))
     study.optimize(lambda t: (t.suggest_float("w", 0, 1), 0.2), n_trials=2,
                    callbacks=[opt.progress_callback()])
     out = capsys.readouterr().out.strip().splitlines()
-    assert len(out) == 2 and all("sharpe=" in line and "w=" in line for line in out)
+    assert len(out) == 2
+    assert all(all(f"{name}=" in line for name in opt.OBJECTIVES) and "w=" in line
+               for line in out)
+    assert not any("sharpe=" in line for line in out)   # not an objective any more
 
 
 def test_study_path_matches_storage_location():
@@ -103,14 +112,15 @@ def test_boundary_report_counts_front_share():
 
 
 def test_pareto_and_trials_frames():
+    first, second = opt.OBJECTIVES          # (info_ratio, excess_return) — benchmark-relative
     study = optuna.create_study(directions=["maximize", "maximize"])
-    for sharpe, ret in [(1.0, 0.2), (0.2, 0.8), (0.1, 0.1),            # third is dominated
-                        (1.0, 0.2)]:                                   # fourth duplicates first
+    for a, b in [(1.0, 0.2), (0.2, 0.8), (0.1, 0.1),                   # third is dominated
+                 (1.0, 0.2)]:                                          # fourth duplicates first
         study.add_trial(optuna.trial.create_trial(
             params={"w": 1}, distributions={"w": optuna.distributions.IntDistribution(1, 2)},
-            values=[sharpe, ret]))
+            values=[a, b]))
     front = opt.pareto_frame(study)
-    assert len(front) == 2 and front["sharpe"].is_monotonic_decreasing  # dup collapsed
-    assert front["trial"].tolist() == [0, 1]                            # earliest trial kept
+    assert len(front) == 2 and front[first].is_monotonic_decreasing    # dup collapsed
+    assert front["trial"].tolist() == [0, 1]                           # earliest trial kept
     everything = opt.trials_frame(study)
-    assert len(everything) == 4 and {"trial", "w", "sharpe", "total_return"} <= set(everything)
+    assert len(everything) == 4 and {"trial", "w", first, second} <= set(everything)

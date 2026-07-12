@@ -15,7 +15,7 @@ from datetime import UTC, date, datetime
 
 import pandas as pd
 
-from trading_simple.db import PriceBar, RatingChange
+from trading_simple.db import PriceBar, PriceTarget, RatingChange
 from trading_simple.exchanges import resolve_exchange
 
 log = logging.getLogger(__name__)
@@ -174,6 +174,101 @@ def _ratings_frame_to_rows(symbol: str, frame: pd.DataFrame, since: date) -> lis
             source=_SOURCE,
         ))
     return rows
+
+
+def fetch_price_targets(
+    symbol: str, since: date, *, exchanges: dict[str, str] | None = None
+) -> list[PriceTarget]:
+    """Fetch sell-side analyst price-target events for one symbol from Yahoo Finance.
+
+    Reads the **same** ``upgrades_downgrades`` frame as :func:`fetch_ratings` — no
+    extra network call. Yahoo's payload (a Benzinga feed) carries a per-event
+    ``currentPriceTarget`` / ``priorPriceTarget`` / ``priceTargetAction`` alongside
+    the grade columns, and yfinance passes those keys straight through even though
+    it does not document them. They are dated per event, so unlike Yahoo's
+    *consensus* target (a snapshot overwritten in place) they are usable
+    point-in-time.
+
+    This is a separate signal from the rating stream, not a replacement: the large
+    majority of target revisions arrive with the rating unchanged, which
+    :func:`fetch_ratings` maps to ``"maintain"`` and the feature layer scores as
+    zero.
+
+    NOTE (documented limitations): the price-target fields are **undocumented**, so
+    Yahoo may withdraw them without notice (ingested rows remain valid — only future
+    ingestion would break). The same survivorship caveat as :func:`fetch_ratings`
+    applies: Yahoo covers only currently-followed names.
+
+    Args:
+        symbol: Bare canonical ticker, e.g. ``"AAPL"``.
+        since: Earliest event date to include.
+        exchanges: Optional per-symbol venue overrides (``settings.exchanges``).
+
+    Returns:
+        Parsed :class:`~trading_simple.db.PriceTarget` rows (empty when Yahoo has no
+        history, or when its payload omits the price-target columns entirely).
+    """
+    import yfinance as yf  # lazy: keeps import-time light
+
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    spec = resolve_exchange(symbol, exchanges)
+    frame = yf.Ticker(f"{symbol}{spec.yf_suffix}").upgrades_downgrades
+    if frame is None or frame.empty:
+        return []
+    return _targets_frame_to_rows(symbol, frame, since)
+
+
+def _targets_frame_to_rows(symbol: str, frame: pd.DataFrame, since: date) -> list[PriceTarget]:
+    """Convert a yfinance upgrades/downgrades frame into :class:`PriceTarget` rows.
+
+    Pure function. Rows without a usable ``currentPriceTarget`` are skipped — the
+    upstream feed omits a target on a meaningful share of rating events, and a row
+    with no target carries no revision. A ``priorPriceTarget`` of ``0.0`` means "no
+    previous target" (a first-ever initiation), and is stored as ``None`` rather than
+    zero so a downstream revision ratio cannot read it as a -100% cut.
+
+    ``known_at`` is stamped at end-of-day UTC of the event date, matching
+    :func:`_ratings_frame_to_rows`; the feature layer buckets by UTC date and then
+    lags one bar, so the intraday time carries no extra information.
+
+    Args:
+        symbol: Bare symbol the rows are stored under.
+        frame: Raw yfinance ``upgrades_downgrades`` frame.
+        since: Earliest event date to include.
+
+    Returns:
+        One :class:`PriceTarget` per row on/after ``since`` that carries a target.
+    """
+    if "currentPriceTarget" not in frame.columns:  # Yahoo dropped the undocumented fields
+        log.warning("yfinance returned no price-target columns for %s", symbol)
+        return []
+    rows: list[PriceTarget] = []
+    for idx, row in frame.iterrows():
+        ts = pd.Timestamp(idx)
+        ts = ts.tz_convert("UTC") if ts.tzinfo else ts.tz_localize("UTC")
+        rated = ts.date()
+        if rated < since:
+            continue
+        current = _pos(row.get("currentPriceTarget"))
+        if current is None:  # a rating event with no target attached
+            continue
+        rows.append(PriceTarget(
+            symbol=symbol,
+            firm=_str(row.get("Firm")),
+            pt_action=_str(row.get("priceTargetAction")),
+            pt_current=current,
+            pt_prior=_pos(row.get("priorPriceTarget")),  # 0.0 -> None: no previous target
+            rated_at=rated,
+            known_at=datetime(rated.year, rated.month, rated.day, 23, 59, 59, tzinfo=UTC),
+            source=_SOURCE,
+        ))
+    return rows
+
+
+def _pos(value) -> float | None:
+    """Coerce to a positive float; NaN, None and non-positive values become None."""
+    number = _f(value)
+    return number if number is not None and number > 0.0 else None
 
 
 def _str(value) -> str | None:

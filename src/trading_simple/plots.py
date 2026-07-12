@@ -8,8 +8,11 @@ Colors follow the job they do, using a pre-validated colorblind-safe palette:
 * **win/loss** trades use the reserved status greens/reds,
 * chrome (grid, axes, labels) stays recessive gray so data carries the figure.
 
-Figures switch to ``Scattergl`` above :data:`_GL_THRESHOLD` points so intraday
-panels stay responsive.
+Long series are thinned to a min/max envelope of :data:`MAX_POINTS` points and
+their time axis is packed as epoch milliseconds, which is what keeps an executed
+1-minute notebook at single-digit megabytes instead of ~80. Set ``MAX_POINTS =
+None`` to draw every bar; figures then switch to ``Scattergl`` above
+:data:`_GL_THRESHOLD` points so they stay responsive.
 """
 
 from __future__ import annotations
@@ -17,6 +20,8 @@ from __future__ import annotations
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+from trading_simple import backtest
 
 #: Fixed-order categorical palette (colorblind-safe, validated; do not cycle).
 SERIES = ("#2a78d6", "#1baf7a", "#eda100", "#008300", "#4a3aa7", "#e34948", "#e87ba4", "#eb6834")
@@ -26,9 +31,12 @@ _WIN, _LOSS = "#0ca30c", "#d03b3b"          # reserved status colors: profit / l
 _LONG, _SHORT = "#2a78d6", "#eb6834"        # trade direction pair (blue long, orange short)
 _INK, _MUTED, _GRID = "#0b0b0b", "#898781", "#e1e0d9"
 _GL_THRESHOLD = 10_000
+#: Point budget per trace, split into min/max buckets; ``None`` draws every bar.
+MAX_POINTS: int | None = 10_000
 #: Metric/bookkeeping columns of sweep and trial frames; everything else is a parameter.
-_METRIC_COLS = {"trial", "total_return", "sharpe", "max_drawdown", "win_rate",
-                "pct_profitable", "n_trades"}
+_METRIC_COLS = backtest.METRIC_COLS | {"trial"}
+#: Metrics measured against the buy-and-hold benchmark, so zero is a meaningful line.
+_RELATIVE = {"excess_cagr", "info_ratio"}
 
 
 def _base(fig: go.Figure, *, title: str, height: int = 420) -> go.Figure:
@@ -49,10 +57,88 @@ def _base(fig: go.Figure, *, title: str, height: int = 420) -> go.Figure:
     return fig
 
 
-def _scatter(x, y, **kwargs) -> go.Scatter | go.Scattergl:
-    """A Scatter that upgrades itself to WebGL for large series."""
-    cls = go.Scattergl if len(x) > _GL_THRESHOLD else go.Scatter
-    return cls(x=x, y=y, **kwargs)
+def _keep(*series: pd.Series) -> pd.Index | None:
+    """Row positions of a min/max envelope shared by every given series.
+
+    Splits the index into equal buckets and keeps, per bucket and per series,
+    the position of the minimum and of the maximum, plus the first and last row.
+    Extremes survive by construction, so no spike, wick or drawdown low can be
+    hidden — which plain ``[::k]`` striding cannot promise. Series passed
+    together come back on one x grid (``hovermode="x unified"`` needs that), and
+    the bucket count is split among them so their union still fits the budget.
+
+    NaN-safe by filling ``±inf`` rather than using ``nanargmin``: the panel index
+    is a symbol union, so a series genuinely carries gaps, and an all-NaN bucket
+    would otherwise raise.
+
+    Args:
+        *series: Equal-length series sharing one index.
+
+    Returns:
+        Sorted positions to keep, or ``None`` when nothing needs dropping
+        (:data:`MAX_POINTS` is ``None``, or the series already fit).
+    """
+    n = len(series[0])
+    if MAX_POINTS is None or n <= MAX_POINTS:
+        return None
+    label = pd.RangeIndex(n) * max(1, MAX_POINTS // (2 * len(series))) // n
+    keep = {0, n - 1}
+    for s in series:
+        v = pd.Series(s.to_numpy(dtype="float64"))
+        keep |= set(v.fillna(float("inf")).groupby(label).idxmin())
+        keep |= set(v.fillna(float("-inf")).groupby(label).idxmax())
+    return pd.Index(sorted(keep))
+
+
+def _thin(data: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
+    """Reduce a long series/frame to the min/max envelope of :func:`_keep`.
+
+    Args:
+        data: A series, or a frame whose columns are all plotted.
+
+    Returns:
+        The reduced object, or the input itself when no reduction applies.
+    """
+    cols = [data[c] for c in data.columns] if isinstance(data, pd.DataFrame) else [data]
+    keep = _keep(*cols)
+    return data if keep is None else data.iloc[keep]
+
+
+def _epoch(index: pd.Index):
+    """A datetime index as float64 epoch milliseconds.
+
+    Plotly base64-packs float arrays but writes a datetime index out as ISO text,
+    once per trace — ~29 bytes a point against ~11, and that repetition is most of
+    what made an executed 1-minute notebook ~80 MB. Pair with ``xaxis.type="date"``
+    to keep the axis, its ticks and the ``%{x|...}`` hovers unchanged. Dropping the
+    timezone changes nothing on screen: plotly.js parses no UTC offset and already
+    renders these timestamps as a naive wall clock.
+
+    Args:
+        index: A trace's x values.
+
+    Returns:
+        Epoch milliseconds for a ``DatetimeIndex``, else ``index`` untouched.
+    """
+    if not isinstance(index, pd.DatetimeIndex):
+        return index
+    naive = index.tz_localize(None) if index.tz is not None else index
+    return naive.to_numpy("datetime64[ms]").astype("float64")
+
+
+def _scatter(y: pd.Series, **kwargs) -> go.Scatter | go.Scattergl:
+    """A thinned Scatter on a packed date axis, upgrading to WebGL for large series.
+
+    Args:
+        y: The series to draw; its index supplies x.
+        **kwargs: Passed through to the trace constructor.
+
+    Returns:
+        The trace.
+    """
+    y = _thin(y)
+    cls = go.Scattergl if len(y) > _GL_THRESHOLD else go.Scatter
+    return cls(x=_epoch(y.index), y=y, **kwargs)
 
 
 def _intraday_breaks(index: pd.DatetimeIndex) -> list[dict] | None:
@@ -160,33 +246,36 @@ def plot_equity(curve: pd.DataFrame, *, title: str = "Portfolio equity") -> go.F
         won, spent = float(curve["realized_pnl"].iloc[-1]), float(curve["fees"].iloc[-1])
         won_str = f"-${abs(won):,.0f}" if won < 0 else f"${won:,.0f}"
         subtitles.append(f"Realized P&L ({won_str}) vs fees paid (${spent:,.0f})")
+    # Read the session gaps off the true index (the step is its median bar spacing),
+    # then thin the whole frame at once so every trace shares one x grid — which is
+    # what keeps the unified hover below showing all of them together.
+    breaks = _intraday_breaks(curve.index)
+    curve = _thin(curve)
     fig = make_subplots(rows=len(subtitles), cols=1, shared_xaxes=True,
                         vertical_spacing=0.07, subplot_titles=subtitles)
-    fig.add_trace(_scatter(curve.index, curve["value"], mode="lines", name="value",
+    fig.add_trace(_scatter(curve["value"], mode="lines", name="value",
                            showlegend=False, line={"color": SERIES[0], "width": 2},
                            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>$%{y:,.0f}<extra></extra>"),
                   row=1, col=1)
-    fig.add_trace(_scatter(curve.index, curve["return"], mode="lines", name="return",
+    fig.add_trace(_scatter(curve["return"], mode="lines", name="return",
                            showlegend=False, line={"color": SERIES[1], "width": 2},
                            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y:.1%}<extra></extra>"),
                   row=2, col=1)
     fig.update_yaxes(tickformat=".0%", row=2, col=1)
     if has_costs:
-        fig.add_trace(_scatter(curve.index, curve["realized_pnl"], mode="lines",
+        fig.add_trace(_scatter(curve["realized_pnl"], mode="lines",
                                name="realized P&L", line={"color": SERIES[3], "width": 2},
                                hovertemplate="%{x|%Y-%m-%d %H:%M}<br>"
                                              "realized $%{y:,.0f}<extra></extra>"),
                       row=3, col=1)
-        fig.add_trace(_scatter(curve.index, curve["fees"], mode="lines", name="fees paid",
+        fig.add_trace(_scatter(curve["fees"], mode="lines", name="fees paid",
                                line={"color": SERIES[2], "width": 2},
                                hovertemplate="%{x|%Y-%m-%d %H:%M}<br>"
                                              "fees $%{y:,.0f}<extra></extra>"),
                       row=3, col=1)
         fig.update_yaxes(tickprefix="$", row=3, col=1)
     fig.update_layout(showlegend=has_costs, hovermode="x unified")
-    breaks = _intraday_breaks(curve.index)
-    if breaks:
-        fig.update_xaxes(rangebreaks=breaks)
+    fig.update_xaxes(type="date", rangebreaks=breaks)
     return _base(fig, title=title, height=660 if has_costs else 520)
 
 
@@ -238,12 +327,12 @@ def plot_symbol(
                         row_heights=[h / sum(heights) for h in heights],
                         subplot_titles=[titles[p] for p in panels])
 
-    fig.add_trace(_scatter(close.index, close, mode="lines", name="close",
+    fig.add_trace(_scatter(close, mode="lines", name="close",
                            line={"color": _INK, "width": 1.2},
                            hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y:.2f}<extra>close</extra>"),
                   row=1, col=1)
     for i, (name, series) in enumerate(overlays.get("price", {}).items()):
-        fig.add_trace(_scatter(series.index, series, mode="lines", name=name,
+        fig.add_trace(_scatter(series, mode="lines", name=name,
                                line={"color": SERIES[i % len(SERIES)], "width": 1.5}),
                       row=1, col=1)
 
@@ -278,9 +367,12 @@ def plot_symbol(
             row=1, col=1)
 
     for name, series in momentum.items():
+        # Thin once, before the clip: both halves then land on one x grid, so the
+        # positive and negative `tozeroy` fills meet cleanly instead of on two.
+        series = _thin(series)
         for part, color, show in ((series.clip(lower=0), _LONG, True),
                                   (series.clip(upper=0), _LOSS, False)):
-            fig.add_trace(_scatter(series.index, part, mode="lines", name=name,
+            fig.add_trace(_scatter(part, mode="lines", name=name,
                                    fill="tozeroy", showlegend=show,
                                    line={"color": color, "width": 1},
                                    hovertemplate="%{x|%Y-%m-%d %H:%M}<br>%{y:+.1%}"
@@ -290,13 +382,14 @@ def plot_symbol(
     marks = overlays.get("volume_marks")
     spike = (marks.reindex(volume.index).fillna(False).astype(bool)
              if marks is not None else pd.Series(False, index=volume.index))
-    fig.add_trace(go.Bar(x=volume.index, y=volume, name="volume", showlegend=False,
+    bars = _thin(volume)  # the bars thin; the spikes below stay at full resolution
+    fig.add_trace(go.Bar(x=_epoch(bars.index), y=bars, name="volume", showlegend=False,
                          marker={"color": _MUTED, "opacity": 0.6},
                          hovertemplate="%{y:,.0f}<extra>volume</extra>"),
                   row=row["volume"], col=1)
     if spike.any():
         # Markers, not bars: dense daily bars render sub-pixel thin and would hide the spikes.
-        fig.add_trace(go.Scatter(x=volume.index[spike], y=volume[spike], mode="markers",
+        fig.add_trace(go.Scatter(x=_epoch(volume.index[spike]), y=volume[spike], mode="markers",
                                  name="volume spike",
                                  marker={"color": SERIES[2], "size": 7,
                                          "line": {"color": "white", "width": 1}},
@@ -304,13 +397,13 @@ def plot_symbol(
                       row=row["volume"], col=1)
     vol_colors = (SERIES[4], SERIES[2], SERIES[6])  # amber slot 2 matches the spike markers
     for i, (name, series) in enumerate(overlays.get("volume", {}).items()):
-        fig.add_trace(_scatter(series.index, series, mode="lines", name=name,
+        fig.add_trace(_scatter(series, mode="lines", name=name,
                                line={"color": vol_colors[i % len(vol_colors)], "width": 1.5,
                                      "dash": "dash" if i else "solid"}),
                       row=row["volume"], col=1)
 
     if equity is not None:
-        fig.add_trace(_scatter(equity.index, equity, mode="lines", name="equity",
+        fig.add_trace(_scatter(equity, mode="lines", name="equity",
                                showlegend=False, line={"color": SERIES[0], "width": 2}),
                       row=row["equity"], col=1)
 
@@ -324,9 +417,7 @@ def plot_symbol(
                       margin={"r": 175})
     if momentum:
         fig.update_yaxes(tickformat="+.0%", row=row["momentum"], col=1)
-    breaks = _intraday_breaks(close.index)
-    if breaks:
-        fig.update_xaxes(rangebreaks=breaks)
+    fig.update_xaxes(type="date", rangebreaks=_intraday_breaks(close.index))
     return fig
 
 
@@ -413,8 +504,8 @@ def plot_volume_profile(volume: pd.Series, baseline: pd.Series, tz: str, *, days
 
 
 def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
-                *, picked: int | None = None) -> go.Figure:
-    """The Sharpe-vs-return Pareto front of an optimization study.
+                *, picked: int | None = None, axes: tuple[str, str] | None = None) -> go.Figure:
+    """The Pareto front of an optimization study, on the study's own two objectives.
 
     Completed trials draw as a recessive gray cloud; the front as a blue
     staircase (the exact boundary of the dominated region — a diagonal would
@@ -422,32 +513,41 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
     number; the picked trial as an orange star. Hovers carry the full
     parameter set, so promising trials can be read straight off the figure.
 
+    A dashed zero cross-hair marks the benchmark: with the default
+    benchmark-relative objectives, anything left of or below it **loses to simply
+    owning the universe**, however healthy its absolute Sharpe looks.
+
     Args:
-        front: ``optimize.pareto_frame`` output (needs ``sharpe``,
-            ``total_return``, ``trial`` columns).
+        front: ``optimize.pareto_frame`` output (needs the two ``axes`` columns
+            plus ``trial``).
         all_trials: Optional frame of every completed trial (context cloud).
         picked: Trial number to highlight (from ``optimize.pick_best``).
+        axes: ``(x, y)`` metric columns; defaults to ``optimize.OBJECTIVES``.
 
     Returns:
         The figure.
     """
-    hover = ("<b>trial %{customdata[0]}</b><br>sharpe %{x:.2f} | return %{y:.1%}"
-             "<br>%{customdata[1]}<extra></extra>")
+    from trading_simple.optimize import OBJECTIVES
+
+    x, y = axes or OBJECTIVES
+    pct = y.endswith("return")
+    hover = (f"<b>trial %{{customdata[0]}}</b><br>{x} %{{x:.2f}} | {y} "
+             f"%{{y:{'.1%' if pct else '.2f'}}}<br>%{{customdata[1]}}<extra></extra>")
     fig = go.Figure()
     if all_trials is not None and len(all_trials):
         fig.add_trace(go.Scatter(
-            x=all_trials["sharpe"], y=all_trials["total_return"], mode="markers",
+            x=all_trials[x], y=all_trials[y], mode="markers",
             name=f"all {len(all_trials)} trials",
             marker={"color": _MUTED, "size": 5, "opacity": 0.35},
             hovertemplate=hover, customdata=_trial_hover(all_trials)))
-    front = front.sort_values("sharpe")
-    # Labels dodge their left neighbor: same-return steps get labeled above, not beside.
-    ys = front["total_return"].to_numpy()
+    front = front.sort_values(x)
+    # Labels dodge their left neighbor: same-y steps get labeled above, not beside.
+    ys = front[y].to_numpy()
     span = max(ys.max() - ys.min(), 1e-9) if len(ys) else 1.0
     positions = ["middle left"] + ["top center" if abs(b - a) / span < 0.08 else "middle left"
                                    for a, b in zip(ys, ys[1:], strict=False)]
     fig.add_trace(go.Scatter(
-        x=front["sharpe"], y=front["total_return"], mode="lines+markers+text",
+        x=front[x], y=front[y], mode="lines+markers+text",
         name="Pareto front", line={"color": SERIES[0], "width": 2, "shape": "vh"},
         marker={"size": 10, "color": SERIES[0], "line": {"color": "white", "width": 1}},
         text=[f"trial {t} " for t in front["trial"]], textposition=positions,
@@ -455,15 +555,22 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
         hovertemplate=hover, customdata=_trial_hover(front)))
     if picked is not None and picked in set(front["trial"]):
         row = front[front["trial"] == picked].iloc[0]
-        fig.add_trace(go.Scatter(x=[row["sharpe"]], y=[row["total_return"]], mode="markers",
+        fig.add_trace(go.Scatter(x=[row[x]], y=[row[y]], mode="markers",
                                  name=f"picked: trial {picked}",
                                  marker={"symbol": "star", "size": 17, "color": SERIES[7],
                                          "line": {"color": "white", "width": 1}},
                                  hovertemplate=hover, customdata=_trial_hover(front[
                                      front["trial"] == picked])))
-    fig.update_xaxes(title="Sharpe ratio")
-    fig.update_yaxes(title="Total return", tickformat=".0%")
-    return _base(fig, title="Optimization Pareto front — Sharpe vs total return")
+    if x in _RELATIVE or y in _RELATIVE:  # zero = the buy-and-hold benchmark
+        line = {"dash": "dash", "color": _LOSS, "width": 1}
+        if x in _RELATIVE:
+            fig.add_vline(x=0, line=line, annotation_text="loses to buy & hold →",
+                          annotation_position="top left")
+        if y in _RELATIVE:
+            fig.add_hline(y=0, line=line)
+    fig.update_xaxes(title=x.replace("_", " "), tickformat=".0%" if x.endswith("return") else None)
+    fig.update_yaxes(title=y.replace("_", " "), tickformat=".0%" if pct else None)
+    return _base(fig, title=f"Optimization Pareto front — {x} vs {y}")
 
 
 def plot_heatmap_grid(stats: pd.DataFrame, *, pairs: list[tuple[str, str]],
