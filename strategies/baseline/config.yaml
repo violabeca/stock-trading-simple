@@ -1,0 +1,24 @@
+# ===========================================================================
+# baseline — equal-weight buy-and-hold: the benchmark made visible.
+# Nothing to optimize; it IS the hurdle (backtest.benchmark) expressed through
+# the strategy contract so it can be run and compared per universe. Override
+# `universe:` (or the whole data block) to benchmark any panel — the comparison
+# notebook (notebooks/04_compare.ipynb) does this per strategy automatically.
+# ===========================================================================
+
+data:
+  universe: starter        # override to benchmark any universe
+  bar: 1d
+  start: "2018-01-01"
+  end: null                # buy-and-hold has no train/holdout split
+  session: regular
+  max_symbols: 20
+
+params: {}                 # nothing to tune: own everything, always
+
+optuna:                    # nothing to search — the block exists only so the
+  study: baseline-v1       # standard smoke gate (`tsim optimize --strategy
+  sampler: nsga2           # baseline --n-trials 1`) runs end to end; the one
+  seed: 42                 # trial scores ~0/~0 by construction.
+  n_trials: 1
+  space: {}

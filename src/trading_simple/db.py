@@ -143,6 +143,35 @@ class ShortInterest:
     source: str
 
 
+@dataclass(slots=True)
+class Fundamental:
+    """One as-reported company fundamental from SEC EDGAR XBRL ``companyfacts``.
+
+    A single logical quantity for one reporting period from one filing. ``concept``
+    is normalized (``equity`` | ``assets`` | ``shares`` | ``ni_ttm`` | ``gp_ttm``):
+    the balance-sheet concepts are INSTANT levels (``period_start`` is ``None``),
+    while ``ni_ttm``/``gp_ttm`` are income-statement FLOWS already summed to
+    trailing-twelve-months in the provider parser. ``known_at`` is the filing date
+    at 21:00 UTC (public-availability time). ``accn`` (the SEC accession) is part
+    of the natural key so a restatement lands as a distinct row.
+    """
+
+    symbol: str
+    concept: str
+    tag: str | None
+    unit: str | None
+    period_start: date | None
+    period_end: date
+    val: float | None
+    fy: int | None
+    fp: str | None
+    form: str | None
+    filed: date
+    known_at: datetime
+    accn: str | None
+    source: str
+
+
 def make_engine(settings: Settings | None = None) -> Engine:
     """Create a SQLAlchemy engine for the shared TimescaleDB.
 
@@ -160,7 +189,8 @@ def make_engine(settings: Settings | None = None) -> Engine:
 
 
 #: Alt-data tables with a BIGSERIAL ``id`` this repo inserts into.
-_SERIAL_TABLES = ("insider_trades", "analyst_ratings", "analyst_price_targets")
+_SERIAL_TABLES = ("insider_trades", "analyst_ratings", "analyst_price_targets",
+                  "fundamentals")
 
 
 def apply_schema(engine: Engine) -> None:
@@ -344,6 +374,220 @@ def upsert_short_interest(engine: Engine, rows: list[ShortInterest]) -> int:
             source           = EXCLUDED.source
     """
     return _executemany(engine, sql, [asdict(r) for r in rows])
+
+
+def upsert_fundamentals(engine: Engine, rows: list[Fundamental]) -> int:
+    """Insert fundamentals, ignoring duplicates (key: ``fundamentals_uq``).
+
+    SEC facts are immutable per accession, so a conflict means we already have
+    the row — ``DO NOTHING`` keeps re-runs idempotent (like :func:`upsert_insider`,
+    unlike short interest's in-place revisions). A restatement carries a *new*
+    accession and so lands as a distinct row, preserving point-in-time history.
+
+    Args:
+        engine: Target database engine.
+        rows: Fundamental observations to write.
+
+    Returns:
+        Number of rows submitted.
+    """
+    sql = """
+        INSERT INTO fundamentals (symbol, concept, tag, unit, period_start, period_end,
+                                  val, fy, fp, form, filed, known_at, accn, source)
+        VALUES (:symbol, :concept, :tag, :unit, :period_start, :period_end,
+                :val, :fy, :fp, :form, :filed, :known_at, :accn, :source)
+        ON CONFLICT ON CONSTRAINT fundamentals_uq DO NOTHING
+    """
+    return _executemany(engine, sql, [asdict(r) for r in rows])
+
+
+def all_symbols(engine: Engine) -> list[str]:
+    """Every symbol in the ``securities`` registry — the ``ALL`` alt-data target.
+
+    Args:
+        engine: Target database engine.
+
+    Returns:
+        Sorted list of every registered symbol (all instruments this DB tracks).
+    """
+    with engine.connect() as conn:
+        return [r[0] for r in conn.execute(text("SELECT symbol FROM securities ORDER BY symbol"))]
+
+
+def load_coverage(engine: Engine, dataset: str) -> dict[str, tuple[date, date]]:
+    """Return the backfill ledger for one dataset as ``{symbol: (covered_from, covered_to)}``.
+
+    Reads ``altdata_coverage`` — this repo's record of what alt-data has already been
+    fetched, so a backfill can skip symbols already covered to the requested depth.
+
+    Args:
+        engine: Target database engine.
+        dataset: Dataset name (e.g. ``"insider"``, ``"fundamentals"``).
+
+    Returns:
+        ``{symbol: (covered_from, covered_to)}`` for every symbol recorded for the
+        dataset (empty when nothing has been ingested yet, or the table is absent).
+    """
+    sql = text("SELECT symbol, covered_from, covered_to FROM altdata_coverage "
+               "WHERE dataset = :dataset")
+    try:
+        with engine.connect() as conn:
+            return {r[0]: (r[1], r[2]) for r in conn.execute(sql, {"dataset": dataset})}
+    except Exception:  # noqa: BLE001 — a missing ledger table must not block ingestion
+        log.warning("altdata_coverage unavailable (run tsim init-db); treating as empty")
+        return {}
+
+
+def upsert_coverage(engine: Engine, dataset: str, rows: list[dict]) -> int:
+    """Record/extend backfill coverage for ``(dataset, symbol)`` rows.
+
+    Widens the stored window rather than replacing it (``covered_from`` takes the
+    earliest, ``covered_to`` the latest ever seen), so repeated runs accumulate the
+    full covered span. Each row is ``{"symbol", "covered_from", "covered_to", "rows"}``.
+
+    Args:
+        engine: Target database engine.
+        dataset: Dataset the rows belong to.
+        rows: One dict per symbol (see above).
+
+    Returns:
+        Number of rows submitted.
+    """
+    if not rows:
+        return 0
+    sql = """
+        INSERT INTO altdata_coverage (dataset, symbol, covered_from, covered_to, rows, updated_at)
+        VALUES (:dataset, :symbol, :covered_from, :covered_to, :rows, now())
+        ON CONFLICT (dataset, symbol) DO UPDATE SET
+            covered_from = LEAST(altdata_coverage.covered_from, EXCLUDED.covered_from),
+            covered_to   = GREATEST(altdata_coverage.covered_to, EXCLUDED.covered_to),
+            rows         = EXCLUDED.rows,
+            updated_at   = now()
+    """
+    return _executemany(engine, sql, [{"dataset": dataset, **r} for r in rows])
+
+
+# One row per alt-data event, tagged with its dataset and its own `source` column,
+# normalised to (dataset, symbol, source, known_at, period_end) — the provenance
+# feed both overview helpers aggregate. `period_end` is only meaningful for
+# fundamentals; the others carry NULL.
+_EVENT_UNION = """
+    SELECT 'insider' AS dataset, symbol, source, known_at, NULL::date AS period_end
+      FROM insider_trades         WHERE symbol = ANY(:syms)
+    UNION ALL SELECT 'ratings', symbol, source, known_at, NULL::date
+      FROM analyst_ratings        WHERE symbol = ANY(:syms)
+    UNION ALL SELECT 'price_target', symbol, source, known_at, NULL::date
+      FROM analyst_price_targets  WHERE symbol = ANY(:syms)
+    UNION ALL SELECT 'short_interest', symbol, source, known_at, NULL::date
+      FROM short_interest         WHERE symbol = ANY(:syms)
+    UNION ALL SELECT 'fundamentals', symbol, source, known_at, period_end
+      FROM fundamentals           WHERE symbol = ANY(:syms)
+"""
+
+
+def coverage_overview(engine: Engine, symbols: list[str], want_from: date) -> list[dict]:
+    """Provenance overview per ``(dataset, source)`` for ``symbols`` (one row each).
+
+    Joins the alt-data event tables (breadth, date range, per-``source`` split — so
+    insider shows ``sec_edgar`` vs ``sec_edgar_bulk`` etc.) to the ``altdata_coverage``
+    ledger. ``will_skip`` mirrors the actual backfill skip: a ``REFRESH=False`` backfill
+    at ``want_from`` skips a symbol iff its ``covered_from <= want_from`` (the covered
+    tail, not ``covered_to``, is update mode's job), so this is true when EVERY ledgered
+    symbol is deep enough (``max(covered_from) <= want_from``). ``recorded_but_empty``
+    counts symbols in the ledger with zero rows — the ledger-aware "thin table goes
+    quiet" alarm. ``ledger_from``/``ledger_to`` show the deepest/latest covered dates.
+
+    Args:
+        engine: Target database engine.
+        symbols: Universe to scope the report to.
+        want_from: Requested backfill start (drives ``will_skip``).
+
+    Returns:
+        One dict per ``(dataset, source)`` (a fully-empty but ledgered dataset yields a
+        single ``source=None`` row), ordered by dataset then source.
+    """
+    sql = text(f"""
+        WITH ev AS ({_EVENT_UNION}),
+        by_src AS (
+            SELECT dataset, source, count(*) AS rows, count(DISTINCT symbol) AS symbols,
+                   min(known_at) AS first_known_at, max(known_at) AS last_known_at,
+                   max(period_end) AS latest_period_end
+            FROM ev GROUP BY dataset, source
+        ),
+        led AS (
+            SELECT dataset, count(*) AS ledger_symbols, min(covered_from) AS ledger_from,
+                   max(covered_from) AS shallowest_from, max(covered_to) AS ledger_to
+            FROM altdata_coverage WHERE symbol = ANY(:syms) GROUP BY dataset
+        ),
+        led_empty AS (
+            SELECT c.dataset, count(*) AS recorded_but_empty
+            FROM altdata_coverage c
+            LEFT JOIN (SELECT DISTINCT dataset, symbol FROM ev) e
+              ON e.dataset = c.dataset AND e.symbol = c.symbol
+            WHERE c.symbol = ANY(:syms) AND e.symbol IS NULL
+            GROUP BY c.dataset
+        ),
+        merged AS (
+            SELECT dataset, source, rows, symbols, first_known_at, last_known_at, latest_period_end
+              FROM by_src
+            UNION ALL
+            SELECT dataset, NULL, 0, 0, NULL, NULL, NULL
+              FROM led WHERE dataset NOT IN (SELECT dataset FROM by_src)
+        )
+        SELECT m.dataset, m.source, m.rows, m.symbols, m.first_known_at, m.last_known_at,
+               m.latest_period_end, l.ledger_symbols, l.ledger_from, l.ledger_to,
+               COALESCE(le.recorded_but_empty, 0) AS recorded_but_empty,
+               (l.shallowest_from IS NOT NULL AND l.shallowest_from <= :wf) AS will_skip
+        FROM merged m
+        LEFT JOIN led l ON l.dataset = m.dataset
+        LEFT JOIN led_empty le ON le.dataset = m.dataset
+        ORDER BY m.dataset, m.source NULLS FIRST
+    """)
+    params = {"syms": list(symbols), "wf": want_from}
+    with engine.connect() as conn:
+        return [dict(r._mapping) for r in conn.execute(sql, params)]
+
+
+def coverage_overview_symbols(engine: Engine, symbols: list[str], want_from: date) -> list[dict]:
+    """Per-``(dataset, symbol)`` coverage detail for ``symbols``.
+
+    Full-outer-joins the event tables to the ledger so it surfaces both
+    unledgered-but-present rows and ledgered-but-empty names. ``will_skip`` mirrors the
+    backfill skip exactly (``covered_from <= want_from``); ``recorded_but_empty`` marks
+    a symbol the ledger claims but the table has no rows for.
+
+    Args:
+        engine: Target database engine.
+        symbols: Universe to scope the report to.
+        want_from: Requested backfill start.
+
+    Returns:
+        One dict per ``(dataset, symbol)`` with data or a ledger entry.
+    """
+    sql = text(f"""
+        WITH ev AS ({_EVENT_UNION}),
+        by_sym AS (
+            SELECT dataset, symbol, string_agg(DISTINCT source, ',') AS sources,
+                   count(*) AS rows, min(known_at) AS first_known_at, max(known_at) AS last_known_at
+            FROM ev GROUP BY dataset, symbol
+        ),
+        led AS (
+            SELECT dataset, symbol, covered_from, covered_to
+            FROM altdata_coverage WHERE symbol = ANY(:syms)
+        )
+        SELECT COALESCE(b.dataset, l.dataset) AS dataset,
+               COALESCE(b.symbol, l.symbol) AS symbol,
+               b.sources, COALESCE(b.rows, 0) AS rows,
+               b.first_known_at, b.last_known_at, l.covered_from, l.covered_to,
+               (l.covered_from IS NOT NULL AND l.covered_from <= :wf) AS will_skip,
+               (l.covered_from IS NOT NULL AND b.symbol IS NULL) AS recorded_but_empty
+        FROM by_sym b
+        FULL OUTER JOIN led l ON l.dataset = b.dataset AND l.symbol = b.symbol
+        ORDER BY dataset, symbol
+    """)
+    params = {"syms": list(symbols), "wf": want_from}
+    with engine.connect() as conn:
+        return [dict(r._mapping) for r in conn.execute(sql, params)]
 
 
 def _executemany(engine: Engine, sql: str, rows: list[dict]) -> int:

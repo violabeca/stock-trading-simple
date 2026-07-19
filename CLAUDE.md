@@ -46,12 +46,29 @@ git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook out
   100%-invested benchmark and cannot beat it however well it picks. (`informed_flow`
   lost 500/500 trials to buy-and-hold on exactly this.) In portfolio mode the dollar
   amount is a *reporting scale* — with fractional shares everything is scale-invariant —
-  so what actually constrains the book is the number of slots, not the $10k.
-  A signal strategy can also return `cash_frac` (a scalar) alongside `entries`/`exits`
-  to run the **cash-shared wallet** variant: ONE `init_cash` book, each entry deploying
-  that fraction of the free cash — total invested can never exceed the wallet, the way
-  a real single account trades a multi-symbol scanner (`support_bounce` does this).
-  Per-symbol books remain the default.
+  so what actually constrains the book is the number of slots, not the $10k. Rebalancing
+  is **event-driven per name**: `backtest.rotation_targets` emits a target only on the
+  bars a name's *own* weight changes, so a held position is bought once, left to drift
+  while other names rotate around it, and sold whole when it leaves — never re-trimmed
+  mid-hold (a whole-row mask would re-trim every holding on any single name's rotation).
+  A signal strategy returns `cash_frac` (a scalar) alongside `entries`/`exits` to run
+  the **cash-shared wallet** variant: ONE `init_cash` book, each entry deploying that
+  fraction of the free cash — total invested can never exceed the wallet, the way a
+  real single account trades a multi-symbol scanner. **The wallet (or portfolio mode)
+  is the repo default — every shipped strategy trades one shared $10k book**;
+  per-symbol books are a diagnostic only (drop `cash_frac`). Wallet-mode shorts work,
+  but percent sizing cannot reverse: an opposite-direction entry closes the position
+  (`upon_opposite_entry="close"`), never flips it.
+- **Comparability rules (README has the full list).** One shared $10k wallet,
+  fractional shares, one global cost model, profits reinvested and reported as
+  geometric CAGR only ($10k→$11k→$12.1k over 2y = 10.0%/yr, never the 10.5%
+  arithmetic mean), objectives benchmark-relative. `strategies/baseline/` is the
+  equal-weight buy-and-hold hurdle expressed as a strategy (test-pinned to
+  `backtest.benchmark`); every strategy notebook must show the baseline comparison,
+  and `notebooks/04_compare.ipynb` is the cross-strategy scoreboard. `optuna.
+  min_trades_per_year` (per config, PER YEAR not absolute — an absolute count is
+  implicitly stricter on a short window than a long one) floors the trading rate
+  in-objective so few-trade artifacts cannot crown a Pareto front.
 - **Beat the benchmark, never the zero line — and never on a cumulative number.**
   Two independent traps, both of which have bitten this repo.
   *(a) Absolute vs relative.* A long-only strategy in a rising market earns a positive
@@ -155,6 +172,15 @@ test, adapt a strategy notebook, then pass:
 - **No literal `%` in `schema.sql`** — it is applied via `exec_driver_sql`, and
   psycopg reads `%` as a parameter placeholder, so even a `%` inside a `--` comment
   breaks `tsim init-db`.
+- **Plotly `add_hrect`/`add_vrect`/`add_hline` default to `exclude_empty_subplots=True`**,
+  so a shape aimed at a subplot that has no *trace yet* is dropped **silently** — no error,
+  it just never renders. In a `make_subplots` figure this means bands/spans/reference lines
+  must be added **after** the `add_trace` calls for their subplot (`layer="below"` still
+  keeps them behind the data). This silently blanked the informed_flow "in or out of the
+  book" figure's IN/HOLD bands and position shading. Also: `-open`/`-thin` marker symbols
+  have no fill and are stroked from `marker.line.color` (not `marker.color`) — set both, or
+  they render the default slate. And a shape does not extend an axis range, but the data
+  behind it does: pin `update_xaxes(range=[...])` when a `add_vrect` could reach past a zoom.
 - Yahoo's `upgrades_downgrades` frame carries **three undocumented price-target
   columns** (`priceTargetAction`, `currentPriceTarget`, `priorPriceTarget`) that
   yfinance forwards but does not document — `providers/yf.fetch_price_targets` reads

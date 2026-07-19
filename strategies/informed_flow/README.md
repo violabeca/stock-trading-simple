@@ -157,13 +157,17 @@ Four behaviours look like bugs and are not:
   name had no data for a sleeve and was handed the median rank. It looks scored; it
   carries nothing.
 
-**A weight is not a position.** Between rotations the book is deliberately *not*
-re-trimmed, so a winner grows past its slot and a loser shrinks below it. That keeps
-trading event-driven and the fee drag small (a dense daily rebalance produced ~20x the
-orders for the same holdings), but it means the realized book drifts away from equal
-weight, and a runaway winner can come to dominate. The notebook reports top-name
-concentration for exactly this reason. For what was *actually* held, read
-`bt.trade_records`, never the weight frame.
+**A weight is not a position.** A held name is bought once and then deliberately *not*
+re-trimmed — not even when other names rotate around it — and is sold **whole in one
+order** only when its own rank leaves the mask. So a winner grows past its slot and a
+loser shrinks below it. That keeps trading event-driven *per name* and the fee drag
+small (a dense daily rebalance produced ~20x the orders for the same holdings; the
+engine's `rotation_targets` masks per name, not per bar), but it means the realized
+book drifts away from equal weight, and a runaway winner can come to dominate. The
+notebook reports top-name concentration for exactly this reason. A name therefore shows
+one buy and one sell per hold in `bt.trade_records` — several sells for one name means
+it genuinely left the book and re-entered, not a partial trim. For what was *actually*
+held, read `bt.trade_records`, never the weight frame.
 
 **The hurdle: beat equal-weight buy-and-hold, or there is no point.**
 
@@ -226,6 +230,19 @@ a cost-doubling stress and breakeven-bps; ~4-fold walk-forward; the Deflated
 Sharpe Ratio over the Optuna study; parameter-neighborhood stability; a
 sub-period table; a random-entry baseline; and a minimum-trades admissibility
 filter on the Pareto front. Report `n_trades` beside every Sharpe.
+
+The holdout section also renders `plots.plot_holdings(panel, pf)` — a
+**strategy-specific** figure that lives beside `strategy.py` in
+`strategies/informed_flow/plots.py`, not in `trading_simple.plots`, because "in
+the book vs out" only means something for a rotating multi-name portfolio. It
+puts four x-aligned panels on one screen: the **close price** of every name the
+book ever held (faded throughout, bold over the real holding spans from
+`bt.trade_records`, with `▲` buy / `▼` sell marks), the **portfolio composition**
+(each name's weight as a stacked area with cash on top, shares and dollar value in
+the hover — where the no-rebalance drift is visible), the **cumulative realized
+P&L** decomposed per name against the total and cumulative fees, and the shared
+book's **portfolio value**. Where `plot_equity` shows *how* the book did,
+this shows *which names* did it.
 
 **Caveats.**
 

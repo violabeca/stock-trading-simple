@@ -47,6 +47,9 @@ def test_volume_momentum_stop_params_passthrough(panel):
     sig = _vm(panel, sl_pct=0.02, sl_trail=True)
     assert sig["sl_stop"] == 0.02 and sig["sl_trail"] is True
     assert "sl_stop" not in _vm(panel, sl_pct=0.0)        # 0 disables the stop entirely
+    # One shared wallet: the cash fraction rides along unconditionally.
+    assert sig["cash_frac"] == 0.25
+    assert _vm(panel, cash_frac=0.5)["cash_frac"] == 0.5
 
 
 def _intraday_panel():
@@ -123,6 +126,10 @@ def test_donchian_breaks_out_long_and_short():
     assert isinstance(sig["sl_stop"], pd.DataFrame)
     valid_stops = sig["sl_stop"].iloc[15:]
     assert (valid_stops > 0).all().all()                  # ATR fraction of price
+    # One shared wallet: the cash fraction rides along unconditionally.
+    assert sig["cash_frac"] == 0.25
+    assert strat.signals(panel, entry_window=10, atr_window=5, atr_mult=2.0,
+                         cash_frac=0.5)["cash_frac"] == 0.5
 
 
 def test_donchian_channel_excludes_current_bar(panel):

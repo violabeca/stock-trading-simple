@@ -48,6 +48,7 @@ def signals(
     sl_pct: float = 0.0,
     sl_trail: bool = False,
     eod_exit: bool = True,
+    cash_frac: float = 0.25,
 ) -> dict:
     """Build execution-timed entry/exit frames for the volume-momentum rules.
 
@@ -71,6 +72,10 @@ def signals(
         sl_trail: True = trailing stop, False = fixed at entry.
         eod_exit: Force positions flat on each session's final bar
             (intraday only).
+        cash_frac: Fraction of the shared wallet's free cash deployed per
+            entry. Its presence runs the whole strategy as ONE ``init_cash``
+            book (engine cash-shared signal mode) — total invested can never
+            exceed the wallet.
 
     Returns:
         Dict with ``entries``, ``exits``, ``short_entries``, ``short_exits``
@@ -100,6 +105,7 @@ def signals(
            "short_entries": short_entries, "short_exits": short_exits}
     if sl_pct:
         out |= {"sl_stop": float(sl_pct), "sl_trail": bool(sl_trail)}
+    out["cash_frac"] = cash_frac
     return out
 
 

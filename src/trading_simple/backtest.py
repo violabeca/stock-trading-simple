@@ -28,8 +28,9 @@ Two execution models, chosen by what a strategy's ``signals()`` returns:
   each entry deploys ``cash_frac`` of the currently *free* cash, so the book can
   never be more than 100% invested. This is how a single real account of
   ``init_cash`` would trade a multi-symbol signal scanner. Stops work per column
-  as usual; percent sizing cannot reverse a position, so signals must stay
-  long-only or short-only per column.
+  as usual. Percent sizing cannot *reverse* a position, so an opposite-direction
+  entry closes the open position instead (``upon_opposite_entry="close"``); the
+  new direction opens on a later bar if its signal persists.
 
 **Every return metric is per-year** (:func:`_years`). A cumulative return rewards
 a long backtest window for being long, so it can compare neither two strategies
@@ -68,8 +69,8 @@ WEIGHTS_KEY = "weights"
 #: Returning this scalar (0 < f <= 1) alongside ``entries``/``exits`` opts a signal
 #: strategy into **one cash-shared wallet** of ``init_cash`` TOTAL: each entry deploys
 #: this fraction of the group's currently free cash, so total invested can never
-#: exceed the book. Percent sizing cannot reverse a position — keep the signals
-#: long-only or short-only per column.
+#: exceed the book. Percent sizing cannot reverse a position, so an opposite-direction
+#: entry closes the open position instead of flipping it.
 CASH_FRAC_KEY = "cash_frac"
 #: Every metric a sweep/trial frame may carry; anything else in such a frame is a
 #: strategy parameter. One definition, so a new metric cannot be mistaken for a knob.
@@ -363,8 +364,11 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
         # One shared wallet of init_cash TOTAL: each entry deploys `cash_frac` of the
         # free cash, so the book can never be more than 100% invested. call_seq="auto"
         # puts same-bar sells before buys, so an exit frees the cash a new entry spends.
+        # upon_opposite_entry="close": percent sizing cannot reverse a position
+        # (vectorbt raises), so an opposite entry closes the open position instead.
         kwargs |= dict(size=float(signals[CASH_FRAC_KEY]), size_type="percent",
-                       group_by=True, cash_sharing=True, call_seq="auto")
+                       group_by=True, cash_sharing=True, call_seq="auto",
+                       upon_opposite_entry="close")
     return vbt.Portfolio.from_signals(
         panel.close, price=panel.open_, fees=fees, slippage=slippage,
         init_cash=init_cash, freq=panel.freq, **kwargs,
@@ -372,23 +376,27 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
 
 
 def rotation_targets(weights: pd.DataFrame) -> pd.DataFrame:
-    """Blank out bars where the target book is unchanged, so no order is placed.
+    """Blank out cells where a name's target is unchanged, so no order is placed.
 
-    Target-percent sizing acts on every bar it is given a number for, so a *dense*
-    weight frame silently re-trims the whole book back to equal weight **every single
-    bar** as prices drift — hundreds of tiny orders and a fee drag charged straight
-    against the benchmark. NaN means "no order", so masking the unchanged bars keeps
-    trading **event-driven**: the book is rebalanced when a name is bought or sold, and
-    left to drift in between. (Measured on a 50-bar synthetic: 101 orders dense, 5
-    sparse, same holdings.)
+    Target-percent sizing acts on every cell it is given a number for, so a *dense*
+    weight frame silently re-trims a position **every single bar** as prices drift —
+    hundreds of tiny orders and a fee drag charged straight against the benchmark. NaN
+    means "no order", so masking the unchanged cells keeps trading **event-driven and
+    per name**: a name is traded only when *its own* target changes (bought when it
+    enters, sold whole when it leaves) and is **left untouched — to drift — while other
+    names rotate around it**. This is the difference from a whole-*row* mask, which
+    re-emits every held name the instant any one name rotates and so re-trims positions
+    the strategy only meant to hold.
+
+    Bar 0 always rotates (the whole first row is emitted) so the initial book is placed.
 
     Args:
         weights: Target fraction of the book per symbol, per bar.
 
     Returns:
-        The same frame with non-rotation bars set to NaN. Bar 0 always rotates.
+        The same frame with unchanged cells set to NaN (per name, not per row).
     """
-    changed = weights.ne(weights.shift()).any(axis=1)
+    changed = weights.ne(weights.shift())
     changed.iloc[0] = True
     return weights.where(changed, np.nan)
 
@@ -622,7 +630,9 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
                 fees=fees, slippage=slippage, init_cash=init_cash,
                 group_by="combo", cash_sharing=True, call_seq="auto", freq=panel.freq,
             )
-            rows += [{**grid[cid], **_grouped_stats(pf[cid])} for cid in ids]
+            # A one-combo chunk has one group and cannot be indexed into further.
+            rows += [{**grid[cid], **_grouped_stats(pf[cid] if len(ids) > 1 else pf)}
+                     for cid in ids]
             continue
 
         kwargs = {
@@ -646,7 +656,7 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
                 size=np.repeat([float(s[CASH_FRAC_KEY]) for s in combo_signals],
                                len(columns))[None, :],
                 size_type="percent", group_by="combo", cash_sharing=True,
-                call_seq="auto",
+                call_seq="auto", upon_opposite_entry="close",
             )
 
         pf = vbt.Portfolio.from_signals(
@@ -654,7 +664,9 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
             fees=fees, slippage=slippage, init_cash=init_cash, freq=panel.freq, **kwargs,
         )
         if grouped:
-            rows += [{**grid[cid], **_grouped_stats(pf[cid])} for cid in ids]
+            # A one-combo chunk has one group and cannot be indexed into further.
+            rows += [{**grid[cid], **_grouped_stats(pf[cid] if len(ids) > 1 else pf)}
+                     for cid in ids]
             continue
         per_combo = _metric_frame(pf, cols).groupby(level="combo").agg({
             "total_return": "mean", "sharpe": "mean", "max_drawdown": "mean",

@@ -22,8 +22,8 @@ Signals:
   day's final bar — nothing is held overnight.
 * Exits are otherwise stop-driven: the engine passes ``sl_stop`` (an ATR
   fraction of price, per entry) with ``sl_trail`` on to vectorbt, which
-  evaluates it intrabar against high/low. An opposite breakout reverses the
-  position.
+  evaluates it intrabar against high/low. An opposite breakout closes the
+  position (the shared wallet's percent sizing cannot reverse in one order).
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ def signals(
     skip_open: int = 15,
     skip_close: int = 15,
     eod_exit: bool = True,
+    cash_frac: float = 0.25,
 ) -> dict:
     """Build breakout entries, ATR trailing-stop parameters and session exits.
 
@@ -61,13 +62,18 @@ def signals(
             (intraday only).
         eod_exit: Force positions flat on each session's final bar
             (intraday only).
+        cash_frac: Fraction of the shared wallet's free cash deployed per
+            entry. Its presence runs the whole strategy as ONE ``init_cash``
+            book (engine cash-shared signal mode) — total invested can never
+            exceed the wallet.
 
     Returns:
         Dict with ``entries``, ``short_entries``, ``sl_stop`` (ATR fraction of
         price at entry), ``sl_trail=True`` and, intraday with ``eod_exit``,
         ``exits`` / ``short_exits`` on each session's final bar. There are no
         other time-based exits: positions leave via the trailing stop, the
-        end of the session, or an opposite breakout (reversal).
+        end of the session, or an opposite breakout (which closes, never
+        reverses, under the shared wallet's percent sizing).
     """
     upper = panel.high.rolling(entry_window, min_periods=entry_window).max().shift(1)
     lower = panel.low.rolling(entry_window, min_periods=entry_window).min().shift(1)
@@ -91,6 +97,7 @@ def signals(
     if intraday and eod_exit:
         end = none | bt.session_end(panel.close.index, panel.tz).to_numpy()[:, None]
         out |= {"exits": end, "short_exits": end.copy()}
+    out["cash_frac"] = cash_frac
     return out
 
 

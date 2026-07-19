@@ -22,7 +22,7 @@ from trading_simple import backtest as bt
 from trading_simple.data import Panel
 
 
-def signals(panel: Panel, *, example_window: int = 20) -> dict:
+def signals(panel: Panel, *, example_window: int = 20, cash_frac: float = 0.25) -> dict:
     """Build execution-timed signal frames from the price panel.
 
     Args:
@@ -30,6 +30,12 @@ def signals(panel: Panel, *, example_window: int = 20) -> dict:
             ``low``, ``volume``), all (timestamp x symbol).
         example_window: Replace with your strategy's real parameters — every
             keyword argument here must appear in ``config.yaml``.
+        cash_frac: Fraction of the shared wallet's free cash deployed per
+            entry. Its presence runs the whole strategy as ONE ``init_cash``
+            book (engine cash-shared signal mode) — the repo's default capital
+            model, so every strategy trades the same $10k. Drop it only for a
+            per-symbol diagnostic run; return a ``weights`` frame instead for
+            portfolio mode (cross-sectional rankers).
 
     Returns:
         A dict with any subset of:
@@ -39,10 +45,12 @@ def signals(panel: Panel, *, example_window: int = 20) -> dict:
             ``sl_stop`` / ``tp_stop`` — stop distance as a fraction of entry
                 price (scalar or frame; NaN = no stop).
             ``sl_trail`` — True to make ``sl_stop`` trail the price.
+            ``cash_frac`` — see above; an opposite-direction entry closes the
+                open position (percent sizing cannot reverse in one order).
     """
     raw = panel.close > bt.sma(panel.close, example_window)  # your idea goes here
     entries = bt.next_bar(raw & ~raw.shift(1, fill_value=False))  # e.g. on crossover only
-    return {"entries": entries, "exits": bt.exit_after(entries, 10)}
+    return {"entries": entries, "exits": bt.exit_after(entries, 10), "cash_frac": cash_frac}
 
 
 def valid(params: dict) -> bool:

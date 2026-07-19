@@ -17,6 +17,12 @@ question that matters: **does reading the candle add anything over the location
 edge alone?** If it doesn't, that negative result is the deliverable, and the
 config is not shipped.
 
+**Capital model.** The whole strategy trades ONE shared $10k wallet (engine
+cash-shared mode): each entry deploys `cash_frac` (25%) of the currently *free*
+cash, so total invested never exceeds the book — the repo-wide comparability
+rule. An opposite-direction entry closes the open position (percent sizing
+cannot reverse in one order).
+
 **How a trade works.**
 
 1. A **reversal candle** prints (`pattern`): a `hammer` (lower wick dominates the

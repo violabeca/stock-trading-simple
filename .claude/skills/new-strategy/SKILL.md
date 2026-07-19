@@ -29,6 +29,12 @@ From the user's description, identify:
   `tsim subset --universe <U> --top 20` writes `<U>Top20` (top names by
   trailing-90d average dollar volume) — see the donchian_breakout README for
   the rationale. Sibling-repo universes arrive via `tsim import-universes`.
+- **Capital model** — the repo default is ONE shared $10k wallet: keep the
+  template's `cash_frac` param and return it in the signals dict (engine
+  cash-shared mode; an opposite-direction entry closes, never reverses). A
+  cross-sectional ranker returns a `weights` frame (portfolio mode) instead.
+  Never let each symbol trade its own book — that breaks the repo-wide
+  comparability rules (root README).
 
 Read `strategies/volume_momentum/strategy.py` (indicator-driven, time exits)
 and `strategies/donchian_breakout/strategy.py` (breakout, trailing stops) —
@@ -67,7 +73,18 @@ combos after `valid`). Comment every parameter with its meaning in one line.
 Make each `space` range generously wide rather than pre-tuned — the
 post-optimization boundary check (§6) will say if it still needs widening;
 use `log: true` for window/horizon-style ranges spanning an order of
-magnitude.
+magnitude. Two comparability keys:
+
+- `data.end` is the **TRAIN cutoff** — leave a recent tail unstored-to-the-
+  optimizer; the notebook's out-of-sample section loads `end=None` and
+  replays the picked params on that tail.
+- `optuna.min_trades_per_year` — admissibility floor pruned in-objective, PER
+  YEAR not an absolute count (an absolute floor is implicitly stricter on a
+  short backtest window than a long one for the same trading style — this bit
+  `donchian_breakout`'s short `end: null` window under the old absolute key).
+  300/year fits an intraday scanner; ~25/year fits a daily portfolio-mode
+  strategy holding several positions at once. Without it a few lucky fills
+  can crown the front.
 
 ## 5 · Write the README and the test
 
@@ -84,7 +101,7 @@ Copy an existing strategy notebook into the new folder, rename it
 `<name>.ipynb`, and change the strategy name in `strategies.load("...")` and
 `jobs.run_optimize("...")`, the title, the intro paragraph, the parameter
 table in the overview section, and the `plot_heatmap_grid` pair names.
-Nothing else should need editing. Every strategy notebook keeps two
+Nothing else should need editing. Every strategy notebook keeps these
 strategy-agnostic sections — do NOT drop them when adapting:
 
 - **Strategy overview** (right after loading): a markdown table of each
@@ -96,6 +113,19 @@ strategy-agnostic sections — do NOT drop them when adapting:
   If a parameter is flagged, widen that bound in `config.yaml` and re-run
   the optimize cell (same study name resumes) until the front sits inside
   the searched box.
+- **Baseline comparison** (mandatory): show the strategy against
+  `strategies.load("baseline")` run on the SAME panel — an equity overlay
+  plus `bt.active_stats` (`excess_cagr`/`info_ratio`). The baseline is the
+  engine hurdle made visible; a strategy that never faces it on a chart is
+  not done. `notebooks/04_compare.ipynb` picks the new strategy up
+  automatically for the cross-strategy scoreboard.
+- **Out-of-sample check** (§11 pattern): `config.yaml`'s `data.end` is the
+  train cutoff; load `end=None`, slice the untouched tail, replay the picked
+  params and verdict on holdout `excess_cagr` AND `info_ratio` > 0.
+- **Cost stress test** (§12 pattern): re-run the picked params at stressed
+  friction (e.g. 6/5 and 10/3 bps via `settings.costs.model_copy`) —
+  `active_stats` recomputes the benchmark at the same costs, keeping the
+  hurdle fair.
 
 ## 7 · VALIDATION GATE (all three must pass before reporting done)
 

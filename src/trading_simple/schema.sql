@@ -151,7 +151,63 @@ CREATE TABLE IF NOT EXISTS analyst_price_targets (
         UNIQUE NULLS NOT DISTINCT (symbol, firm, rated_at)
 );
 
+-- As-reported company fundamentals from SEC EDGAR XBRL `companyfacts` (free, no
+-- API key). One row per (symbol, logical concept, reporting period, filing): a
+-- balance-sheet INSTANT level (equity, assets, shares) or an income-statement
+-- FLOW already rolled to trailing-twelve-months (ni_ttm, gp_ttm) in the provider
+-- parser. `known_at` is the filing date at 21:00 UTC (safely after the US close,
+-- like short_interest) — features act only on rows knowable by the as-of bar.
+-- (Keep literal percent signs out of this file: psycopg reads them as placeholders.)
+--
+-- Point-in-time is preserved across restatements by keying on the SEC accession:
+-- an amendment arrives as a NEW accession with a later `filed`, so it lands as a
+-- distinct row rather than overwriting the original, and an as-of query
+-- (`known_at <= as_of`, latest wins) reconstructs what was truly known then.
+-- Hence DO NOTHING on conflict (SEC facts are immutable per accession), unlike
+-- short_interest's in-place revisions.
+CREATE TABLE IF NOT EXISTS fundamentals (
+    id           BIGSERIAL PRIMARY KEY,
+    symbol       TEXT NOT NULL REFERENCES securities(symbol),
+    concept      TEXT NOT NULL,                 -- equity | assets | shares | ni_ttm | gp_ttm
+    tag          TEXT,                           -- the XBRL tag actually used (audit trail)
+    unit         TEXT,                           -- 'USD' | 'shares'
+    period_start DATE,                           -- NULL for instants (balance-sheet levels)
+    period_end   DATE NOT NULL,                  -- instant date, or TTM window end
+    val          DOUBLE PRECISION,               -- instant level, or TTM sum for flows
+    fy           INTEGER,                         -- fiscal year of the source filing
+    fp           TEXT,                            -- fiscal period: FY | Q1 | Q2 | Q3
+    form         TEXT,                            -- 10-K | 10-Q | 20-F | 10-K/A ...
+    filed        DATE NOT NULL,                   -- SEC submission date (point-in-time key)
+    known_at     TIMESTAMPTZ NOT NULL,
+    accn         TEXT,                            -- SEC accession number (part of the key)
+    source       TEXT,
+    -- accn in the key keeps a restatement (new accession) distinct from the
+    -- original; NULLS NOT DISTINCT keeps re-runs idempotent for null accns.
+    CONSTRAINT fundamentals_uq
+        UNIQUE NULLS NOT DISTINCT (symbol, concept, period_end, accn)
+);
+
 CREATE INDEX IF NOT EXISTS idx_insider_symbol_known ON insider_trades  (symbol, known_at);
 CREATE INDEX IF NOT EXISTS idx_ratings_symbol_known ON analyst_ratings (symbol, known_at);
 CREATE INDEX IF NOT EXISTS idx_short_int_sym_known  ON short_interest  (symbol, known_at);
 CREATE INDEX IF NOT EXISTS idx_ptarget_symbol_known ON analyst_price_targets (symbol, known_at);
+CREATE INDEX IF NOT EXISTS idx_fundamentals_sym_known ON fundamentals (symbol, known_at);
+
+-- ===========================================================================
+-- INGESTION BOOKKEEPING — this repo only (the sibling never touches it). Records,
+-- per (dataset, symbol), the [covered_from, covered_to] window already fetched, so
+-- a follow-up backfill can SKIP symbols already covered to the requested depth.
+-- That is what makes "add one name to a universe" re-fetch only the new name
+-- instead of re-pulling the whole list. It is ATTEMPT-based, not row-based: a name
+-- with genuinely no insider events is still recorded as covered, so it is not
+-- re-attempted forever. Safe to be empty (a fresh run simply backfills everything).
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS altdata_coverage (
+    dataset      TEXT NOT NULL,               -- insider | ratings | price_target | short_interest | fundamentals
+    symbol       TEXT NOT NULL,
+    covered_from DATE NOT NULL,               -- earliest `since` fetched for this (dataset, symbol)
+    covered_to   DATE NOT NULL,               -- latest day fetched (the run's end date)
+    rows         BIGINT,                       -- rows written on the most recent fetch (audit only)
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (dataset, symbol)
+);

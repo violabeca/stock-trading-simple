@@ -13,6 +13,12 @@ ATR-compression ratio — a deliberate lightweight proxy for the TTM
 Bollinger-inside-Keltner squeeze from the same own-history compression
 family. Donchian trades every break; this one waits for the green lights.
 
+**Capital model.** The whole strategy trades ONE shared $10k wallet (engine
+cash-shared mode): each entry deploys `cash_frac` (25%) of the currently *free*
+cash, so total invested never exceeds the book — the repo-wide comparability
+rule. An opposite-direction entry closes the open position (percent sizing
+cannot reverse in one order).
+
 **How a trade works.**
 
 1. At a bar's close, all enabled gates must agree: the lagged squeeze ratio

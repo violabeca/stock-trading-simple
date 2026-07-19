@@ -4,12 +4,16 @@ data:                      # which panel the notebook / optimizer loads
   universe: starter        # a name from settings.yaml or universes.yaml
   bar: 1d                  # 1d | 1m
   start: "2018-01-01"
-  end: null                # null = everything stored
+  end: null                # set to the TRAIN cutoff; the notebook's out-of-sample
+                           # section loads end=null and replays the tail as the
+                           # untouched holdout (null = everything stored)
   session: regular         # regular | extended | both (rth filter; matters intraday)
   max_symbols: 20          # cap at the best-covered names
 
 params:                    # single-run defaults = signals() keyword arguments
   example_window: 20
+  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
+                           # deploys 25% of the FREE cash — params-only, not searched
 
 sweep:                     # value lists for grid exploration (optional block)
   example_window: [10, 20, 50]
@@ -19,6 +23,11 @@ optuna:
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
   n_trials: 100
+  # min_trades_per_year: 300  # admissibility floor, PER YEAR not absolute (an
+                           # absolute count is implicitly stricter on a short window
+                           # than a long one for the same trading style): trials
+                           # trading below this rate are pruned in-objective
+                           # (300 fits intraday; ~25 for a daily portfolio-mode strategy)
   space:                   # one entry per tunable parameter
     example_window: { type: int, low: 5, high: 100 }
     # other types:

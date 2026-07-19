@@ -1,6 +1,18 @@
 """CLI command composition and stdout parsing (pure parts of jobs.py)."""
 
-from trading_simple.jobs import backfill_cmd, parse_rows_written, parse_symbol_bars
+from trading_simple.jobs import altdata_cmd, backfill_cmd, parse_rows_written, parse_symbol_bars
+
+
+def test_altdata_cmd_composition_and_flags():
+    base = " ".join(altdata_cmd("fundamentals", since="2020-01-01", universe="LiquidLeaders"))
+    assert "-m trading_simple.cli altdata --dataset fundamentals --since 2020-01-01" in base
+    assert "--universe LiquidLeaders" in base
+    assert "--skip-covered" not in base and "--refresh" not in base  # off by default
+    # symbols override universe; skip/refresh flags appear only when set
+    full = " ".join(altdata_cmd("all", since="2020-01-01", universe="ALL",
+                                symbols=["AAPL", "MSFT"], skip_covered=True, refresh=True))
+    assert "--symbols AAPL,MSFT" in full and "--universe" not in full
+    assert "--skip-covered" in full and "--refresh" in full
 
 
 def test_backfill_cmd_composition():

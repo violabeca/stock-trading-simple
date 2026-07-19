@@ -77,6 +77,9 @@ def test_stop_param_conditional():
     assert (sig["sl_stop"].iloc[5:] > 0).all().all()      # ATR fraction of price
     assert "sl_trail" not in sig                          # reversion bets never trail
     assert "sl_stop" not in _kr(panel, sl_mult=0.0)       # 0 disables the stop entirely
+    # One shared wallet: the cash fraction rides along unconditionally.
+    assert sig["cash_frac"] == 0.25
+    assert _kr(panel, cash_frac=0.5)["cash_frac"] == 0.5
 
 
 def test_intraday_session_guards_and_eod():

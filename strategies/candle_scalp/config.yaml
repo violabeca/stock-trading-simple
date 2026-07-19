@@ -10,7 +10,7 @@ data:
   start: "2025-07-01"      # ~10 months of stored 1m history for the train window
   end: "2026-04-30"        # TRAIN cutoff — the ~2-month tail is the notebook's holdout
   session: regular         # the band/ATR assume one consistent session
-  max_symbols: 40          # cap at the best-covered names
+  max_symbols: 20          # the pinned Top20 subset — matches the universe size
 
 params:                    # single-backtest defaults; every key is a signals() argument
   pattern: hammer          # hammer | engulfing | any (any = location-only ablation control)
@@ -29,6 +29,8 @@ params:                    # single-backtest defaults; every key is a signals() 
   skip_open: 15            # no entries in the first N minutes of a session
   skip_close: 15           # no entries in the last N minutes of a session
   eod_exit: true           # flat on each session's final bar (intraday only)
+  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
+                           # deploys 25% of the FREE cash — params-only, not searched
 
 sweep:                     # coarse grid (24 combos; all valid at these band/trend/sl defaults)
   pattern: [hammer, engulfing, any]
@@ -37,10 +39,15 @@ sweep:                     # coarse grid (24 combos; all valid at these band/tre
   horizon: [30, 120]
 
 optuna:
-  study: candle_scalp-1m-v1  # journal file: studies/<study>.log (rename = fresh study)
+  study: candle_scalp-1m-v2  # v2: capital model changed to one shared $10k wallet — v1
+                             # scored 20 independent $10k books (and predates the
+                             # benchmark-relative objectives); journal stays on disk
   sampler: nsga2           # nsga2 | tpe | random
   seed: 7
   n_trials: 1000
+  min_trades_per_year: 300  # admissibility floor (PER YEAR, not absolute — a short
+                           # window shouldn't need fewer trades to pass): fewer-trade
+                           # trials are pruned in-objective (a lucky fill can fake info_ratio)
   space:                   # declarative search space -> optimize.suggest_params
     # pattern=any and stretch_mult=0 are the two ablation controls, searched first-class;
     # trend/volume gates stay ON in the search (ablate them by hand in the notebook).

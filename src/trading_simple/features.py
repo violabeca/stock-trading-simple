@@ -76,13 +76,46 @@ _SHORT_INTEREST_SQL = """
     GROUP BY symbol, d
 """
 
+def _fundamental_sql(concept: str) -> str:
+    """SQL for one fundamentals concept: the latest as-of value per (symbol, UTC day).
+
+    ``DISTINCT ON`` keeps, for each day a filing became public, the row with the
+    most recent ``period_end`` (and, on a tie, the latest filing) — so a same-day
+    restatement or a comparative never displaces the current period. The ``ffill``
+    mode then carries that level forward between filings. ``concept`` is a fixed
+    code literal (never user input), so interpolating it is safe.
+
+    Args:
+        concept: The stored concept name (e.g. ``"equity"``, ``"ni_ttm"``).
+
+    Returns:
+        A parameterized SQL string returning ``(symbol, d, value)``.
+    """
+    return f"""
+        SELECT DISTINCT ON (symbol, (known_at AT TIME ZONE 'UTC')::date)
+               symbol, (known_at AT TIME ZONE 'UTC')::date AS d, val AS value
+        FROM fundamentals
+        WHERE symbol = ANY(:symbols) AND concept = '{concept}'
+          AND known_at >= :start AND known_at <= :as_of
+        ORDER BY symbol, (known_at AT TIME ZONE 'UTC')::date, period_end DESC, known_at DESC
+    """
+
+
 #: Feature name -> (SQL, fill mode). ``zero`` = event flow (no event = 0);
-#: ``ffill`` = a level that persists between observations (short interest).
+#: ``ffill`` = a level that persists between observations (short interest, and the
+#: fundamentals levels, which hold from one filing to the next).
 _BUILDERS = {
     "insider": (_INSIDER_SQL, "zero"),
     "ratings": (_RATINGS_SQL, "zero"),
     "price_target": (_PRICE_TARGET_SQL, "zero"),
     "short_interest": (_SHORT_INTEREST_SQL, "ffill"),
+    # Fundamentals (SEC XBRL companyfacts): balance-sheet levels + TTM income flows,
+    # each forward-filled from its filing. Ratios vs price are formed in signals().
+    "fund_equity": (_fundamental_sql("equity"), "ffill"),
+    "fund_assets": (_fundamental_sql("assets"), "ffill"),
+    "fund_shares": (_fundamental_sql("shares"), "ffill"),
+    "fund_ni_ttm": (_fundamental_sql("ni_ttm"), "ffill"),
+    "fund_gp_ttm": (_fundamental_sql("gp_ttm"), "ffill"),
 }
 
 

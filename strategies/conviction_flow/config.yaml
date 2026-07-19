@@ -1,0 +1,95 @@
+# ===========================================================================
+# conviction_flow — informed_flow's alt-data composite, made selective and gated
+# on fundamentals. Same insider + rating-change + price-target + short-interest
+# ranking and the same TopK-Drop hysteresis selector, plus five open/close levers
+# (all OFF by default, so at these params it reproduces informed_flow exactly).
+# Blocks: data (what to load, incl. alt-data AND fundamentals feature matrices),
+# params (single-run defaults), sweep (ablation grid), optuna (study + space).
+# ===========================================================================
+
+data:
+  universe: LiquidLeaders  # ~100 liquid US names — breadth for cross-sectional ranking
+  bar: 1d                  # daily bars (alt-data + fundamentals act over weeks–quarters)
+  # Train from 2021 (the 2020 COVID/reflation regime is unlike today's); 2025+ is the
+  # notebook's untouched holdout. See the informed_flow README for the DSR/sub-period
+  # caveats — they apply here too, with an even larger search space.
+  start: "2021-01-01"
+  end: "2024-12-31"        # TRAIN cutoff — 2025+ is the notebook's untouched holdout
+  session: regular         # daily bars are all regular-session
+  max_symbols: 100         # cap at the best-covered names
+  # Attached to Panel.features at load time. The first four are the alt-data flow sleeves
+  # (as in informed_flow); the five fund_* matrices feed the fundamentals-quality GATE
+  # (book-to-price, earnings yield, gross profitability — as in value_factor). A sleeve
+  # that is missing or too thin to rank (strategy._MIN_COVERAGE) is dropped and, for the
+  # quality gate, the gate self-disables — so an un-ingested table degrades gracefully.
+  features: [insider, ratings, price_target, short_interest,
+             fund_shares, fund_equity, fund_ni_ttm, fund_gp_ttm, fund_assets]
+
+params:                    # single-backtest defaults; every key is a signals() argument
+  insider_window: 63       # trailing bars for insider dollars, normalizer, eligibility (~1 quarter)
+  rating_halflife: 21      # EMA half-life (bars) for the rating-change stream (~1 month)
+  ptrev_halflife: 21       # EMA half-life (bars) for the price-target revision stream
+  # Composite weights. signals() divides by their SUM, so only the RATIOS matter; w_dtc is
+  # the FIXED numeraire (never searched) and the other three float relative to it.
+  w_insider: 1.0           # composite weight: insider buying
+  w_rating: 1.0            # composite weight: rating-change momentum
+  w_ptrev: 0.5             # composite weight: price-target revisions (NOT the target level)
+  w_dtc: 1.0               # FIXED numeraire — the scale reference
+  q_in: 0.8                # enter when composite rank is top 20% cross-sectionally
+  q_out: 0.6               # exit when rank falls below 60% (hysteresis band vs q_in)
+  max_hold: 126            # time-stop backstop (~6 months) for a name parked in the band
+  min_events: 1            # min insider+rating events in the window to be rankable
+  max_positions: 10        # slots in the ONE shared book, 1/max_positions each at entry
+  displace: false          # may a qualifying newcomer evict the weakest holding when full?
+  # --- the five selectivity levers, ALL OFF by default (== informed_flow) --------------
+  min_quality_pct: 0.0     # fundamentals-quality floor to OPEN (0 = off; needs fund_* data)
+  min_agree: 0             # min flow sleeves each ranking the name >= q_in to OPEN (0 = off)
+  min_score: 0.0           # min composite score LEVEL (in [0,1]) to OPEN (0 = off)
+  displace_margin: 0.0     # rank margin a challenger must beat the weakest holding by (0 = strict)
+  exit_decay: 1.0          # sell a holding faded >= this from its peak-while-held (1.0 = off)
+
+sweep:                     # coarse ablation grid; all satisfy valid()
+  # Fix the sleeve weights and the bands, and toggle the new open-gates on/off to read
+  # their marginal effect side by side (16 combos). displace_margin/exit_decay are left at
+  # their param defaults here and searched in Optuna.
+  w_insider: [1.0]
+  w_rating: [1.0]
+  w_ptrev: [0.5]
+  w_dtc: [1.0]
+  q_in: [0.8]
+  q_out: [0.6]
+  max_positions: [10]
+  min_quality_pct: [0.0, 0.5]   # fundamentals quality gate off vs top-half only
+  min_agree: [0, 2]             # no agreement required vs >= 2 sleeves agree
+  min_score: [0.0, 0.4]         # conviction bar off vs a modest floor
+  displace: [false, true]       # wait-for-vacancy vs evict-the-weakest
+
+optuna:
+  # v1: the initial study for this strategy. NOT comparable to informed_flow's studies —
+  # this one searches five extra selectivity levers on top of the same flow composite.
+  study: conviction-flow-1d-v1
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 42
+  n_trials: 1000
+  min_trades_per_year: 15  # admissibility floor (PER YEAR): daily multi-position portfolio
+                           # mode turns over far less than an intraday scanner
+  space:                   # declarative search space -> optimize.suggest_params
+    insider_window:  { type: int,   low: 21,  high: 378, log: true }
+    rating_halflife: { type: int,   low: 5,   high: 90,  log: true }
+    ptrev_halflife:  { type: int,   low: 5,   high: 90,  log: true }
+    # w_dtc is the fixed numeraire (1.0) and is NOT searched; these three float against it.
+    w_insider:       { type: float, low: 0.0, high: 3.0, step: 0.25 }
+    w_rating:        { type: float, low: 0.0, high: 3.0, step: 0.25 }
+    w_ptrev:         { type: float, low: 0.0, high: 3.0, step: 0.25 }
+    q_in:            { type: float, low: 0.6, high: 0.95, step: 0.05 }
+    q_out:           { type: float, low: 0.4, high: 0.9,  step: 0.05 }
+    max_hold:        { type: int,   low: 21,  high: 252, log: true }
+    min_events:      { type: int,   low: 1,   high: 3 }
+    max_positions:   { type: int,   low: 5,   high: 25 }
+    displace:        { type: categorical, choices: [true, false] }
+    # --- the new selectivity levers (0 / off ends of the ranges reduce to informed_flow) -
+    min_quality_pct: { type: float, low: 0.0, high: 0.9,  step: 0.1 }   # fundamentals veto
+    min_agree:       { type: int,   low: 0,   high: 3 }                 # sleeve agreement
+    min_score:       { type: float, low: 0.0, high: 0.6,  step: 0.05 }  # conviction bar
+    displace_margin: { type: float, low: 0.0, high: 0.3,  step: 0.05 }  # decisive-edge rotation
+    exit_decay:      { type: float, low: 0.1, high: 1.0,  step: 0.1 }   # rank-decay exit (1.0 = off)

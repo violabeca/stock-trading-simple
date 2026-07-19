@@ -8,3 +8,13 @@
 
 Document each parameter's meaning in `config.yaml` comments — that file is the
 single place someone tunes your strategy from.
+
+Conventions every strategy follows (see "Comparability rules" in the root README):
+
+- **One shared $10k wallet** — keep the `cash_frac` return (or a `weights` frame
+  for a cross-sectional ranker); never one book per symbol.
+- **`data.end` is the TRAIN cutoff** — the notebook's out-of-sample section
+  replays the picked parameters on the untouched tail.
+- **Baseline comparison is mandatory** — the notebook must show the strategy
+  against `strategies/baseline` (equal-weight buy-and-hold of the same panel):
+  equity overlay plus `excess_cagr`/`info_ratio`.

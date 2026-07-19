@@ -40,9 +40,10 @@ look-ahead.
 **This is a capital-constrained portfolio, and that is the whole design.** The
 strategy runs in the engine's portfolio mode: it returns a ``weights`` frame, not
 entries/exits, so all names share **one** cash account of ``init_cash`` *total*.
-There are exactly ``max_positions`` slots, each a fixed ``1 / max_positions`` of the
-book, and **a new name can only be bought by selling an existing one**. That
-constraint is not incidental — it is what the earlier design got wrong. With a cash
+There are exactly ``max_positions`` slots, each ``1 / max_positions`` of the book
+**at entry** (then left to drift — a held name is bought once and sold whole, never
+re-trimmed mid-hold), and **a new name can only be bought by selling an existing
+one**. That constraint is not incidental — it is what the earlier design got wrong. With a cash
 account *per symbol*, a strategy holding 40 of 100 names sat ~30% invested against a
 100%-invested benchmark, forfeiting most of the market's return to buy a selection
 edge, and the ranking was diluted across four times as many names as the edge could
@@ -165,8 +166,12 @@ def _weights(held: pd.DataFrame, max_positions: int) -> pd.DataFrame:
     Each slot is a **fixed** ``1 / max_positions`` of the book rather than
     ``1 / len(held)``, so a thin selection leaves the remaining capital in cash instead
     of silently concentrating the whole book into the few names that happened to
-    qualify. ``bt.next_bar`` keeps the execution discipline identical to the rest of the
-    repo: decided on bar t from data already lagged a bar, filled at the open of t+1.
+    qualify. The ``1 / max_positions`` is the target **at entry**: the engine
+    (:func:`trading_simple.backtest.rotation_targets`) masks per name, so a held name is
+    bought once, **left to drift** while other names rotate around it, and sold whole in
+    one order when it leaves the mask — it is never re-trimmed mid-hold. ``bt.next_bar``
+    keeps the execution discipline identical to the rest of the repo: decided on bar t
+    from data already lagged a bar, filled at the open of t+1.
 
     Args:
         held: Boolean (bars x symbols) mask of names the book wants to own.

@@ -10,6 +10,12 @@ name's own volatility) keeps every loss small while letting the occasional real
 intraday trend run. The result profile to expect: many small stop-outs,
 frequent medium wins, few large losses.
 
+**Capital model.** The whole strategy trades ONE shared $10k wallet (engine
+cash-shared mode): each entry deploys `cash_frac` (25%) of the currently *free*
+cash, so total invested never exceeds the book — the repo-wide comparability
+rule. An opposite-direction entry closes the open position (percent sizing
+cannot reverse in one order).
+
 **How a trade works.**
 
 1. Close breaks above the 30-minute high → buy at the next bar's open

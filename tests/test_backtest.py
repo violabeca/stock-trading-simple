@@ -8,6 +8,7 @@ import pytest
 
 from trading_simple import backtest as bt
 from trading_simple.config import CostSettings, Settings
+from trading_simple.data import Panel
 
 
 # --- pure helpers ------------------------------------------------------------
@@ -331,6 +332,40 @@ def test_no_orders_on_non_rotation_bars(panel):
     assert dense.notna().any(axis=1).sum() == 3      # bar 0 (flat), bar 1 (buy), bar 20
 
 
+def test_held_name_is_not_trimmed_when_a_peer_rotates():
+    """A held position must not be re-trimmed just because another name rotates.
+
+    `rotation_targets` masks per NAME, not per row: AAA is held at a constant slot
+    across the whole run while BBB rotates out to CCC at bar 20. With a whole-row mask
+    the entire book would be re-emitted on bar 20 and target-percent would trim AAA back
+    to its slot of the (drifted) book value — a real partial sell of a position the
+    strategy only meant to hold. Per-cell masking leaves AAA's cell NaN there, so AAA
+    trades exactly once (its entry) and is never trimmed. Prices drift so that, were the
+    trim happening, it would place a nonzero AAA order.
+    """
+    idx = pd.date_range("2024-01-02", periods=30, freq="B", tz="UTC")
+    close = pd.DataFrame({"AAA": np.linspace(100.0, 160.0, 30),   # drifts up strongly...
+                          "BBB": np.linspace(100.0, 90.0, 30),
+                          "CCC": np.linspace(100.0, 130.0, 30)}, index=idx)
+    p = Panel(close=close, open_=close * 0.999, high=close * 1.01, low=close * 0.99,
+              volume=pd.DataFrame(1e6, index=idx, columns=close.columns), bar="1d")
+    w = pd.DataFrame(0.0, index=idx, columns=close.columns)
+    w.iloc[1:, w.columns.get_loc("AAA")] = 1.0 / 3      # AAA held the whole run
+    w.iloc[1:20, w.columns.get_loc("BBB")] = 1.0 / 3    # BBB rotates out to CCC at bar 20
+    w.iloc[20:, w.columns.get_loc("CCC")] = 1.0 / 3
+
+    masked = bt.rotation_targets(w)
+    assert not np.isfinite(masked["AAA"].iloc[20])       # AAA gets NO target on the rotation bar
+    assert masked["BBB"].iloc[20] == 0.0 and masked["CCC"].iloc[20] == 1.0 / 3
+
+    pf = bt.run(p, {"weights": w}, fees=0.0, slippage=0.0, init_cash=10_000)
+    orders = pf.orders.records_readable
+    aaa = orders[orders["Column"] == "AAA"]
+    assert list(aaa["Timestamp"]) == [idx[1]]            # bought once, never trimmed thereafter
+    rot = orders[orders["Timestamp"] == idx[20]]
+    assert set(rot["Column"]) == {"BBB", "CCC"}          # only the rotating pair trades
+
+
 def test_sweep_portfolio_matches_evaluate(panel):
     """A portfolio-mode sweep must group by COMBO — each combo its own shared book.
 
@@ -408,6 +443,39 @@ def test_cash_frac_stops_still_fire_when_grouped(panel):
     t = bt.trade_records(pf).iloc[0]
     assert t["exit_ts"] < panel.close.index[-1]          # stopped out, not end-of-test
     assert t["return"] > -0.06                           # loss capped near the stop
+
+
+def test_cash_frac_short_entry_consumes_the_wallet(panel):
+    # Shorting from flat is well-defined under percent sizing: the entry deploys a
+    # fraction of the wallet's free short capacity and counts against the book.
+    short_entries = pd.DataFrame(False, index=panel.close.index, columns=panel.close.columns)
+    short_entries.iloc[5, 1] = True                      # short the down-trending BBB
+    pf = bt.run(panel, {"short_entries": short_entries,
+                        "short_exits": bt.exit_after(short_entries, 30),
+                        "cash_frac": 0.25},
+                fees=0.0, slippage=0.0, init_cash=10_000)
+    assert bt.is_grouped(pf)
+    trades = bt.trade_records(pf)
+    assert len(trades) == 1 and trades.iloc[0]["direction"] == "Short"
+    assert trades.iloc[0]["pnl"] > 0                     # BBB trends down; the short wins
+    gross = pf.asset_value(group_by=False).abs().sum(axis=1)
+    assert gross.max() > 0.0
+    assert (gross <= pf.value() + 1e-9).all()            # exposure never exceeds the book
+
+
+def test_cash_frac_opposite_entry_closes_not_reverses(panel):
+    # Percent sizing cannot reverse a position (vectorbt raises); the wallet mode
+    # therefore closes on an opposite entry (upon_opposite_entry="close") instead.
+    idx, cols = panel.close.index, panel.close.columns
+    entries = pd.DataFrame(False, index=idx, columns=cols)
+    entries.iloc[5, 0] = True                            # long AAA at bar 5...
+    short_entries = pd.DataFrame(False, index=idx, columns=cols)
+    short_entries.iloc[15, 0] = True                     # ...opposite entry at bar 15
+    pf = bt.run(panel, {"entries": entries, "short_entries": short_entries,
+                        "cash_frac": 0.25}, fees=0.0, slippage=0.0)
+    trades = bt.trade_records(pf)
+    assert list(trades["direction"]) == ["Long"]         # closed, never flipped short
+    assert trades.iloc[0]["exit_ts"] == idx[15]
 
 
 def test_run_without_cash_frac_stays_per_symbol(panel):

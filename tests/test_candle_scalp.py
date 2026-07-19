@@ -115,6 +115,9 @@ def test_stop_keys_conditional():
     assert "tp_stop" not in sig                            # 0 disables the target
     assert "sl_trail" not in sig                           # a bracket never trails
     assert "tp_stop" in _sig(panel, sl_mult=2.0, tp_mult=3.0)
+    # One shared wallet: the cash fraction rides along unconditionally.
+    assert sig["cash_frac"] == 0.25
+    assert _sig(panel, cash_frac=0.5)["cash_frac"] == 0.5
 
 
 def test_intraday_session_guards_and_eod():

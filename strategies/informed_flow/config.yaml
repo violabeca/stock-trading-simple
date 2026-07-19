@@ -53,7 +53,10 @@ params:                    # single-backtest defaults; every key is a signals() 
   # cash. This replaces per-symbol cash accounts, under which a strategy holding 40 of
   # 100 names sat ~30% invested against a 100%-invested benchmark and diluted the edge
   # across four times as many names as it could survive (top decile +5.8%/yr active,
-  # top 40% +0.6%/yr).
+  # top 40% +0.6%/yr). A slot is 1/max_positions of the book AT ENTRY and is then LEFT
+  # TO DRIFT — a held name is never re-trimmed while other names rotate around it, and is
+  # sold whole in one order when its rank falls out (engine `rotation_targets` masks per
+  # name, not per bar; see the v7 study note below).
   max_positions: 10
   # What happens when a qualifying name arrives and all slots are full:
   # false = it waits for a vacancy (low turnover); true = it evicts the weakest holding
@@ -72,6 +75,11 @@ sweep:                     # coarse grid; all satisfy valid(): q_out < q_in, wei
   max_positions: [10]      # hold the slot count fixed so the ablation is about sleeves
 
 optuna:
+  # v7: execution model changed — the book no longer re-trims a held position when
+  #    another name rotates (engine `rotation_targets` now masks per NAME, not per bar).
+  #    Each name is bought once and sold whole; weights drift between its own events, the
+  #    way the equal-weight benchmark already does. This changes realized returns, so v6
+  #    and v7 trials are NOT comparable — do not mix them.
   # v5: TWO changes, and both make earlier studies incomparable — do not compare them.
   # 1. The book is now a single shared cash account with max_positions slots (portfolio
   #    mode). Under v4's per-symbol cash accounts the strategy was structurally ~30%
@@ -80,10 +88,13 @@ optuna:
   #    v4 traded an annualized objective against a whole-window one, which is incoherent
   #    and cannot rank walk-forward folds of different lengths.
   # v3 maximized absolute Sharpe, which rewarded market exposure over stock selection.
-  study: informed-flow-1d-v5
+  study: informed-flow-1d-v7
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
-  n_trials: 500
+  n_trials: 1000
+  min_trades_per_year: 15  # admissibility floor (PER YEAR, not absolute): daily,
+                           # multi-position portfolio mode turns over far less than an
+                           # intraday scanner — 25/yr ~= 100 trades over this 4y window
   space:                   # declarative search space -> optimize.suggest_params
     # High bound widened 189 -> 378 (~1.5y): a 5-trial probe pinned the old ceiling.
     # NOTE the confound when reading the result — insider_window does double duty. It is

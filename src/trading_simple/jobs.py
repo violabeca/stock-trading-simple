@@ -90,16 +90,20 @@ def run_backfill(
 
 def altdata_cmd(
     dataset: str, *, since: str, universe: str | None = None,
-    symbols: list[str] | None = None,
+    symbols: list[str] | None = None, skip_covered: bool = False, refresh: bool = False,
+    bulk: bool = False,
 ) -> list[str]:
     """Compose a ``tsim altdata`` command line (pure; unit-testable).
 
     Args:
         dataset: Dataset name (``insider`` | ``ratings`` | ``price_target`` |
-            ``short_interest`` | ``all``).
+            ``short_interest`` | ``fundamentals`` | ``all``).
         since: First day, ``YYYY-MM-DD``.
-        universe: Universe name (used when ``symbols`` is omitted).
+        universe: Universe name (used when ``symbols`` is omitted), or ``ALL``.
         symbols: Explicit symbol list (overrides ``universe``).
+        skip_covered: Skip symbols the ledger already backfilled to ``since``.
+        refresh: Re-fetch even ledger-covered symbols.
+        bulk: Insider only — backfill from SEC's quarterly Form 345 bulk data sets.
 
     Returns:
         The argv list.
@@ -109,12 +113,19 @@ def altdata_cmd(
         cmd += ["--symbols", ",".join(symbols)]
     elif universe:
         cmd += ["--universe", universe]
+    if skip_covered:
+        cmd += ["--skip-covered"]
+    if refresh:
+        cmd += ["--refresh"]
+    if bulk:
+        cmd += ["--bulk"]
     return cmd
 
 
 def run_altdata(
     dataset: str, *, since: str, universe: str | None = None,
-    symbols: list[str] | None = None,
+    symbols: list[str] | None = None, skip_covered: bool = False, refresh: bool = False,
+    bulk: bool = False,
 ) -> None:
     """Ingest one alt-data dataset via a single streamed ``tsim altdata`` subprocess.
 
@@ -124,12 +135,18 @@ def run_altdata(
 
     Args:
         dataset: Dataset name (``insider`` | ``ratings`` | ``price_target`` |
-            ``short_interest`` | ``all``).
+            ``short_interest`` | ``fundamentals`` | ``all``).
         since: First day, ``YYYY-MM-DD``.
-        universe: Universe name (used when ``symbols`` is omitted).
+        universe: Universe name (used when ``symbols`` is omitted), or ``ALL``.
         symbols: Explicit symbol list (overrides ``universe``).
+        skip_covered: Skip symbols the ledger already backfilled to ``since`` — so a
+            follow-up backfill re-fetches only newly-added names.
+        refresh: Re-fetch even ledger-covered symbols.
+        bulk: Insider only — backfill from SEC's quarterly Form 345 bulk data sets
+            (whole-market downloads) instead of per-filing scraping.
     """
-    cmd = altdata_cmd(dataset, since=since, universe=universe, symbols=symbols)
+    cmd = altdata_cmd(dataset, since=since, universe=universe, symbols=symbols,
+                      skip_covered=skip_covered, refresh=refresh, bulk=bulk)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, cwd=PROJECT_ROOT)
     for line in proc.stdout:

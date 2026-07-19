@@ -11,6 +11,12 @@ heavy open and close minutes never trigger a signal by themselves. Volume says
 current market condition and says *which way*: positive → long, negative →
 short. Both directions are always live; there is no long/short switch.
 
+**Capital model.** The whole strategy trades ONE shared $10k wallet (engine
+cash-shared mode): each entry deploys `cash_frac` (25%) of the currently *free*
+cash, so total invested never exceeds the book — the repo-wide comparability
+rule. An opposite-direction entry closes the open position (percent sizing
+cannot reverse in one order).
+
 **How a trade works.**
 
 1. Volume ≥ `threshold` × its time-of-day expectation *and* momentum is

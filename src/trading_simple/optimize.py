@@ -166,7 +166,12 @@ def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
 
     Invalid parameter combos and degenerate results (NaN metrics — usually
     zero trades) are pruned rather than scored, so they never pollute the
-    Pareto front. Secondary metrics land in ``trial.user_attrs``.
+    Pareto front. So are trials trading below the strategy's optional
+    ``optuna.min_trades_per_year`` rate — a few lucky fills can post a huge
+    info_ratio, and this admissibility floor keeps such artifacts off the
+    front. Per YEAR, not an absolute trade count: an absolute floor is
+    implicitly far stricter on a short backtest window than a long one for
+    the identical trading style. Secondary metrics land in ``trial.user_attrs``.
 
     Args:
         trial: The Optuna trial.
@@ -189,6 +194,14 @@ def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
     stats = bt.evaluate(strategy, panel, params, settings=settings)
     if any(pd.isna(stats[m]) for m in OBJECTIVES):
         raise optuna.TrialPruned("degenerate result (no trades?)")
+    min_rate = strategy.optuna.get("min_trades_per_year", 0)
+    if stats["trades_per_year"] < min_rate:
+        # A handful of lucky trades can post a huge info_ratio and crown the front;
+        # the floor keeps such artifacts out of the Pareto set entirely. Per-YEAR,
+        # not an absolute count: an absolute floor is implicitly far stricter on a
+        # short backtest window than a long one, for the exact same trading style.
+        raise optuna.TrialPruned(
+            f"only {stats['trades_per_year']:.1f} trades/year (< min_trades_per_year={min_rate})")
     for name in EXTRA_METRICS:
         trial.set_user_attr(name, stats[name])
     return tuple(stats[m] for m in OBJECTIVES)

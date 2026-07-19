@@ -5,12 +5,13 @@
 # ===========================================================================
 
 data:
-  universe: starter        # any name from settings.yaml / universes.yaml
+  universe: HighOctaneTop20  # top-20 HighOctane names by 90d dollar volume — aligned with
+                             # the other 1m strategies (was the starter WIP leftover)
   bar: 1m                  # intraday; needs an IBKR backfill (see 02_backfill)
-  start: "2026-06-01"      # deliberately short (~1 month) while testing the 1m setup
-  end: null                # null = everything stored
+  start: "2025-07-01"      # ~10 months of stored 1m history for the train window
+  end: "2026-04-30"        # TRAIN cutoff — the ~2-month tail is the notebook's holdout
   session: regular         # profile baseline assumes one consistent session
-  max_symbols: 20          # cap at the best-covered names
+  max_symbols: 20          # the pinned Top20 subset — matches the universe size
 
 params:                    # single-backtest defaults; every key is a signals() argument
   fast: 15                 # fast price-SMA window (bars = minutes on 1m)
@@ -26,6 +27,8 @@ params:                    # single-backtest defaults; every key is a signals() 
   sl_pct: 0.02             # stop-loss distance (fraction of entry price); 0 disables
   sl_trail: false          # false = fixed at entry, true = trails the best price
   eod_exit: true           # always flat on each session's final bar
+  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
+                           # deploys 25% of the FREE cash — params-only, not searched
 
 sweep:                     # coarse grid for notebook exploration (invalid fast>=slow dropped)
   fast: [10, 30]
@@ -35,10 +38,14 @@ sweep:                     # coarse grid for notebook exploration (invalid fast>
   sl_pct: [0.01, 0.02]
 
 optuna:
-  study: vm-1m-v1          # journal file studies/vm-1m-v1.log; rename to start fresh
+  study: vm-1m-v2          # v2: shared $10k wallet + HighOctaneTop20 + the common train
+                           # window — v1 (starter, per-symbol books) stays on disk
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
   n_trials: 300
+  min_trades_per_year: 300  # admissibility floor (PER YEAR, not absolute — a short
+                           # window shouldn't need fewer trades to pass): fewer-trade
+                           # trials are pruned in-objective (a lucky fill can fake info_ratio)
   space:                   # declarative search space -> optimize.suggest_params
     fast:           { type: int,   low: 5,     high: 60 }
     slow:           { type: int,   low: 30,    high: 240 }

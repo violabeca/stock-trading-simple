@@ -1,4 +1,4 @@
-"""FINRA consolidated bi-monthly equity short interest (free Query API).
+"""FINRA consolidated bi-monthly equity short interest (free).
 
 Short interest / days-to-cover is a well-replicated cross-sectional signal
 (Hong, Li, Wang & Zhao: days-to-cover long-short ~1.19%/mo), but the tradable
@@ -8,10 +8,17 @@ weak (Asquith-Pathak-Ritter). So this strategy uses low days-to-cover as a
 long-only favourable tilt and down-weights high-DTC names — never a fast trigger
 (the data is bi-monthly and ~8 business days stale at dissemination).
 
+Two ingestion paths, both parsed by :func:`_records_to_rows` (pure):
+
+* :func:`iter_short_interest_bulk` — the DEFAULT for a backfill. FINRA publishes one
+  pipe-delimited file per settlement date at ``cdn.finra.org`` carrying EVERY symbol
+  with no auth. This scales: the Query API's symbol ``domainFilter`` times out (504)
+  on a full universe, whereas a bulk file is one clean ~2 MB download per settlement.
+* :func:`fetch_short_interest` — the Query API, for small/targeted symbol lists.
+
 Point-in-time: a settlement's figures are only knowable at FINRA's dissemination
 date (~8 business days after settlement, after 16:00 ET), so ``known_at`` is set
-there, never at the settlement date. Network fetch (:func:`fetch_short_interest`)
-is separated from parsing (:func:`_records_to_rows`, pure).
+there, never at the settlement date.
 """
 
 from __future__ import annotations
@@ -27,14 +34,51 @@ log = logging.getLogger(__name__)
 
 _SOURCE = "finra"
 _API_URL = "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest"
-_PAGE = 1000
+_BULK_URL = "https://cdn.finra.org/equity/otcmarket/biweekly/shrt{ymd}.csv"
+# A few always-shorted mega-caps whose settlement coverage is complete — used only to
+# enumerate FINRA's dissemination schedule via one SMALL Query-API request (a large
+# symbol filter is what 504s; a 5-symbol probe does not).
+_SCHEDULE_PROBE = ["AAPL", "MSFT", "AMZN", "GOOGL", "JPM"]
+_PAGE = 5000  # FINRA's documented synchronous max per request (was 1000): ~5x fewer requests
 # FINRA disseminates consolidated short interest ~8 business days after the
 # settlement date, after the close; act only from the next session.
 _DISSEM_BDAYS = 8
 _DISSEM_UTC = time(21, 0)  # ~16:00-17:00 ET, safely after the US close
 
 
-def fetch_short_interest(symbols: list[str], since: date) -> list[ShortInterest]:
+def _si_request_body(symbols: list[str], since: date, until: date | None, offset: int) -> dict:
+    """Build the FINRA otcMarket query body (pure; unit-testable).
+
+    Filters by symbol and settlement date; a non-null ``until`` adds an inclusive
+    upper bound so only the missing early gap of an already-covered range is
+    queried.
+
+    Args:
+        symbols: Bare canonical tickers to fetch.
+        since: Earliest settlement date (``gte``).
+        until: Latest settlement date (``lte``), or ``None`` for no upper bound.
+        offset: Paging offset.
+
+    Returns:
+        The JSON request body.
+    """
+    compare = [{"fieldName": "settlementDate", "compareType": "gte",
+                "fieldValue": since.isoformat()}]
+    if until is not None:
+        compare.append({"fieldName": "settlementDate", "compareType": "lte",
+                        "fieldValue": until.isoformat()})
+    return {
+        "limit": _PAGE,
+        "offset": offset,
+        "compareFilters": compare,
+        "domainFilters": [
+            {"fieldName": "symbolCode", "values": [s.upper() for s in symbols]},
+        ],
+    }
+
+
+def fetch_short_interest(symbols: list[str], since: date,
+                         *, until: date | None = None) -> list[ShortInterest]:
     """Fetch consolidated short-interest observations for ``symbols`` since ``since``.
 
     Queries FINRA's free otcMarket Query API, filtering by symbol and settlement
@@ -45,6 +89,9 @@ def fetch_short_interest(symbols: list[str], since: date) -> list[ShortInterest]
     Args:
         symbols: Bare canonical tickers to fetch.
         since: Earliest settlement date to include.
+        until: Latest settlement date to include (inclusive); ``None`` means no
+            upper bound. Used to query only the missing early gap of an
+            already-covered range.
 
     Returns:
         Parsed short-interest rows (empty if FINRA returns nothing).
@@ -54,17 +101,7 @@ def fetch_short_interest(symbols: list[str], since: date) -> list[ShortInterest]
     rows: list[ShortInterest] = []
     offset = 0
     while True:
-        body = {
-            "limit": _PAGE,
-            "offset": offset,
-            "compareFilters": [
-                {"fieldName": "settlementDate", "compareType": "gte",
-                 "fieldValue": since.isoformat()},
-            ],
-            "domainFilters": [
-                {"fieldName": "symbolCode", "values": [s.upper() for s in symbols]},
-            ],
-        }
+        body = _si_request_body(symbols, since, until, offset)
         resp = requests.post(_API_URL, json=body,
                              headers={"Accept": "application/json"}, timeout=60)
         resp.raise_for_status()
@@ -76,6 +113,80 @@ def fetch_short_interest(symbols: list[str], since: date) -> list[ShortInterest]
             break
         offset += _PAGE
     return rows
+
+
+def settlement_dates(since: date, until: date | None = None) -> list[date]:
+    """List FINRA short-interest settlement dates in ``[since, until]`` (inclusive).
+
+    Enumerated from ONE small Query-API request over a handful of always-covered
+    mega-caps (:data:`_SCHEDULE_PROBE`) — reliable and fast, unlike a full-universe
+    ``domainFilter`` (which 504s). These are exactly the dates whose bulk files exist,
+    so callers never have to guess the bi-monthly calendar or handle 403s on bad dates.
+
+    Args:
+        since: Earliest settlement date to include.
+        until: Latest settlement date to include (inclusive), or ``None`` for no bound.
+
+    Returns:
+        Sorted settlement dates (empty if FINRA returns nothing).
+    """
+    import requests
+
+    body = _si_request_body(_SCHEDULE_PROBE, since, until, 0)
+    resp = requests.post(_API_URL, json=body, headers={"Accept": "application/json"}, timeout=60)
+    resp.raise_for_status()
+    return sorted({date.fromisoformat(r["settlementDate"][:10])
+                   for r in resp.json() if r.get("settlementDate")})
+
+
+def _parse_bulk_file(text: str) -> list[dict]:
+    """Parse a FINRA bulk short-interest file into records (pure).
+
+    The file is **pipe-delimited** despite its ``.csv`` name, and its columns use the
+    SAME field names as the Query API (``symbolCode`` / ``settlementDate`` /
+    ``currentShortPositionQuantity`` / ``averageDailyVolumeQuantity`` /
+    ``daysToCoverQuantity``), so :func:`_records_to_rows` consumes the output directly.
+
+    Args:
+        text: The downloaded file body.
+
+    Returns:
+        One dict per data row.
+    """
+    import csv
+    import io
+
+    return list(csv.DictReader(io.StringIO(text), delimiter="|"))
+
+
+def iter_short_interest_bulk(symbols: list[str], since: date, *, until: date | None = None):
+    """Yield ``(settlement_date, [ShortInterest])`` per settlement from the bulk CDN files.
+
+    One pipe-delimited file per settlement date carries EVERY symbol with no auth and no
+    symbol filter, so this replaces :func:`fetch_short_interest` for a full-universe
+    backfill (whose large ``domainFilter`` times out). Enumerates dates via
+    :func:`settlement_dates`, downloads each settlement's file, filters to ``symbols``,
+    and reuses :func:`_records_to_rows`. Yielding per settlement keeps memory bounded.
+
+    Args:
+        symbols: Bare canonical tickers to keep.
+        since: Earliest settlement date to include.
+        until: Latest settlement date to include (inclusive); ``None`` means no bound.
+
+    Yields:
+        ``(settlement_date, rows)`` per settlement (a missing file is warned and skipped).
+    """
+    import requests
+
+    symset = {s.upper() for s in symbols}
+    for settle in settlement_dates(since, until):
+        resp = requests.get(_BULK_URL.format(ymd=settle.strftime("%Y%m%d")), timeout=60)
+        if resp.status_code != 200:
+            log.warning("FINRA: no bulk file for %s (HTTP %s)", settle, resp.status_code)
+            continue
+        recs = [r for r in _parse_bulk_file(resp.text)
+                if (r.get("symbolCode") or "").upper() in symset]
+        yield settle, _records_to_rows(recs)
 
 
 def _dissemination(settlement: date) -> datetime:

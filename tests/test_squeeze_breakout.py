@@ -144,6 +144,9 @@ def test_stop_scale_uses_normal_volatility():
     # tp_stop shares the scale (3.0 vs 2.0 multiples) and 0 removes it.
     pd.testing.assert_frame_equal(sig["tp_stop"], expected * 1.5)
     assert "tp_stop" not in _sb(panel, tp_mult=0.0)
+    # One shared wallet: the cash fraction rides along unconditionally.
+    assert sig["cash_frac"] == 0.25
+    assert _sb(panel, cash_frac=0.5)["cash_frac"] == 0.5
 
 
 def test_valid_rejects_incoherent_combos():

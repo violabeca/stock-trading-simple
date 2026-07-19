@@ -1,11 +1,15 @@
 """informed_flow signal logic + feature alignment on synthetic data (no DB, no network)."""
 
+import importlib.util
+
 import numpy as np
 import pandas as pd
 import pytest
 
+from trading_simple import backtest as bt
 from trading_simple import features as F
 from trading_simple import strategies
+from trading_simple.config import CostSettings
 from trading_simple.data import Panel
 
 _PARAMS = {"insider_window": 10, "rating_halflife": 5, "ptrev_halflife": 5,
@@ -378,3 +382,139 @@ def test_to_grid_empty_is_index_only():
     index = pd.date_range("2024-01-02", periods=4, freq="B", tz="UTC")
     grid = F._to_grid(pd.DataFrame(columns=["symbol", "d", "value"]), index, fill="zero")
     assert grid.index.equals(index) and grid.shape[1] == 0
+
+
+# --- the strategy's own holdings figure (strategies/informed_flow/plots.py) ---
+def _holdings_plots():
+    """Import the strategy-folder plots module (not on sys.path — load it by file)."""
+    path = strategies.load("informed_flow").dir / "plots.py"
+    spec = importlib.util.spec_from_file_location("informed_flow_plots", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _traded_panel_and_pf():
+    """A synthetic portfolio-mode run of informed_flow that actually opens/closes trades."""
+    syms = ("AAA", "BBB", "CCC", "DDD")
+    index = pd.date_range("2020-01-02", periods=90, freq="B", tz="UTC")
+    rng = np.random.default_rng(0)
+    close = pd.DataFrame(100.0 + np.cumsum(rng.normal(0, 1, (90, 4)), axis=0),
+                         index=index, columns=list(syms)).clip(lower=5.0)
+    panel = Panel(close=close, open_=close * 0.999, high=close * 1.01,
+                  low=close * 0.99, volume=pd.DataFrame(1e6, index=index, columns=list(syms)),
+                  bar="1d")
+    zero = pd.DataFrame(0.0, index=index, columns=list(syms))
+    panel.features = {"insider": zero.copy(), "ratings": zero.copy()}
+    panel.features["insider"].iloc[10, 0] = 5e6
+    panel.features["insider"].iloc[10, 1] = 3e6
+    panel.features["insider"].iloc[40, 2] = 8e6
+    panel.features["insider"].iloc[55, 0] = 6e6
+    panel.features["ratings"].iloc[30:, 3] = 1.0
+    sig = _if(panel, insider_window=10, rating_halflife=5, max_positions=2,
+              q_in=0.6, q_out=0.4)
+    fees, slippage = bt.leg_costs(CostSettings())
+    return panel, bt.run(panel, sig, fees=fees, slippage=slippage)
+
+
+def test_plot_holdings_builds_four_aligned_panels():
+    """The figure exists, is portfolio-mode-shaped, and marks a buy for every trade."""
+    panel, pf = _traded_panel_and_pf()
+    assert bt.is_grouped(pf)                                   # portfolio mode
+    trades = bt.trade_records(pf)
+    assert len(trades)                                         # something actually traded
+
+    fig = _holdings_plots().plot_holdings(panel, pf)
+    assert {"yaxis", "yaxis2", "yaxis3", "yaxis4"} <= set(fig.layout)  # four stacked panels
+    buy = next(t for t in fig.data if t.name == "buy")
+    assert len(buy.x) == len(trades)                           # one buy mark per trade
+    sell = next(t for t in fig.data if t.name == "sell")
+    assert len(sell.x) == int((trades["status"] == "Closed").sum())  # sells: closed only
+    assert any(t.name == "cash" for t in fig.data)             # composition panel drawn
+
+
+def test_plot_holdings_composition_weights_plus_cash_sum_to_one():
+    """The composition panel is a true book decomposition: name weights + cash = 100%.
+
+    Shares and dollar value come straight from the portfolio, and each name's weight is
+    its value over the whole book, so at every bar the stacked weights plus the cash band
+    must fill exactly one — the invariant the stacked-to-100% area relies on.
+    """
+    _, pf = _traded_panel_and_pf()
+    names = bt.trade_records(pf)["symbol"].unique().tolist()
+    shares, value, weight, cash = _holdings_plots()._composition(pf, names)
+    total = weight.sum(axis=1) + cash
+    assert (total - 1.0).abs().max() < 1e-9
+    # Shares and value are the real portfolio holdings, not a reconstruction.
+    assert shares.shape == value.shape == weight.shape
+    assert (shares.to_numpy() >= 0).all() and (cash.to_numpy() >= -1e-9).all()
+
+
+def test_plot_holdings_per_name_pnl_sums_to_total():
+    """The per-name realized-P&L lines must add up to the total line — same closed trades."""
+    panel, pf = _traded_panel_and_pf()
+    total = bt.equity_curve(pf)["realized_pnl"]
+    booked = bt.trade_records(pf).query("status == 'Closed'")
+    per_name = sum(
+        booked[booked["symbol"] == n].groupby("exit_ts")["pnl"].sum()
+        .reindex(panel.close.index, fill_value=0.0).cumsum()
+        for n in booked["symbol"].unique()
+    )
+    assert (per_name - total).abs().max() < 1e-9
+
+
+def test_plot_holdings_handles_a_run_with_no_trades():
+    """A run that never traded returns a titled empty figure, not an exception."""
+    panel, _ = _traded_panel_and_pf()
+    flat = {"weights": pd.DataFrame(0.0, index=panel.close.index, columns=panel.symbols)}
+    fees, slippage = bt.leg_costs(CostSettings())
+    pf = bt.run(panel, flat, fees=fees, slippage=slippage)
+    fig = _holdings_plots().plot_holdings(panel, pf)
+    assert len(fig.data) == 0 and "no trades" in fig.layout.title.text
+
+
+def _rotating_book():
+    """AAA held continuously (drifting up) while BBB and CCC swap the second slot.
+
+    Prices drift so that, if the book were re-trimmed on the BBB↔CCC rotation, AAA
+    would receive a real partial sell. This is the scenario that distinguishes the
+    per-name (no re-trim) execution model from the old whole-book rebalance.
+    """
+    syms = ("AAA", "BBB", "CCC")
+    index = pd.date_range("2020-01-02", periods=80, freq="B", tz="UTC")
+    close = pd.DataFrame({"AAA": np.linspace(100.0, 180.0, 80),   # drifts up strongly
+                          "BBB": 100.0, "CCC": 100.0}, index=index)
+    panel = Panel(close=close, open_=close * 0.999, high=close * 1.01, low=close * 0.99,
+                  volume=pd.DataFrame(1e6, index=index, columns=list(syms)), bar="1d")
+    rat = pd.DataFrame({"AAA": 5.0, "BBB": 4.0, "CCC": 1.0}, index=index)
+    rat.loc[index[40:], "BBB"] = 1.0            # BBB and CCC swap ranks at bar 40
+    rat.loc[index[40:], "CCC"] = 4.0
+    panel.features = {"ratings": rat}
+    sig = _if(panel, w_insider=0.0, w_rating=1.0, w_dtc=0.0, rating_halflife=2,
+              q_in=0.6, q_out=0.5, max_positions=2, max_hold=200, min_events=1)
+    fees, slippage = bt.leg_costs(CostSettings())
+    return panel, bt.run(panel, sig, fees=fees, slippage=slippage)
+
+
+def test_held_position_is_never_trimmed_by_a_peer_rotation():
+    """A continuously-held name is one buy + one sell — not re-trimmed when a peer rotates.
+
+    AAA stays ranked #1 the whole run, so the strategy only ever wants it fully held.
+    BBB→CCC rotates the second slot at bar 40. Under the old whole-book rebalance, that
+    rotation re-trimmed AAA (its drifted value re-sized back to its slot), splitting the
+    single hold into several FIFO lots — the spurious "multiple sells". With per-name
+    execution AAA trades exactly twice (open, then the engine's close at the last bar),
+    while BBB and CCC really do rotate.
+    """
+    panel, pf = _rotating_book()
+    trades = bt.trade_records(pf)
+    aaa = trades[trades["symbol"] == "AAA"]
+    assert len(aaa) == 1                                   # ONE continuous position, no trims
+    assert aaa["entry_ts"].iloc[0] == panel.close.index[1]  # bought once, up front
+    assert len(trades[trades["symbol"] == "BBB"]) >= 1     # the peers genuinely rotate...
+    assert len(trades[trades["symbol"] == "CCC"]) >= 1     # ...so the scenario is real
+
+    # And so the figure marks AAA exactly once each way (it self-corrects).
+    fig = _holdings_plots().plot_holdings(panel, pf)
+    buy = next(t for t in fig.data if t.name == "buy")
+    assert list(buy.customdata[:, 0]).count("AAA") == 1

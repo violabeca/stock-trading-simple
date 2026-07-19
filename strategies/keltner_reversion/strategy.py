@@ -49,6 +49,7 @@ def signals(
     skip_open: int = 15,
     skip_close: int = 15,
     eod_exit: bool = True,
+    cash_frac: float = 0.25,
 ) -> dict:
     """Build stretched-dip entries, reversion/time exits and an optional ATR stop.
 
@@ -70,6 +71,10 @@ def signals(
             (intraday only).
         eod_exit: Force positions flat on each session's final bar
             (intraday only).
+        cash_frac: Fraction of the shared wallet's free cash deployed per
+            entry. Its presence runs the whole strategy as ONE ``init_cash``
+            book (engine cash-shared signal mode) — total invested can never
+            exceed the wallet.
 
     Returns:
         Dict with ``entries`` / ``exits`` / ``short_entries`` / ``short_exits``
@@ -104,6 +109,7 @@ def signals(
            "short_entries": short_entries, "short_exits": short_exits}
     if sl_mult:
         out["sl_stop"] = (sl_mult * rng / panel.close).clip(lower=1e-4)
+    out["cash_frac"] = cash_frac
     return out
 
 

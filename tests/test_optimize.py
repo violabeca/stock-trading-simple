@@ -111,6 +111,42 @@ def test_boundary_report_counts_front_share():
     assert report.loc["w", "action"] == "widen low & widen high"
 
 
+def test_objective_prunes_below_min_trades_per_year():
+    """A handful of lucky trades must not crown the front: the floor prunes them.
+
+    The floor is a RATE, not an absolute count: an absolute floor would be
+    implicitly far stricter on a short backtest window than a long one for the
+    identical trading style (this bit donchian_breakout's short window in
+    production — see the README/CLAUDE.md "Comparability rules").
+    """
+    from dataclasses import replace
+
+    from tests.conftest import make_panel
+    from trading_simple import backtest as bt
+    from trading_simple.config import Settings
+
+    panel = make_panel()   # ~0.23-year window: one trade here is a rate of ~4.4/year
+
+    def one_trade(p, **_):
+        entries = pd.DataFrame(False, index=p.close.index, columns=p.close.columns)
+        entries.iloc[5, 0] = True
+        return {"entries": entries, "exits": bt.exit_after(entries, 10)}
+
+    strat = strategies.load("volume_momentum")
+
+    def run_study(optuna_cfg):
+        s = replace(strat, signals=one_trade, valid=lambda p: True, params={},
+                    optuna=optuna_cfg)
+        study = optuna.create_study(directions=["maximize", "maximize"],
+                                    sampler=optuna.samplers.RandomSampler(seed=1))
+        study.optimize(lambda t: opt.objective(t, s, panel, Settings()), n_trials=1)
+        return study.trials[0].state
+
+    assert (run_study({"space": {}, "min_trades_per_year": 20})
+            is optuna.trial.TrialState.PRUNED)          # ~4.4/year < 20/year
+    assert run_study({"space": {}}) is optuna.trial.TrialState.COMPLETE
+
+
 def test_pareto_and_trials_frames():
     first, second = opt.OBJECTIVES          # (info_ratio, excess_return) — benchmark-relative
     study = optuna.create_study(directions=["maximize", "maximize"])

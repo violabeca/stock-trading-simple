@@ -10,7 +10,7 @@ data:
   start: "2025-07-01"      # ~10 months of stored 1m history for the train window
   end: "2026-04-30"        # TRAIN cutoff — the ~2-month tail is the notebook's holdout
   session: regular         # bands assume one consistent session
-  max_symbols: 40          # cap at the best-covered names
+  max_symbols: 20          # the pinned Top20 subset — matches the universe size
 
 params:                    # single-backtest defaults; every key is a signals() argument
   trend_window: 960        # regime SMA (bars = minutes on 1m); ~2.5 sessions
@@ -25,6 +25,8 @@ params:                    # single-backtest defaults; every key is a signals() 
   skip_close: 15           # no entries in the last N minutes of a session
   eod_exit: false          # false = deep dips may be held overnight (the gap-back pays);
                            # true = strictly intraday — both are optimized below
+  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
+                           # deploys 25% of the FREE cash — params-only, not searched
 
 sweep:                     # coarse grid (24 combos; valid() reads band+trend, keep both here)
   trend_window: [480, 960]
@@ -33,10 +35,14 @@ sweep:                     # coarse grid (24 combos; valid() reads band+trend, k
   horizon: [120, 360]
 
 optuna:
-  study: keltner-1m-v2     # fresh confirmation study (v1 = exploratory; new seed, final space)
+  study: keltner-1m-v3     # v3: capital model changed to one shared $10k wallet — v2
+                           # scored independent per-symbol books; journal stays on disk
   sampler: nsga2           # nsga2 | tpe | random
   seed: 7
   n_trials: 1000
+  min_trades_per_year: 300  # admissibility floor (PER YEAR, not absolute — a short
+                           # window shouldn't need fewer trades to pass): fewer-trade
+                           # trials are pruned in-objective (a lucky fill can fake info_ratio)
   space:                   # declarative search space -> optimize.suggest_params
     trend_window: { type: int,   low: 60,   high: 2000, log: true }  # 1h .. ~5 sessions; longer
                            # filters stop being an intraday regime and fit the train tape (v1 finding)
