@@ -1,7 +1,7 @@
 # ===========================================================================
 # donchian_breakout — all tunable settings for this strategy (intraday, 1m).
-# Blocks: data (what to load), params (single-run defaults), sweep (grid
-# exploration), optuna (optimization study + search space).
+# Layout: data (what panel to load), optuna (study settings), params
+# (every knob: doc + shipped value + optional search space and sweep grid).
 # ===========================================================================
 
 data:
@@ -12,26 +12,12 @@ data:
   session: regular         # channels assume one consistent session
   max_symbols: 20          # the pinned Top20 subset — matches the universe size
 
-params:                    # single-backtest defaults; every key is a signals() argument
-  entry_window: 30         # channel lookback (bars = minutes on 1m); breakout = new N-bar extreme
-  atr_window: 14           # ATR smoothing window (bars)
-  atr_mult: 2.0            # trailing stop distance in ATRs (lower = tighter)
-  direction: both          # long | short | both
-  skip_open: 15            # no entries in the first N minutes of a session
-  skip_close: 15           # no entries in the last N minutes of a session
-  eod_exit: true           # default: flat at each session's close. false = hold overnight
-                           # (trailing stop / opposite breakout still exit) — both are swept below
-  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
-                           # deploys 25% of the FREE cash — params-only, not searched
-
-sweep:                     # coarse grid for notebook exploration
-  entry_window: [15, 30, 60, 120]
-  atr_window: [14]
-  atr_mult: [1.5, 2.0, 3.0]
-  eod_exit: [true, false]  # flat-at-close vs hold-overnight, side by side
-
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: donchian-1m-v6    # v6: capital model changed to one shared $10k wallet — v5
+  study: donchian-1m-v7    # v7: 2026-07-19 engine realism (panel-priced costs +
+                           # pessimistic stop fills, exit-wins signal conflicts) — v6 journals not comparable.
+                           # v6: capital model changed to one shared $10k wallet — v5
                            # scored independent per-symbol books; journal stays on disk
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
@@ -39,9 +25,44 @@ optuna:
   min_trades_per_year: 300  # admissibility floor (PER YEAR, not absolute — this
                            # strategy's `end: null` window is short and grows over time):
                            # fewer-trade trials are pruned in-objective
-  space:                   # declarative search space -> optimize.suggest_params
-    entry_window: { type: int,   low: 10,  high: 1000, log: true }
-    atr_window:   { type: int,   low: 7,   high: 100 }
-    atr_mult:     { type: float, low: 1.0, high: 10.0, step: 0.25 }
-    eod_exit:     { type: categorical, choices: [true, false] }  # hold overnight or go flat at the close
-    # direction:    { type: categorical, choices: [long, short, both] }
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+params:
+  entry_window:
+    doc: "channel lookback (bars = minutes on 1m); breakout = new N-bar extreme"
+    value: 30
+    search: { type: int, low: 10, high: 1000, log: true }
+    grid: [15, 30, 60, 120]
+  atr_window:
+    doc: "ATR smoothing window (bars)"
+    value: 14
+    search: { type: int, low: 7, high: 100 }
+    grid: [14]
+  atr_mult:
+    doc: "trailing stop distance in ATRs (lower = tighter)"
+    value: 2.0
+    search: { type: float, low: 1.0, high: 10.0, step: 0.25 }
+    grid: [1.5, 2.0, 3.0]
+  direction:
+    doc: "long | short | both"
+    value: both
+  skip_open:
+    doc: "no entries in the first N minutes of a session"
+    value: 15
+  skip_close:
+    doc: "no entries in the last N minutes of a session"
+    value: 15
+  eod_exit:
+    doc: >-
+      default: flat at each session's close. false = hold overnight (trailing stop /
+      opposite breakout still exit) — both are swept below
+    value: true
+    search: { type: categorical, choices: [true, false] }   # hold overnight or go flat at the close
+    grid: [true, false]   # flat-at-close vs hold-overnight, side by side
+  cash_frac:
+    doc: >-
+      ONE shared $10k wallet (engine cash-shared mode): each entry deploys 25% of the FREE
+      cash — params-only, not searched
+    value: 0.25

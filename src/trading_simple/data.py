@@ -196,3 +196,36 @@ def coverage(engine: Engine, symbols: list[str] | None = None,
     """)
     with engine.connect() as conn:
         return pd.read_sql(sql, conn, params={"symbols": symbols, "bar": bar})
+
+
+def coverage_timeline(engine: Engine, symbols: list[str], bar: str,
+                      freq: str = "month") -> pd.DataFrame:
+    """Bars stored per symbol per calendar bucket — coverage *over time*.
+
+    :func:`coverage` collapses a symbol to one row, so a symbol that starts late,
+    stops early or has a hole in the middle all read as "fewer bars" and are
+    indistinguishable. This keeps the time axis: one row per
+    ``(symbol, period)``, which is what makes a late listing (a clean left edge)
+    separable from a failed backfill (a hole).
+
+    Args:
+        engine: Database engine.
+        symbols: Symbols to report on.
+        bar: Bar size, e.g. ``"1d"`` or ``"1m"``.
+        freq: Bucket width — ``"day"``, ``"week"``, ``"month"`` or ``"year"``
+            (any PostgreSQL ``date_trunc`` unit).
+
+    Returns:
+        Columns ``symbol``, ``period`` (bucket start), ``bars``, ``regular``,
+        ``extended``. Buckets with no data are absent, not zero.
+    """
+    sql = text("""
+        SELECT symbol, date_trunc(:freq, ts) AS period, count(*) AS bars,
+               count(*) FILTER (WHERE rth) AS regular,
+               count(*) FILTER (WHERE NOT rth) AS extended
+        FROM prices_ohlcv
+        WHERE symbol = ANY(:symbols) AND bar = :bar
+        GROUP BY symbol, period ORDER BY symbol, period
+    """)
+    with engine.connect() as conn:
+        return pd.read_sql(sql, conn, params={"symbols": symbols, "bar": bar, "freq": freq})

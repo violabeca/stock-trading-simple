@@ -1,0 +1,146 @@
+# ===========================================================================
+# gap_and_go — all tunable settings for this strategy (intraday, 1m).
+# Layout: data (what panel to load), optuna (study settings), params
+# (every knob: doc + shipped value + optional search space and sweep grid).
+# ===========================================================================
+
+data:
+  universe: Morning200     # 200 names ranked POINT-IN-TIME: eligible on 1m coverage inside
+                           # the backtest window, ordered by median daily dollar volume over
+                           # 2025-01-01..2025-06-30 only (notebooks/01_universe_screener §8).
+                           # NOT HighOctaneTop20 — that list was pinned in 2026-07 by
+                           # trailing-90d dollar volume, i.e. chosen with data from inside
+                           # and after this window, and its equal-weight buy-and-hold hurdle
+                           # was +460%/yr. Every v1 trial scored excess_cagr ~= -4.6 against
+                           # it and the whole Pareto front was noise. Here the hurdle is ~+47%/yr
+  bar: 1m                  # intraday; needs an IBKR backfill (see 02_backfill)
+  start: "2025-07-01"      # the siblings' shared ~10-month train window
+  end: "2026-04-30"        # TRAIN cutoff — the ~2-month tail is the notebook's holdout
+  session: regular         # opening range + volume profile assume one consistent session
+  max_symbols: 200         # the whole point-in-time universe
+
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
+optuna:
+  study: gap_and_go-1m-v2  # v1 is kept as the record of the diagnosis; its numbers are not
+                           # comparable (different universe, benchmark, and parameterization)
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 42
+  n_trials: 1000
+  min_trades_per_year: 100  # admissibility floor (PER YEAR, not absolute). Was 300, which on a
+                           # 20-name universe pruned 73% of v1's trials — and pruned exactly the
+                           # SELECTIVE region (the whole gap_min >= 5% row, everything at
+                           # vol_mult >= 3), i.e. the only place the rule was not losing money.
+                           # On 200 names the same configs trade 1,500-5,000/yr, so the floor
+                           # stops binding; 100/yr (~83 trades here) still kills lucky-few-trade
+                           # artifacts. max_candidates caps the rate at 252 x max_candidates
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+params:
+  or_minutes:
+    doc: "K: opening-range length (bars); range = high/low of bars 0..K-1"
+    value: 15
+    # job, not the optimizer's (squeeze_breakout precedent)
+    search: { type: categorical, choices: [5, 10, 15, 30] }   # classic ORB lengths — a regime switch, not a fine dial
+  entry_span:
+    doc: >-
+      bars AFTER the range closes in which a signal may fire; window = [K, K+entry_span]. An
+      OFFSET, not an absolute bar, so an entry window that ends before its own range closes
+      cannot be drawn
+    value: 75
+    search: { type: int, low: 5, high: 300, log: true }   # morning only: the move is a momentum claim, not all-day
+  gap_min:
+    doc: "min |overnight gap| as a fraction of prior close; 0 disables the gate"
+    value: 0.02
+    search: { type: float, low: 0.005, high: 0.05, step: 0.005 }   # 0.5% = any gap, 5% = event-sized
+    grid: [0.0, 0.02]
+  vol_mult:
+    doc: >-
+      first-K cumulative volume >= mult x its time-of-day expectation; the baseline already
+      EXPECTS the opening surge, so useful values sit near 1-4 (not squeeze's 3-6 trailing-
+      gate range). 0 disables
+    value: 1.5
+    search: { type: float, low: 1.0, high: 4.0, step: 0.25 }
+    grid: [0.0, 1.5]
+  profile_days:
+    doc: "sessions in the time-of-day volume baseline"
+    value: 10
+  entry_mode:
+    doc: >-
+      break = trade the OR break (thesis) | time = enter at bar K on the gates alone
+      (ablation control: does the ORB trigger add anything?)
+    value: break
+    grid: [break, time]
+  polarity:
+    doc: >-
+      go = take the position the gap points at (continuation) | fade = the opposite position
+      on the SAME event. Searched, not assumed: a market-demeaned event study over these 200
+      names says the continuation leg loses (-11.8 bps excess at gap>=2%, t=-3.3), but only
+      the holdout at stressed costs settles it
+    value: go
+    search: { type: categorical, choices: [go, fade] }   # the headline experiment
+    # continuation vs fade x break vs time-entry x +/- each gate.
+    # or_minutes is deliberately NOT here — the grid answers the thesis
+    # questions one variable at a time; range length is a dial for optuna
+    grid: [go, fade]
+  rank_by:
+    doc: "how the morning watchlist is ordered: gap | rvol | gap_x_rvol"
+    value: gap
+    search: { type: categorical, choices: [gap, rvol, gap_x_rvol] }   # what "conviction" means
+  max_candidates:
+    doc: >-
+      THE scaling knob. Only the top max_candidates gate-passing names by rank_by may trade
+      a session, ranked at bar K-1 on frozen information (causal — the watchlist a scanner
+      builds at the open). Each entry deploys 1/max_candidates of the ONE shared $10k
+      wallet, so a full watchlist is a fully invested book and never more. Without this the
+      engine funds whichever columns it reaches first and alphabetical luck picks the book
+      on a market-wide gap day
+    value: 8
+    search: { type: int, low: 2, high: 20 }   # concentrated conviction vs breadth; also sets the per-entry wallet fraction
+  min_price:
+    doc: "$ floor read at bar K-1 \u2014 a quiet cheap name's 1m spread is not 2 bps"
+    value: 5.0
+  min_or_dollar_volume:
+    doc: >-
+      NOT 1e6 — YAML 1.1 reads a bare `1e6` as a STRING (it wants `1.0e+6`), and a string
+      floor sails through config load only to blow up inside the first comparison. $ traded
+      in the opening range; per session, so it also drops a normally liquid name on a
+      morning it simply is not trading
+    value: 1000000
+  atr_window:
+    doc: >-
+      ATR smoothing (bars); the day's first bar includes the overnight jump, so stops auto-
+      widen on exactly the big-gap mornings
+    value: 14
+  sl_mult:
+    doc: "stop distance in ATRs at entry"
+    value: 2.0
+    search: { type: float, low: 1.0, high: 5.0, step: 0.25 }   # <1 ATR = noise-floor stops
+  sl_trail:
+    doc: "trail the stop (let it run) | false = fixed bracket"
+    value: true
+    search: { type: categorical, choices: [true, false] }   # trail vs bracket — the exit thesis
+  tp_ratio:
+    doc: >-
+      profit target as a MULTIPLE OF THE STOP; 0 = no target. A ratio, not an independent
+      ATR distance, so a degenerate short-gamma bracket is unrepresentable rather than
+      rejected by valid()
+    value: 0.0
+    search: { type: float, low: 0.0, high: 4.0, step: 0.5 }   # 0 floor = "no target"; the 0.5 step keeps every non-zero target >= half the stop
+  horizon:
+    doc: "time stop (bars held) when the move never comes"
+    value: 120
+    search: { type: int, low: 15, high: 390, log: true }
+  direction:
+    doc: >-
+      which POSITIONS are allowed: long | short | both (applied AFTER polarity, so under
+      fade a long run trades gap-down bounces)
+    value: both
+    search: { type: categorical, choices: [long, short, both] }   # gap continuation is documented as asymmetric — let the data pick the side
+  eod_exit:
+    doc: >-
+      ALWAYS flat at the close — overnight risk is the ENTRY signal, never the hold; params-
+      only, not searched, never off
+    value: true

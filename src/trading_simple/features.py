@@ -68,11 +68,13 @@ _PRICE_TARGET_SQL = """
 """
 
 # One row per (symbol, UTC dissemination-date): days-to-cover level (a stock).
+# No lower time bound: a level is seeded from the last observation BEFORE the panel
+# start, so bar 0 is not a dead zone waiting for the first in-window dissemination.
 _SHORT_INTEREST_SQL = """
     SELECT symbol, (known_at AT TIME ZONE 'UTC')::date AS d,
            avg(days_to_cover) AS value
     FROM short_interest
-    WHERE symbol = ANY(:symbols) AND known_at >= :start AND known_at <= :as_of
+    WHERE symbol = ANY(:symbols) AND known_at <= :as_of
     GROUP BY symbol, d
 """
 
@@ -82,8 +84,11 @@ def _fundamental_sql(concept: str) -> str:
     ``DISTINCT ON`` keeps, for each day a filing became public, the row with the
     most recent ``period_end`` (and, on a tie, the latest filing) — so a same-day
     restatement or a comparative never displaces the current period. The ``ffill``
-    mode then carries that level forward between filings. ``concept`` is a fixed
-    code literal (never user input), so interpolating it is safe.
+    mode then carries that level forward between filings; like all levels there is
+    no lower time bound, so the panel's first bars are seeded from the last filing
+    BEFORE the window instead of sitting NaN until the first in-window one lands.
+    ``concept`` is a fixed code literal (never user input), so interpolating it is
+    safe.
 
     Args:
         concept: The stored concept name (e.g. ``"equity"``, ``"ni_ttm"``).
@@ -96,7 +101,7 @@ def _fundamental_sql(concept: str) -> str:
                symbol, (known_at AT TIME ZONE 'UTC')::date AS d, val AS value
         FROM fundamentals
         WHERE symbol = ANY(:symbols) AND concept = '{concept}'
-          AND known_at >= :start AND known_at <= :as_of
+          AND known_at <= :as_of
         ORDER BY symbol, (known_at AT TIME ZONE 'UTC')::date, period_end DESC, known_at DESC
     """
 
@@ -140,13 +145,17 @@ def load_features(
     start = pd.Timestamp(index[0]).to_pydatetime()
     as_of = pd.Timestamp(index[-1]).to_pydatetime()
     out: dict[str, pd.DataFrame] = {}
-    for name in names:
-        sql, fill = _BUILDERS[name]
-        with engine.connect() as conn:
-            long = pd.read_sql(text(sql), conn,
-                               params={"symbols": symbols, "start": start, "as_of": as_of})
-        grid = _to_grid(long, index, fill=fill)
-        out[name] = grid.reindex(columns=symbols)
+    with engine.connect() as conn:                # one connection serves every builder
+        for name in names:
+            sql, fill = _BUILDERS[name]
+            # Flows are window-bounded; levels carry no :start bind (they fetch the
+            # full pre-window history so the first bars are seeded — see builder SQL).
+            params = {"symbols": symbols, "as_of": as_of}
+            if fill == "zero":
+                params["start"] = start
+            long = pd.read_sql(text(sql), conn, params=params)
+            grid = _to_grid(long, index, fill=fill)
+            out[name] = grid.reindex(columns=symbols)
     return out
 
 
@@ -167,9 +176,13 @@ def _to_grid(long: pd.DataFrame, index: pd.DatetimeIndex, *, fill: str = "zero")
     """Pivot a ``(symbol, d, value)`` long frame onto the panel index (pure).
 
     Reindexes daily event aggregates onto the panel's calendar (matching on UTC
-    date), fills gaps per ``fill`` (``"zero"`` for event flows, ``"ffill"`` for
-    persistent levels), then shifts one bar so bar ``D`` sees only events
-    knowable strictly before ``D`` — the conservative point-in-time lag.
+    date) and lags them one day, so bar ``D`` sees only events knowable strictly
+    before ``D`` — the conservative point-in-time lag. ``"zero"`` flows live on
+    panel days only (no event = 0, lag = previous panel bar). ``"ffill"`` levels
+    are as-of joins over ALL observation dates: a level observed before the panel
+    start seeds bar 0 (no dead zone waiting for the first in-window filing), and
+    one observed on a non-panel day (weekend dissemination) is carried onto the
+    next bar instead of being dropped.
 
     Args:
         long: Columns ``symbol``, ``d`` (a date), ``value``; one row per pair.
@@ -189,8 +202,14 @@ def _to_grid(long: pd.DataFrame, index: pd.DatetimeIndex, *, fill: str = "zero")
     keys = keys.tz_convert("UTC") if keys.tz is not None else keys
     keys = keys.normalize().tz_localize(None) if keys.tz is not None else keys.normalize()
 
-    wide = wide.reindex(keys)
-    wide = wide.ffill() if fill == "ffill" else wide.fillna(0.0)
-    wide = wide.shift(1)          # PIT: bar D sees only events strictly before D
+    if fill == "ffill":
+        # As-of at D-1: the last observation on any date <= D-1, i.e. strictly
+        # before D — the same lag the flows' shift(1) expresses, but seedable from
+        # observations before keys[0] and not confined to panel days.
+        filled = wide.reindex(wide.index.union(keys)).ffill()
+        wide = filled.reindex(keys - pd.Timedelta(days=1), method="ffill")
+    else:
+        wide = wide.reindex(keys).fillna(0.0)
+        wide = wide.shift(1)      # PIT: bar D sees only events strictly before D
     wide.index = index            # restore the panel's real (tz-aware) index
     return wide

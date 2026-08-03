@@ -14,11 +14,16 @@ data:
   session: regular
   max_symbols: 20
 
-params: {}                 # nothing to tune: own everything, always
-
-optuna:                    # nothing to search — the block exists only so the
-  study: baseline-v1       # standard smoke gate (`tsim optimize --strategy
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
+optuna:
+  study: baseline-v2       # v2: 2026-07-19 engine realism (panel-priced costs +
+                           # benchmark late-lister mask). Standard smoke gate (`tsim optimize --strategy
   sampler: nsga2           # baseline --n-trials 1`) runs end to end; the one
   seed: 42                 # trial scores ~0/~0 by construction.
   n_trials: 1
-  space: {}
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+params:

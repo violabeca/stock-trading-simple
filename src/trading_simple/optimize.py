@@ -436,3 +436,244 @@ def boundary_report(best_params: dict, space: dict[str, dict], *,
         return pd.DataFrame(
             columns=["low", "high", "best", "at_edge", "action"]).rename_axis("param")
     return pd.DataFrame(rows).set_index("param")
+
+
+# ---------------------------------------------------------------------------
+# Local robustness: is the pick a plateau or a spike?
+# ---------------------------------------------------------------------------
+#: Perturbation sizes for :func:`neighbors`, as a fraction of each parameter's
+#: **searched span** — the same normalized scale :func:`boundary_report` measures
+#: edges on, so §8 and the stability check speak one language.
+NEIGHBOR_SPANS = (0.05, 0.10)
+
+
+def _span_value(pos: float, spec: dict):
+    """Inverse of :func:`_span_position`: a 0–1 span position back to a legal value.
+
+    Snaps to the space's own grid (``step``, integers for ``type: int``) and clips
+    to the bounds, so every value returned is one the study could itself have
+    suggested — a "neighbor" the optimizer could never reach would be testing a
+    strategy nobody can ship.
+
+    Args:
+        pos: Position inside the searched range (0 = ``low``, 1 = ``high``);
+            clipped into that interval.
+        spec: The ``optuna.space`` entry.
+
+    Returns:
+        The snapped value, ``int`` for an int space and ``float`` otherwise.
+    """
+    low, high = float(spec["low"]), float(spec["high"])
+    pos = min(max(pos, 0.0), 1.0)
+    value = (np.exp(np.log(low) + pos * (np.log(high) - np.log(low))) if spec.get("log")
+             else low + pos * (high - low))
+    if step := spec.get("step"):
+        value = low + round((value - low) / step) * step
+    value = min(max(value, low), high)
+    return int(round(value)) if spec.get("type") == "int" else round(float(value), 10)
+
+
+def neighbors(picked: dict, space: dict[str, dict], *, valid=lambda p: True,
+              spans: tuple[float, ...] = NEIGHBOR_SPANS) -> pd.DataFrame:
+    """The local star around a picked parameter set: perturb one coordinate at a time.
+
+    A study reports the best point it found; it says nothing about whether that
+    point is a **plateau** (neighbors score about the same — the parameter values
+    are not load-bearing and small real-world drift is survivable) or a **spike**
+    (neighbors collapse — the pick is fitted to noise). Answering that needs
+    points *near the pick*, which neither the Pareto front nor the coarse
+    ``grid:`` sweep provides: the front is a global trade-off curve, and the grid
+    is a fixed ablation lattice that generally contains no point near the optimum
+    at all.
+
+    Perturbations are measured **on the searched scale** — ±5% and ±10% of each
+    parameter's own span, in log space for ``log: true`` ranges — so one bar of the
+    resulting tornado is comparable to the next. Coarse parameters are the
+    exception worth knowing about: a 1–3 integer cannot move by 10% of its span,
+    so it falls back to its smallest representable step rather than being silently
+    reported as inert. Categorical parameters contribute one row per alternative
+    choice (``offset`` is NaN — a switch has no near or far side).
+
+    Args:
+        picked: The full parameter set to perturb (typically the study's pick).
+        space: The strategy's ``optuna.space`` block; keys absent from ``picked``
+            and picked keys absent from the space are both skipped.
+        valid: The strategy's combo validator — perturbations it rejects (an exit
+            band crossing its entry band, say) are dropped, not backtested.
+        spans: Perturbation sizes as fractions of each searched span.
+
+    Returns:
+        One row per candidate, the unperturbed center first: every parameter as a
+        column, plus ``perturbed`` (which coordinate moved, ``""`` for the center)
+        and ``offset`` (the requested span offset, signed).
+    """
+    rows = [{**picked, "perturbed": "", "offset": 0.0}]
+    offsets = sorted({*spans, *(-s for s in spans)}, key=abs)     # nearest first: see dedupe
+    for name, spec in space.items():
+        if name not in picked:
+            continue
+        if spec.get("type") == "categorical":
+            candidates = {c: float("nan") for c in spec["choices"] if c != picked[name]}
+        else:
+            pos = float(_span_position(picked[name], spec))
+            step = spec.get("step") or 1
+            candidates = {}
+            for offset in offsets:
+                value = _span_value(pos + offset, spec)
+                if value == picked[name]:
+                    # Too coarse to move by this offset (a 1-3 int, a 0.25-step weight
+                    # near a bound): take the smallest step it CAN make instead, so the
+                    # knob is judged rather than reported inert by construction.
+                    value = picked[name] + (step if offset > 0 else -step)
+                    if not spec["low"] <= value <= spec["high"]:
+                        continue
+                    value = int(value) if spec.get("type") == "int" else round(float(value), 10)
+                # Nearest offset wins when two offsets snap to the same value.
+                candidates.setdefault(value, offset)
+        for value, offset in sorted(candidates.items(),
+                                    key=lambda kv: (kv[1] if kv[1] == kv[1] else 0.0, str(kv[0]))):
+            candidate = {**picked, name: value}
+            if valid(candidate):
+                rows.append({**candidate, "perturbed": name, "offset": offset})
+    return pd.DataFrame(rows)
+
+
+def sensitivity(strategy: LoadedStrategy, panel: Panel, picked: dict, *, settings: Settings,
+                spans: tuple[float, ...] = NEIGHBOR_SPANS,
+                space: dict[str, dict] | None = None) -> pd.DataFrame:
+    """Backtest the local star around ``picked`` — the input to :func:`stability_report`.
+
+    One :func:`backtest.sweep` call, so the whole neighborhood costs about what a
+    coarse grid does. The metric to read is ``excess_cagr``: benchmark-relative and
+    per-year, i.e. one of the study's own :data:`OBJECTIVES`. (``info_ratio``, the
+    other one, needs per-combo equity curves a column-stacked sweep does not keep.)
+
+    Args:
+        strategy: A loaded strategy.
+        panel: The **training** panel — re-centering a pick is a train-window
+            decision, and scoring candidates on the holdout would burn it.
+        picked: Full parameter set to perturb.
+        settings: Global settings.
+        spans: Perturbation sizes (see :func:`neighbors`).
+        space: Search space; defaults to the strategy's ``optuna.space``.
+
+    Returns:
+        :func:`neighbors`' ``perturbed``/``offset`` labels joined to every
+        :func:`backtest.sweep` metric, one row per candidate.
+    """
+    star = neighbors(picked, space if space is not None else strategy.optuna["space"],
+                     valid=strategy.valid, spans=spans)
+    keys = list(picked)
+    # Cast back through the picked set's own python types: a DataFrame column upcasts an
+    # int grid to float the moment any row differs, and signals() receives the raw value.
+    grid = [{k: type(picked[k])(row[k]) for k in keys}
+            for row in star[keys].to_dict("records")]
+    stats = bt.sweep(strategy, panel, grid, settings=settings)
+    return pd.concat([star[["perturbed", "offset"]], stats], axis=1)
+
+
+def stability_report(star: pd.DataFrame, *, metric: str = "excess_cagr", inert: float = 0.25,
+                     cliff: float = 0.5, min_trades: int = 0) -> pd.DataFrame:
+    """Per-parameter verdict on a local star, with the action each verdict implies.
+
+    Reads like :func:`boundary_report` — one row per parameter, ending in an
+    ``action`` column — and is deliberately **relative to the center**, never a
+    fixed threshold: ``metric`` is signed and benchmark-relative, so a rule like
+    "median > 0.5 × max" silently inverts as soon as the best neighbor is negative.
+
+    Verdicts, and what each one means you should do:
+
+    * ``inert`` — the whole neighborhood scores within ``inert`` of the center.
+      The knob is not load-bearing *here*: pin it in ``params:`` and spend the
+      trial budget on knobs that move the result. Note the scope — this is a
+      **local** claim, and a knob that is flat within ±10% of its span can still
+      be decisive at the far end of it; the sweep grid and the front say that,
+      not this table.
+    * ``plateau`` — moves cost something but nothing collapses. Ship it.
+    * ``cliff (low|high)`` — one side loses more than ``cliff`` of the center's
+      score, or drops below the benchmark, within one perturbation. The pick is on
+      an edge; ``suggest`` holds the nearest value on the safe side, or ``None``
+      when the pick sits on a searched **bound** with the collapse beside it —
+      there is nowhere to step back to, and the fix is a wider bound (see
+      :func:`boundary_report`), not a re-centering.
+    * ``spike`` — *both* sides collapse. The classic overfit optimum: do not ship
+      it, prefer a flatter point from the front.
+    * ``off-center`` — a neighbor beats the center by more than ``inert``. Not an
+      instruction to move: an in-sample bump is exactly what a walk-forward fold
+      exists to referee.
+    * ``n/a`` — the center itself does not beat buy-and-hold, so its neighborhood
+      is not the problem.
+
+    Args:
+        star: Output of :func:`sensitivity`.
+        metric: Column to judge on (benchmark-relative by default).
+        inert: Fraction of the center's score below which a spread counts as noise.
+        cliff: Fraction of the center's score a side must lose to count as a cliff.
+        min_trades: Trade-count floor; neighbors below it are **counted** in
+            ``n_thin`` rather than dropped — a perturbation that starves the book
+            is a finding about that parameter, not a row to hide.
+
+    Returns:
+        One row per perturbed parameter, indexed by name: ``value`` (the picked
+        one), ``tried_low``/``tried_high``, ``worst``, ``best``, ``range``,
+        ``n_thin``, ``verdict``, ``suggest`` and ``action``.
+    """
+    cols = ["value", "tried_low", "tried_high", "worst", "best", "range", "n_thin",
+            "verdict", "suggest", "action"]
+    center = star[star["perturbed"] == ""]
+    moved = star[star["perturbed"] != ""]
+    if not len(center) or not len(moved):
+        return pd.DataFrame(columns=cols).rename_axis("param")
+    mid = float(center[metric].iloc[0])
+    rows = []
+    for name, group in moved.groupby("perturbed", sort=False):
+        scores, values = group[metric], group[name]
+        worst, best = float(scores.min()), float(scores.max())
+        row = {"param": name, "value": center[name].iloc[0],
+               "tried_low": values.min(), "tried_high": values.max(),
+               "worst": worst, "best": best, "range": max(best, mid) - min(worst, mid),
+               "n_thin": int((group["n_trades"] < min_trades).sum()),
+               "suggest": None}
+        def gave_way(scores: pd.Series) -> bool:
+            """Did this side lose the benchmark, or most of the center's score?"""
+            return len(scores) > 0 and bool(scores.min() <= 0 or mid - scores.min() >= cliff * mid)
+
+        collapsed = {}       # side -> the nearest value on the OTHER side of the cliff, if any
+        for side, on_side in (("low", group["offset"] < 0), ("high", group["offset"] > 0)):
+            if gave_way(group.loc[on_side, metric]):
+                # No safe side means the pick sits on a searched BOUND with the collapse
+                # right next to it — there is nowhere to step back to, and the move is
+                # not a re-centering but a wider bound (§8's job, not this table's).
+                safe = group[~on_side & group["offset"].notna()]
+                collapsed[side] = values[safe["offset"].abs().idxmin()] if len(safe) else None
+        # A categorical has no near or far side — its alternatives carry offset NaN.
+        switch = group[group["offset"].isna()]
+        if mid <= 0:
+            row |= {"verdict": "n/a",
+                    "action": "center loses to buy-and-hold — read §10a, not this table"}
+        elif row["range"] <= inert * mid:
+            row |= {"verdict": "inert",
+                    "action": f"flat near the pick: pin {name}, spend the trials elsewhere "
+                              "(a LOCAL claim — it may still bite far from here)"}
+        elif gave_way(switch[metric]):
+            row |= {"verdict": "decisive",
+                    "action": f"the other choice loses the edge — keep {name}={row['value']}"}
+        elif len(collapsed) == 2:
+            row |= {"verdict": "spike",
+                    "action": "both sides collapse — do not ship this pick; take a flatter "
+                              "point off the front"}
+        elif collapsed:
+            side, safe_value = next(iter(collapsed.items()))
+            row |= {"verdict": f"cliff ({side})", "suggest": safe_value,
+                    "action": (f"on an edge: ship {name}={safe_value}, one step clear of it"
+                               if safe_value is not None else
+                               f"on an edge with no room to step back — {name} is at a "
+                               "searched bound; widen it (§8) and re-run")}
+        elif best > mid + inert * abs(mid):
+            row |= {"verdict": "off-center",
+                    "action": "a neighbor scores higher in-sample — refer it to §10b, "
+                              "do not just take it"}
+        else:
+            row |= {"verdict": "plateau", "action": "ok"}
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("param")[cols]

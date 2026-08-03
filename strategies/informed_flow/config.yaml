@@ -2,20 +2,22 @@
 # informed_flow — daily cross-sectional composite of alternative-data signals
 # (insider buying + analyst rating changes + analyst price-target revisions +
 # short-interest avoidance).
-# Blocks: data (what to load, incl. the alt-data feature matrices), params
-# (single-run defaults), sweep (grid exploration), optuna (study + search space).
+# Layout: data (what panel to load), optuna (study settings), params
+# (every knob: doc + shipped value + optional search space and sweep grid).
+# The study-version history — and which journals may not be compared — lives in
+# README.md under "Study history"; this file describes what runs TODAY.
 # ===========================================================================
 
 data:
   universe: LiquidLeaders  # ~100 liquid US names — breadth for cross-sectional ranking
   bar: 1d                  # daily bars (alt-data signals act over weeks–months)
-  # History is ingested from 2020 (see notebooks/03_altdata_update.ipynb), but we TRAIN
-  # from 2021: the 2020 regime (COVID crash and the reflation melt-up) is unlike today's.
-  # This costs statistical power — ~4y of train, minus up to ~9mo of insider_window
-  # warm-up — so read the DSR and the §10e sub-period table before believing any result.
-  # data.start and the ingested history are separate knobs on purpose: widening back to
-  # 2020 is a one-line change here, with no re-ingestion.
-  start: "2021-01-01"
+  # History is ingested from 2020 (see notebooks/03_altdata_update.ipynb) and we TRAIN from
+  # 2020 too, i.e. the full ingested span: ~5y of train, minus up to ~9mo of insider_window
+  # warm-up. That includes the 2020 COVID crash and reflation melt-up, a regime unlike
+  # today's — narrowing `start` to 2021 trades statistical power for regime relevance and
+  # needs no re-ingestion. Either way read the DSR, the §10b walk-forward and the §10e
+  # sub-period table before believing any result.
+  start: "2018-01-01"
   end: "2024-12-31"        # TRAIN cutoff — 2025+ is the notebook's untouched holdout
   session: regular         # daily bars are all regular-session
   max_symbols: 100         # cap at the best-covered names
@@ -25,99 +27,201 @@ data:
   # silently becoming a tilt on the handful of names that do have data.
   features: [insider, ratings, price_target, short_interest]
 
-params:                    # single-backtest defaults; every key is a signals() argument
-  insider_window: 63       # trailing bars for insider dollars, normalizer, eligibility (~1 quarter)
-  rating_halflife: 21      # EMA half-life (bars) for the rating-change stream (~1 month)
-  ptrev_halflife: 21       # EMA half-life (bars) for the price-target revision stream
-  # Composite weights. signals() divides by their SUM, so only the RATIOS matter:
-  # (1.0, 1.0, 0.4, 0.5) is the same strategy as (0.4, 0.4, 0.16, 0.2). That made the
-  # 4-D weight search really 3-D — a wasted dimension, and it produced bogus "parameter
-  # at boundary" alarms whenever a weight drifted to 1.0. So w_dtc is now the FIXED
-  # numeraire (never searched) and the other three float relative to it. Any relative mix
-  # is still reachable, and the three suspect sleeves can each still be zeroed (ablated).
-  w_insider: 1.0           # composite weight: insider buying
-  w_rating: 1.0            # composite weight: rating-change momentum
-  w_ptrev: 0.5             # composite weight: price-target revisions (NOT the target level)
-  w_dtc: 1.0               # FIXED numeraire — the scale reference; see above
-  q_in: 0.8                # enter when composite rank is top 20% cross-sectionally
-  q_out: 0.6               # exit when rank falls below 60% (hysteresis band vs q_in damps turnover)
-  # Time-stop backstop (~6 months). It exists for ONE case: a name parked in the
-  # hysteresis band — too weak to re-qualify, not weak enough to trip q_out — quietly
-  # aging while the evidence that bought it decays out of the trailing windows. It
-  # cannot evict a name currently ranked >= q_in (that name has a fresh thesis).
-  max_hold: 126
-  min_events: 1            # min insider+rating events in the window to be rankable
-  # THE capital constraint. The book is ONE shared cash account (engine portfolio mode),
-  # split into max_positions slots of 1/max_positions each — so a new name can only be
-  # bought by selling an existing one, and when fewer names qualify the rest stays in
-  # cash. This replaces per-symbol cash accounts, under which a strategy holding 40 of
-  # 100 names sat ~30% invested against a 100%-invested benchmark and diluted the edge
-  # across four times as many names as it could survive (top decile +5.8%/yr active,
-  # top 40% +0.6%/yr). A slot is 1/max_positions of the book AT ENTRY and is then LEFT
-  # TO DRIFT — a held name is never re-trimmed while other names rotate around it, and is
-  # sold whole in one order when its rank falls out (engine `rotation_targets` masks per
-  # name, not per bar; see the v7 study note below).
-  max_positions: 10
-  # What happens when a qualifying name arrives and all slots are full:
-  # false = it waits for a vacancy (low turnover); true = it evicts the weakest holding
-  # if it outranks it (chases the top of the ranking, pays for it in costs). Searched.
-  displace: false
-
-sweep:                     # coarse grid; all satisfy valid(): q_out < q_in, weights > 0
-  # The sweep is where sleeves get ABLATED (a 0.0 column removes that signal), including
-  # w_dtc, which the Optuna space holds fixed as the numeraire.
-  w_insider: [0.0, 1.0]    # 0.0 ablates insider
-  w_rating: [0.0, 1.0]     # 0.0 ablates rating changes
-  w_ptrev: [0.0, 1.0]      # 0.0 ablates price-target revisions
-  w_dtc: [0.0, 1.0]        # 0.0 ablates short interest
-  q_in: [0.8, 0.9]
-  q_out: [0.6]
-  max_positions: [10]      # hold the slot count fixed so the ablation is about sleeves
-
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  # v7: execution model changed — the book no longer re-trims a held position when
-  #    another name rotates (engine `rotation_targets` now masks per NAME, not per bar).
-  #    Each name is bought once and sold whole; weights drift between its own events, the
-  #    way the equal-weight benchmark already does. This changes realized returns, so v6
-  #    and v7 trials are NOT comparable — do not mix them.
-  # v5: TWO changes, and both make earlier studies incomparable — do not compare them.
-  # 1. The book is now a single shared cash account with max_positions slots (portfolio
-  #    mode). Under v4's per-symbol cash accounts the strategy was structurally ~30%
-  #    invested against a fully-invested benchmark and could not win, whatever it picked.
-  # 2. The second objective is excess_CAGR (per year), not excess_return (cumulative).
-  #    v4 traded an annualized objective against a whole-window one, which is incoherent
-  #    and cannot rank walk-forward folds of different lengths.
-  # v3 maximized absolute Sharpe, which rewarded market exposure over stock selection.
-  study: informed-flow-1d-v7
+  study: informed-flow-1d-v18   # bump this whenever a `search:` bound changes: a journal
+                           # that mixes two spaces cannot be read (see README study history).
+                           # v17 gained the displace_margin dimension while its journal was
+                           # still EMPTY (zero trials), so no bump was owed for it.
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
   n_trials: 1000
   min_trades_per_year: 15  # admissibility floor (PER YEAR, not absolute): daily,
                            # multi-position portfolio mode turns over far less than an
-                           # intraday scanner — 25/yr ~= 100 trades over this 4y window
-  space:                   # declarative search space -> optimize.suggest_params
-    # High bound widened 189 -> 378 (~1.5y): a 5-trial probe pinned the old ceiling.
-    # NOTE the confound when reading the result — insider_window does double duty. It is
-    # the insider lookback AND the eligibility window, so a longer value also makes more
-    # names rankable. A pick at the ceiling may be buying BREADTH, not a longer insider
-    # horizon (the literature puts insider drift at ~1-6 months, i.e. well below 378).
-    insider_window:  { type: int,   low: 21,  high: 378, log: true }
-    rating_halflife: { type: int,   low: 5,   high: 90,  log: true }
-    ptrev_halflife:  { type: int,   low: 5,   high: 90,  log: true }
-    # w_dtc is the fixed numeraire (1.0) and is NOT searched — see the params block.
-    # These three float against it, so 0.0 ablates and 3.0 means "3x short interest".
-    w_insider:       { type: float, low: 0.0, high: 3.0, step: 0.25 }
-    w_rating:        { type: float, low: 0.0, high: 3.0, step: 0.25 }
-    w_ptrev:         { type: float, low: 0.0, high: 3.0, step: 0.25 }
-    q_in:            { type: float, low: 0.6, high: 0.95, step: 0.05 }
-    q_out:           { type: float, low: 0.4, high: 0.9,  step: 0.05 }
-    max_hold:        { type: int,   low: 21,  high: 252, log: true }
-    min_events:      { type: int,   low: 1,   high: 3 }
-    # How concentrated the book is. This is the knob the signal cares about most: a
-    # construction-free test put the edge at +5.8%/yr in the top decile and +0.6%/yr by
-    # the top 40%, so fewer slots means a purer signal but a lumpier, riskier book.
-    max_positions:   { type: int,   low: 5,   high: 25 }
-    # Whether a better name may evict the weakest holding, or must wait for a vacancy.
-    # Searched rather than assumed: concentration argues for chasing the top of the
-    # ranking, turnover costs argue against, and which wins is an empirical question.
-    displace:        { type: categorical, choices: [true, false] }
+                           # intraday scanner — 15/yr ~= 75 trades over this 5y window
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+# Two invariants are enforced at load time (strategies._unpack): `value` must be
+# reachable by its own `search`, and must appear in its own `grid` — so the sweep can
+# never explore a family that excludes the strategy this file ships.
+params:
+
+  # --- signal construction --------------------------------------------------------
+  insider_window:
+    doc: >-
+      Trailing bars for insider dollars, the dollar-volume normalizer and the eligibility
+      count (~1 quarter at 63). DOUBLE DUTY, and that confounds a high pick: it is the
+      insider lookback AND the eligibility window, so a longer value also makes more names
+      rankable — a pick at the ceiling may be buying BREADTH, not a longer insider horizon
+      (the literature puts insider drift at ~1-6 months, well below 378).
+    value: 63
+    search: { type: int, low: 21, high: 378, log: true }   # high widened 189 -> 378 (~1.5y)
+  rating_halflife:
+    doc: EMA half-life (bars) for the rating-change stream (~1 month at 21).
+    value: 21
+    search: { type: int, low: 5, high: 90, log: true }
+  ptrev_halflife:
+    doc: EMA half-life (bars) for the price-target revision stream.
+    value: 21
+    search: { type: int, low: 5, high: 90, log: true }
+
+  # --- composite weights ----------------------------------------------------------
+  # signals() divides by their SUM, so only the RATIOS matter: (1.0, 1.0, 0.4, 0.5) is the
+  # same strategy as (0.4, 0.4, 0.16, 0.2). That made the 4-D weight search really 3-D — a
+  # wasted dimension that produced bogus "parameter at boundary" alarms whenever a weight
+  # drifted to 1.0. So w_dtc is the FIXED numeraire (never searched) and the rest float
+  # against it. Every `search:` floor here is 0.25, NOT 0.0, on purpose: the study decides
+  # how BIG a sleeve is, never whether it exists. Existence is decided out of sample, by the
+  # 0.0 columns of the grids below (§10b·ii). EXPECTED NOISE: §8's boundary_report says
+  # "widen low" whenever a pick lands on 0.25 — it cannot know the floor is deliberate, so
+  # that one flag is not a finding. Every other boundary flag still means what it says.
+  w_insider:
+    doc: Composite weight on insider buying. 0.0 in the grid ablates the sleeve.
+    value: 1.0
+    search: { type: float, low: 0.25, high: 3.0, step: 0.25 }
+    grid: [0.0, 1.0]
+  w_rating:
+    doc: Composite weight on rating-change momentum. 0.0 in the grid ablates it.
+    value: 1.0
+    search: { type: float, low: 0.25, high: 3.0, step: 0.25 }
+    grid: [0.0, 1.0]
+  w_ptrev:
+    doc: >-
+      Composite weight on price-target REVISIONS (never the target-to-price level — Han-Kang
+      2022 show price drifts against the level, worst in exactly this large-cap universe).
+    value: 0.5
+    search: { type: float, low: 0.25, high: 3.0, step: 0.25 }
+    grid: [0.0, 0.5, 1.0]
+  w_dtc:
+    doc: >-
+      Composite weight on (negated) days-to-cover — low short interest is the favourable
+      tilt. The FIXED numeraire at 1.0: never searched, because only weight ratios matter
+      and searching all four would waste a dimension. The grid can still ablate it.
+    value: 1.0
+    grid: [0.0, 1.0]
+
+  # --- price-derived market-condition sleeves --------------------------------------
+  # These read panel.close directly — no alt-data table — so they always cover the universe:
+  # a name drifting sideways or down earns a low tech-rank that drags its composite down and
+  # pushes it out of the limited slots. Ranked only WITHIN the alt-data-eligible
+  # cross-section, so they confirm an already-rankable name and can never pull in a name the
+  # model has no evidence on. Currently OFF (value 0.0) and NOT searched — v13-vs-v14's
+  # controlled holdout ablation put their effect at ~zero (holdout IR 2.02 -> 2.02). The grid
+  # keeps testing them out of sample; re-add a `search:` here to let the study size them.
+  w_trend:
+    doc: Composite weight on the MA-trend sleeve, SMA(trend_fast)/SMA(trend_slow) - 1.
+    value: 0.0
+    grid: [0.0, 1.0]
+  w_rsi:
+    doc: Composite weight on the Wilder-RSI(rsi_period) sleeve.
+    value: 0.0
+    grid: [0.0, 1.0]
+  trend_fast:
+    doc: >-
+      MA-trend fast leg (bars, ~1mo). The crossover reads the trend's slope, which is
+      smoother than a single-MA distance; valid() enforces trend_fast < trend_slow.
+    value: 21
+  trend_slow:
+    doc: MA-trend slow leg (bars, ~6mo) — matches the ~1-6mo alt-data drift horizon.
+    value: 126
+  rsi_period:
+    doc: Wilder-RSI lookback (bars) — the canonical 14.
+    value: 14
+
+  # --- the entry/exit band ---------------------------------------------------------
+  # NOT arbitrary defaults: v13 and v14 searched q_in over [0.6, 0.95] and q_out over
+  # [0.4, 0.9] and BOTH converged on exactly 0.75/0.45, from opposite sleeve mixes. Two
+  # independent fits agreeing on the band is the most robust single result either produced.
+  # The grids pin both to the shipped value so §10b·ii's folds re-pick inside the family
+  # that actually ships — the drift that made a whole walk-forward meaningless twice.
+  q_in:
+    doc: Buy when the composite rank reaches this quantile (0.75 = top 25%). Qualifying is
+         necessary, not sufficient — it still needs a free slot.
+    value: 0.75
+    search: { type: float, low: 0.6, high: 0.95, step: 0.01 }
+    grid: [0.75]
+  q_out:
+    doc: >-
+      Sell when the rank falls below this. The gap to q_in is the hysteresis band that damps
+      turnover. Measured caveat: under displace=true the band is nearly dormant — the queue
+      of waiting names evicts a holding long before its rank decays this far (4 of 368 exits
+      on the v15 pick), so this knob only bites when displace is false.
+    value: 0.45
+    search: { type: float, low: 0.4, high: 0.9, step: 0.01 }
+    grid: [0.45]
+  max_hold:
+    doc: >-
+      Time-stop backstop in bars (~6 months). It exists for ONE case: a name parked in the
+      hysteresis band — too weak to re-qualify, not weak enough to trip q_out — quietly
+      aging while the evidence that bought it decays out of the trailing windows. It cannot
+      evict a name currently ranked >= q_in; that name has a fresh thesis and its clock
+      restarts. Same caveat as q_out: with displace=true the clock never runs out (measured
+      max 3 bars parked, against the 65 it needed).
+    value: 126
+    search: { type: int, low: 21, high: 252, log: true }
+  min_events:
+    doc: >-
+      Minimum insider+rating events in the trailing window for a name to be RANKABLE at all
+      (an ineligible name is dropped from the cross-section, not merely blocked from
+      entering). Both studies pinned this at 1 and the low bound is deliberately not
+      widened: 0 would mean ranking names the model has no evidence on, so the pin is a
+      finding — the filter wants to be loose — rather than a clipped bound.
+    value: 1
+    search: { type: int, low: 1, high: 3 }
+
+  # --- the book (capital constraint) ------------------------------------------------
+  max_positions:
+    doc: >-
+      Slots in the book. ONE shared cash account (engine portfolio mode) split into
+      max_positions slots of 1/max_positions each AT ENTRY, then left to drift — so a new
+      name can only be bought by selling an existing one, and when fewer names qualify the
+      rest stays in cash. This replaced per-symbol cash accounts, under which the strategy
+      sat ~30% invested against a 100%-invested benchmark and diluted the edge across four
+      times as many names as it could survive (top decile +5.8%/yr active, top 40%
+      +0.6%/yr). THE knob the signal cares about most, and a risk decision rather than a
+      free parameter: fewer slots is a purer signal but a lumpier, more fragile book. Every
+      study so far has pinned it at whatever the low bound was (30 -> 15 -> 8 -> 5), so
+      treat a pick at the floor as a statement about concentration, not a converged value.
+    value: 15
+    search: { type: int, low: 15, high: 30 }
+    grid: [15]             # pinned so the sweep's free dimensions are the sleeve ablations
+  displace:
+    doc: >-
+      What happens when a qualifying name arrives and every slot is full: false = it waits
+      for a vacancy (low turnover), true = it evicts the weakest holding if it outranks it
+      (chases the top of the ranking and pays for it in costs). Searched rather than
+      assumed, and decisive — all four walk-forward refits chose true, and it is what makes
+      q_out and max_hold dormant.
+    value: false
+    search: { type: categorical, choices: [true, false] }
+  displace_margin:
+    doc: >-
+      How far a challenger must out-rank the weakest holding before it may evict it, in
+      composite-rank units (one rank place in a ~91-name cross-section is ~0.011, so 0.05
+      is "about five places clear"). 0.0 is the bare "any epsilon wins" comparison. This
+      is the ONLY brake on displacement: q_in/q_out and max_hold gate a name's rank LEVEL,
+      while displacement is an ORDERING comparison none of them can see — and on the v16
+      pick's holdout book 122 of 127 exits were displacements, median winning margin ~2
+      rank places, 16% of them a single place. Because score_pct is a percentile, a name
+      can lose its slot on a bar where its own composite did not move at all (MRVL, 2025-
+      12-15, re-bought 7 bars later). An event study over all 121 of those evictions put
+      the challenger's forward return minus the evicted name's at zero to every horizon
+      (win rate ~50%, p >= 0.67), so the swaps were paying two legs of costs for no
+      information. SHIPS AT 0.0 ON PURPOSE: the counterfactual that favours a margin was
+      measured on the HOLDOUT, and picking the value off it would be peeking. The study
+      sizes it on train, and the grid tests its existence out of sample.
+    value: 0.0
+    search: { type: float, low: 0.0, high: 0.15, step: 0.01 }
+    grid: [0.0, 0.05]
+  retrim_k:
+    doc: >-
+      Single-name concentration cap (engine _retrim_loop). A held slot drifts untouched
+      UNTIL its book weight reaches retrim_k x its 1/max_positions target (2.0 = it
+      doubled), then it is trimmed back to the slot and the freed cash rotates into the next
+      pick. Risk control, not signal: it exists so one lucky pop cannot dominate the book
+      and crown a parameter set. Deliberately a FIXED policy with no `search:` — optimizing
+      it would just tune the cap to whatever flattered the in-sample winner. null disables.
+    value: 2.0

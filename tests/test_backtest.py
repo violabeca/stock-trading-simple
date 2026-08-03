@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from tests.conftest import make_panel
 from trading_simple import backtest as bt
 from trading_simple.config import CostSettings, Settings
 from trading_simple.data import Panel
@@ -80,6 +81,17 @@ def test_leg_costs_arithmetic():
     assert slip == pytest.approx(1.0 / 1e4)
 
 
+def test_panel_costs_prices_commission_at_the_panel_median():
+    """Per-share commission must be priced at the panel, not a hard-coded $20.
+
+    make_panel's median-of-medians is $100: 100 shares of a $10k order cost
+    $0.50, so the $1 minimum binds — 1 bp/leg, not the $20-name's 2.5 bp.
+    """
+    fees, slip = bt.panel_costs(CostSettings(), make_panel())
+    assert fees == pytest.approx(1.0 / 10_000 + 1.0 / 1e4)   # min commission + half spread
+    assert slip == pytest.approx(1.0 / 1e4)
+
+
 def test_grid_from_config_product_and_valid():
     grid = bt.grid_from_config({"a": [1, 2], "b": [10, 20]}, valid=lambda p: p["a"] < 2)
     assert grid == [{"a": 1, "b": 10}, {"a": 1, "b": 20}]
@@ -139,6 +151,49 @@ def test_run_executes_engineered_trade(panel):
     assert t["entry_ts"] == panel.close.index[41]
     assert t["entry_price"] == pytest.approx(panel.open_.iloc[41, 0])  # next-bar open fill
     assert t["pnl"] > 0                                                # AAA trends up
+
+
+def test_time_stop_is_hard_even_when_a_fresh_signal_lands_on_it(panel):
+    """An exit and an entry signal on the same bar must EXIT, not cancel out.
+
+    vectorbt's default conflict mode ("ignore") dropped both signals: a horizon
+    exit landing on a bar that also carried a fresh entry signal was swallowed,
+    so the position ran past its supposed hard time stop (and the entry
+    evaporated too). Exit-wins makes exit_after a real stop; the same-bar
+    re-entry is still dropped — from_signals cannot exit and re-enter in one bar.
+    """
+    entries = pd.DataFrame(False, index=panel.close.index, columns=panel.close.columns)
+    entries.iloc[5, 0] = True
+    entries.iloc[13, 0] = True                      # fresh signal ON the time-stop bar
+    exits = bt.exit_after(entries, 8)               # schedules exits at bars 13 and 21
+    pf = bt.run(panel, {"entries": entries, "exits": exits}, fees=0.0, slippage=0.0)
+    t = bt.trade_records(pf)
+    t = t[t["symbol"] == "AAA"]
+    assert len(t) == 1                              # no phantom second position
+    assert t.iloc[0]["entry_ts"] == panel.close.index[5]
+    assert t.iloc[0]["exit_ts"] == panel.close.index[13]   # the hard stop, not bar 21
+
+
+def test_stop_gap_through_fills_at_the_open_not_the_stop():
+    """A bar that gaps through a stop must fill at its (worse) true open.
+
+    vectorbt's defaults are optimistic here: without ``open=`` it substitutes
+    close for open in stop-hit detection, and ``stoplimit`` fills AT the stop
+    level even when the bar opened far beyond it. run() now passes the open and
+    ``stopmarket``, so the overnight collapse below prints at 85, not at 98.
+    """
+    idx = pd.date_range("2024-01-02", periods=20, freq="B", tz="UTC")
+    close = pd.DataFrame({"AAA": 100.0}, index=idx)
+    close.iloc[10:] = 85.0                                   # collapse at bar 10
+    p = Panel(close=close, open_=close.copy(), high=close + 0.5, low=close - 0.5,
+              volume=pd.DataFrame(1_000.0, index=idx, columns=["AAA"]), bar="1d")
+    entries = pd.DataFrame(False, index=idx, columns=["AAA"])
+    entries.iloc[5] = True                                   # fill at open(5) = 100
+    pf = bt.run(p, {"entries": entries, "sl_stop": 0.02},    # stop level = 98
+                fees=0.0, slippage=0.0)
+    t = bt.trade_records(pf).iloc[0]
+    assert t["exit_ts"] == idx[10]
+    assert t["exit_price"] == pytest.approx(85.0)            # the open, NOT the 98 stop
 
 
 def test_run_with_trailing_stop_caps_loss(panel):
@@ -214,14 +269,17 @@ def test_benchmark_is_buy_and_hold_and_beats_a_flat_strategy(panel):
     assert abs(active["info_ratio"]) < 1e-9
 
     # A strategy that never trades earns nothing, so it trails a rising benchmark.
-    bench_return, _ = bt.benchmark(panel, fees=0.0, slippage=0.0)
-    if bench_return > 0:
-        flat = pd.DataFrame(False, index=panel.close.index, columns=panel.close.columns)
-        pf0 = bt.run(panel, {"entries": flat, "exits": flat}, fees=0.0, slippage=0.0)
-        s0 = bt.portfolio_stats(pf0)
-        a0 = bt.active_stats(pf0, panel, fees=0.0, slippage=0.0,
-                             total_return=s0["total_return"])
-        assert a0["excess_cagr"] < 0
+    # AAA-only panel: the benchmark is unambiguously positive, so this half can't
+    # silently no-op the way it would on the mixed AAA-up/BBB-down fixture.
+    rising = make_panel(symbols=("AAA",))
+    bench_return, _ = bt.benchmark(rising, fees=0.0, slippage=0.0)
+    assert bench_return > 0
+    flat = pd.DataFrame(False, index=rising.close.index, columns=rising.close.columns)
+    pf0 = bt.run(rising, {"entries": flat, "exits": flat}, fees=0.0, slippage=0.0)
+    s0 = bt.portfolio_stats(pf0)
+    a0 = bt.active_stats(pf0, rising, fees=0.0, slippage=0.0,
+                         total_return=s0["total_return"])
+    assert a0["excess_cagr"] < 0
 
 
 def test_benchmark_matches_the_mean_of_the_per_symbol_returns(panel):
@@ -252,6 +310,67 @@ def test_benchmark_matches_the_mean_of_the_per_symbol_returns(panel):
 
     costed, _ = bt.benchmark(panel, fees=0.001, slippage=0.001)            # 10x real costs
     assert costed == pytest.approx(per_symbol_mean(0.001, 0.001), abs=1e-3)
+
+
+def test_benchmark_buys_a_late_listed_name_at_its_listing():
+    """A name with leading-NaN prices must still enter the buy-and-hold book.
+
+    LiquidLeaders is screened from names listed TODAY but backfilled years further:
+    a 2022 IPO on a 2021 panel starts with NaN prices. The dense constant-1/N frame
+    put that name's only order on bar 0 — a NaN-price order vectorbt silently skips —
+    so the name was never bought and its 1/N sat in cash forever, understating the
+    hurdle every strategy is judged against. The masked frame emits the order on the
+    name's first valid bar instead.
+    """
+    p = make_panel()
+    for f in ("close", "open_", "high", "low", "volume"):
+        frame = getattr(p, f)
+        frame.iloc[:20, frame.columns.get_loc("BBB")] = np.nan   # BBB lists 20 bars late
+
+    weights = pd.DataFrame(1.0 / len(p.symbols), index=p.close.index,
+                           columns=p.close.columns)
+    pf = bt.run(p, {"weights": weights.where(p.close.notna())},   # benchmark's construction
+                fees=0.0, slippage=0.0)
+    held = pf.asset_value(group_by=False)["BBB"].fillna(0.0)
+    assert (held.iloc[:20] == 0.0).all()      # nothing held before the listing...
+    assert held.iloc[20] > 0.0                # ...bought ON the first valid bar
+    assert held.iloc[-1] > 0.0                # ...and held to the end
+
+    # And the public entry point agrees: the staggered-panel benchmark ends more
+    # invested than a book where BBB's 1/N is simply never deployed (its curve must
+    # show BBB's post-listing decline, not flat cash).
+    total, curve = bt.benchmark(p, fees=0.0, slippage=0.0)
+    assert curve.iloc[21:].ne(0.0).any()
+    aaa_only = p.close["AAA"].iloc[-1] / p.close["AAA"].iloc[0] - 1.0
+    assert total < aaa_only / 2               # BBB's decline is IN the number, not idled away
+
+
+def test_diagnostic_sharpe_is_on_the_bars_per_year_clock():
+    """The diagnostic Sharpe must share info_ratio's clock: actual bars per year.
+
+    vectorbt's own ``sharpe_ratio`` annualizes with a 365-calendar-day year — √365
+    on daily bars that number ~252 a year (~20% high) and ~2.3x high on 1m bars.
+    Pin the factor at √(bars/years) so a regression back to the wall-clock year
+    cannot slip through.
+    """
+    index = pd.date_range("2024-01-01", "2024-12-31", freq="B", tz="UTC")   # ~1 year
+    rets = pd.Series([0.001, -0.0005] * (len(index) // 2) + [0.001] * (len(index) % 2),
+                     index=index)
+    factor = float(bt._bar_sharpe(rets, index) / (rets.mean() / rets.std()))
+    assert factor == pytest.approx(np.sqrt(len(index)), rel=0.02)   # ~16.1 on ~261 bars
+    assert factor < np.sqrt(300)                                    # rules out sqrt(365)
+
+    # Intraday, same formula: factor^2 * years == number of bars, exactly.
+    intraday = pd.date_range("2026-03-02 14:30", periods=390, freq="1min", tz="UTC") \
+                 .append(pd.date_range("2026-03-03 14:30", periods=390, freq="1min", tz="UTC"))
+    rets2 = pd.Series([0.001, -0.0005] * 390, index=intraday)
+    factor2 = float(bt._bar_sharpe(rets2, intraday) / (rets2.mean() / rets2.std()))
+    assert factor2 ** 2 * bt._years(intraday) == pytest.approx(len(intraday), rel=1e-9)
+
+    # Frame input -> per-column Series (the _metric_frame path).
+    frame = pd.DataFrame({"AAA": rets, "BBB": -rets})
+    out = bt._bar_sharpe(frame, index)
+    assert list(out.index) == ["AAA", "BBB"] and out["AAA"] == pytest.approx(-out["BBB"])
 
 
 # --- portfolio mode: one shared cash account ------------------------------------
@@ -364,6 +483,88 @@ def test_held_name_is_not_trimmed_when_a_peer_rotates():
     assert list(aaa["Timestamp"]) == [idx[1]]            # bought once, never trimmed thereafter
     rot = orders[orders["Timestamp"] == idx[20]]
     assert set(rot["Column"]) == {"BBB", "CCC"}          # only the rotating pair trades
+
+
+def _runaway_panel():
+    """Three equal slots; AAA runs away 10x while BBB/CCC stay ~flat.
+
+    With a 1/3 slot each, AAA's book weight climbs past 2/3 (2x its slot) as it rips, while
+    the two flat names only ever drift BELOW their slot — so exactly one name is a concentration
+    risk, which is what the retrim band is for.
+    """
+    idx = pd.date_range("2024-01-02", periods=50, freq="B", tz="UTC")
+    close = pd.DataFrame({"AAA": np.linspace(100.0, 1000.0, 50),   # runs away 10x
+                          "BBB": np.linspace(100.0, 104.0, 50),    # ~flat
+                          "CCC": np.linspace(100.0, 96.0, 50)}, index=idx)   # ~flat
+    p = Panel(close=close, open_=close * 0.999, high=close * 1.01, low=close * 0.99,
+              volume=pd.DataFrame(1e6, index=idx, columns=close.columns), bar="1d")
+    w = pd.DataFrame(0.0, index=idx, columns=close.columns)
+    w.iloc[1:, :] = 1.0 / 3       # hold all three at equal slots for the whole run
+    return p, w
+
+
+def test_retrim_caps_a_runaway_winner():
+    """retrim_k trims a held name back to its slot once it doubles it, so a pop cannot dominate.
+
+    AAA rips 10x and, left alone, would grow to ~5/6 of the book (see the off-path test). With
+    `retrim_k=2.0` the engine sells it back to its 1/3 slot the bar after its weight first reaches
+    2/3, capping single-name concentration near the band. The two flat peers never breach 2x their
+    slot, so they are bought once and never trimmed — the trim is per name, not a whole-book
+    rebalance.
+    """
+    p, w = _runaway_panel()
+    pf = bt.run(p, {"weights": w, "retrim_k": 2.0}, fees=0.0, slippage=0.0, init_cash=10_000)
+    orders = pf.orders.records_readable
+
+    aaa = orders[orders["Column"] == "AAA"]
+    assert (aaa["Side"] == "Sell").any() and len(aaa) >= 2   # entry + at least one trim
+    for peer in ("BBB", "CCC"):                              # never breach -> bought once, no trim
+        assert list(orders[orders["Column"] == peer]["Side"]) == ["Buy"]
+    weight = pf.asset_value(group_by=False)["AAA"] / pf.value()
+    assert weight.max() < 0.72                               # held near the 2/3 band, not ~5/6
+
+
+def test_retrim_off_lets_the_winner_run():
+    """The default (no retrim_k) is unchanged: a held name drifts uncapped, bought once.
+
+    The exact behavior `test_held_name_is_not_trimmed_when_a_peer_rotates` pins, on the runaway
+    panel — proof the cap is strictly opt-in and off by default (so the benchmark and every other
+    strategy are untouched).
+    """
+    p, w = _runaway_panel()
+    pf = bt.run(p, {"weights": w}, fees=0.0, slippage=0.0, init_cash=10_000)  # retrim_k absent
+    aaa = pf.orders.records_readable
+    aaa = aaa[aaa["Column"] == "AAA"]
+    assert list(aaa["Side"]) == ["Buy"]                     # bought once, never trimmed
+    weight = pf.asset_value(group_by=False)["AAA"] / pf.value()
+    assert weight.max() > 0.80                              # runs away past the 2x band, uncapped
+
+
+def test_sweep_portfolio_retrim_matches_evaluate():
+    """A portfolio sweep must apply the retrim cap identically to `evaluate`, per combo.
+
+    The cap lives in both call sites (`_run_portfolio` and the sweep branch); if they drift,
+    a swept number silently disagrees with the single run it should equal. Runs the same
+    runaway book capped (k=2) and uncapped (k=None) as two combos and checks each against
+    `evaluate` — and that the two differ, proving the cap actually fired inside the sweep.
+    """
+    from trading_simple import strategies
+
+    strat = strategies.load("informed_flow")
+    p, w = _runaway_panel()
+
+    def capped(_panel, *, k, **__):
+        return {"weights": w, "retrim_k": k}
+
+    strat = replace(strat, signals=capped, params={"k": 2.0})
+    grid = [{"k": 2.0}, {"k": None}]
+    stats = bt.sweep(strat, p, grid, settings=_settings(), chunk_size=2)
+    for row, combo in zip(stats.to_dict("records"), grid, strict=True):
+        single = bt.evaluate(strat, p, combo, settings=_settings())
+        assert row["total_return"] == pytest.approx(single["total_return"], rel=1e-9)
+    # Capping the runaway changes the realized book, so the two combos must not be equal —
+    # proof the cap ran in the column-stacked sweep, not just in evaluate.
+    assert stats["total_return"].iloc[0] != pytest.approx(stats["total_return"].iloc[1])
 
 
 def test_sweep_portfolio_matches_evaluate(panel):

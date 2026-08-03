@@ -203,11 +203,21 @@ def test_valid_rules():
     strat = strategies.load("informed_flow")
     assert strat.valid({"q_in": 0.8, "q_out": 0.6, "w_insider": 0.4,
                         "w_rating": 0.3, "w_dtc": 0.3})
+    assert strat.valid({"q_in": 0.8, "q_out": 0.6, "w_trend": 1.0})   # a tech-only weight counts
+    assert not strat.valid({"q_in": 0.8, "q_out": 0.6, "w_trend": 1.0,
+                            "trend_fast": 100, "trend_slow": 50})     # crossover inverted
     assert not strat.valid({"q_in": 0.6, "q_out": 0.8})               # band inverted
-    assert not strat.valid({"q_in": 0.8, "q_out": 0.6, "w_insider": 0.0,
-                            "w_rating": 0.0, "w_dtc": 0.0})            # no weight
+    assert not strat.valid({"q_in": 0.8, "q_out": 0.6, "w_insider": 0.0, "w_rating": 0.0,
+                            "w_dtc": 0.0, "w_trend": 0.0, "w_rsi": 0.0})   # no weight at all
     assert not strat.valid({"q_in": 0.8, "q_out": 0.6, "w_insider": 0.4,
                             "max_positions": 0})                       # a book with no slots
+
+
+# The old `test_sweep_grid_contains_shipped_shape` and
+# `test_optuna_space_brackets_the_shipped_params` lived here. Both are now enforced for
+# EVERY strategy, at config-load time (strategies._unpack) plus the fleet-wide check in
+# test_strategies.py::test_every_shipped_config_satisfies_its_own_invariants — a config
+# that ships a value its grid or its search space excludes no longer loads at all.
 
 
 # --- the capital constraint: slots, waiting, and displacement -----------------
@@ -249,6 +259,43 @@ def test_displace_evicts_the_weakest_holding():
     assert (late > 0).sum() == 2                       # still exactly two slots
 
 
+def test_displace_margin_blocks_a_one_place_challenger():
+    """A challenger one rank place ahead is not "better", it is noise — the margin says so.
+
+    Displacement is an ORDERING comparison, so neither the q_in/q_out band nor max_hold
+    can see it: without a margin, any epsilon of rank advantage sells a whole position and
+    buys another. That is not hypothetical — it drove 122 of 127 exits on the v16 pick's
+    holdout book, and the resulting swaps were measured to be a coin flip (see `_select`).
+
+    From bar 40 the late ranking is BBB 1.0, CCC 0.8, AAA 0.6, DDD 0.4, EEE 0.2, so the
+    book (AAA, BBB) has CCC sitting exactly ONE rank place (0.2) above its weakest
+    holding — the marginal case the margin exists for.
+    """
+    p = _band_panel()
+    bare = _if(p, **_DISPLACE, displace=True)["weights"].iloc[70]
+    assert bare["CCC"] > 0 and bare["AAA"] == 0        # one place is enough, unbraked
+
+    braked = _if(p, **_DISPLACE, displace=True, displace_margin=0.25)["weights"].iloc[70]
+    assert braked["AAA"] > 0 and braked["CCC"] == 0    # ...and not enough, with the brake
+    assert braked["BBB"] > 0 and (braked > 0).sum() == 2   # still exactly two slots
+    # CCC is not merely unbought, it is on the bench for the stated reason.
+    exp = _explain(p, "CCC", **_DISPLACE, displace=True, displace_margin=0.25)
+    assert exp.loc[exp.index[69], "state"] == "slot_blocked"
+
+
+def test_a_decisive_challenger_still_displaces_through_the_margin():
+    """The brake damps noise, it does not switch displacement off.
+
+    Same panel, but EEE storms to the top: it clears the weakest holding by 0.6, so a
+    0.25 margin — which blocked the one-place challenger above — must let it through.
+    """
+    p = _band_panel()
+    p.features["ratings"].loc[p.close.index[40:], "EEE"] = 10.0
+    late = _if(p, **_DISPLACE, displace=True, displace_margin=0.25)["weights"].iloc[70]
+    assert late["EEE"] > 0 and late["AAA"] == 0
+    assert (late > 0).sum() == 2
+
+
 def test_thin_selection_leaves_cash_rather_than_concentrating():
     """One name qualifying does not mean betting the whole book on it.
 
@@ -283,6 +330,83 @@ def test_low_coverage_sleeve_is_dropped():
     dtc["CCC"] = 3.0
     parts = _module()["_compose"](p, **{**_PARAMS, "w_dtc": 0.9})
     assert "short_interest" in parts["present"]
+
+
+# --- the price-derived market-condition sleeves (MA-trend + Wilder RSI) ------
+def _sloped_panel(ends, n=90):
+    """A daily panel with distinct linear price paths, every name eligible on every bar.
+
+    ``ends`` maps symbol -> final price (start is always 100.0): end > 100 trends up,
+    end < 100 down, end == 100 flat. A constant nonzero ratings stream makes every name
+    clear the eligibility floor on every bar, so a ranking test can assert at a late,
+    warmed-up bar without the alt-data event ageing out of the trailing window. The
+    ratings sleeve itself is only used for eligibility here — the tech tests set
+    ``w_rating=0`` so it never enters the composite.
+    """
+    syms = list(ends)
+    index = pd.date_range("2020-01-02", periods=n, freq="B", tz="UTC")
+    close = pd.DataFrame({s: np.linspace(100.0, e, n) for s, e in ends.items()}, index=index)
+    panel = Panel(close=close, open_=close * 0.999, high=close * 1.01, low=close * 0.99,
+                  volume=pd.DataFrame(1e6, index=index, columns=syms), bar="1d")
+    panel.features = {"insider": pd.DataFrame(0.0, index=index, columns=syms),
+                      "ratings": pd.DataFrame(1.0, index=index, columns=syms)}  # always eligible
+    return panel
+
+
+def test_tech_sleeves_are_off_by_default():
+    """With w_trend/w_rsi at their 0.0 default the price sleeves are absent and inert."""
+    p = _sloped_panel({"AAA": 160, "BBB": 130, "CCC": 90, "DDD": 60})
+    default = _module()["_compose"](p, **_PARAMS)                 # tech weights default to 0
+    assert "trend" not in default["present"] and "rsi" not in default["present"]
+    explicit0 = _module()["_compose"](p, **{**_PARAMS, "w_trend": 0.0, "w_rsi": 0.0})
+    pd.testing.assert_frame_equal(default["score_pct"], explicit0["score_pct"])
+    # And turning them on actually changes the ranking, so "off" is a meaningful state.
+    on = _module()["_compose"](p, **{**_PARAMS, "w_trend": 1.0, "w_rsi": 1.0,
+                                     "trend_fast": 5, "trend_slow": 20})
+    assert "trend" in on["present"] and "rsi" in on["present"]
+    assert not default["score_pct"].equals(on["score_pct"])
+
+
+def test_trend_sleeve_ranks_uptrend_above_downtrend():
+    """The MA-trend sleeve ranks names above their own moving average over ones below it."""
+    p = _sloped_panel({"AAA": 160, "BBB": 120, "CCC": 90, "DDD": 60})   # AAA up hardest
+    parts = _module()["_compose"](
+        p, **{**_PARAMS, "w_insider": 0.0, "w_rating": 0.0, "w_ptrev": 0.0, "w_dtc": 0.0,
+              "w_trend": 1.0, "w_rsi": 0.0, "trend_fast": 5, "trend_slow": 20})
+    assert "trend" in parts["present"]
+    score = parts["score_pct"].loc[p.close.index[80]]               # well past the warm-up
+    assert score["AAA"] > score["BBB"] > score["CCC"] > score["DDD"]
+
+
+def test_rsi_sleeve_ranks_momentum_and_flat_is_neutral():
+    """RSI ranks persistent buying above selling; a flat name has no RSI -> neutral 0.5."""
+    p = _sloped_panel({"AAA": 200, "BBB": 40, "CCC": 150, "DDD": 100})  # DDD flat
+    parts = _module()["_compose"](
+        p, **{**_PARAMS, "w_insider": 0.0, "w_rating": 0.0, "w_ptrev": 0.0, "w_dtc": 0.0,
+              "w_trend": 0.0, "w_rsi": 1.0, "rsi_period": 14})
+    assert "rsi" in parts["present"]                               # 3 of 4 covered -> live
+    bar = p.close.index[80]
+    assert parts["score_pct"].loc[bar, "AAA"] > parts["score_pct"].loc[bar, "BBB"]
+    # The flat name has no RSI (0/0 = NaN), so it is imputed the neutral 0.5 and flagged.
+    assert np.isnan(parts["raw"]["rsi"].loc[bar, "DDD"])
+    assert np.isnan(parts["ranks"]["rsi"].loc[bar, "DDD"])
+    assert parts["filled"]["rsi"].loc[bar, "DDD"]
+
+
+def test_tech_sleeve_warmup_is_neutral_not_dropped():
+    """The long warm-up prefix is neutral-filled, not a reason to drop the whole sleeve."""
+    p = _sloped_panel({"AAA": 160, "BBB": 120, "CCC": 90, "DDD": 60})
+    parts = _module()["_compose"](
+        p, **{**_PARAMS, "w_insider": 0.0, "w_rating": 0.0, "w_ptrev": 0.0, "w_dtc": 0.0,
+              "w_trend": 1.0, "w_rsi": 0.0, "trend_fast": 5, "trend_slow": 30})
+    assert "trend" in parts["present"]                    # coverage is the best-covered bar
+    early = p.close.index[10]                             # inside the 30-bar (slow) warm-up
+    assert parts["ranks"]["trend"].loc[early].isna().all()    # no rank yet...
+    assert parts["filled"]["trend"].loc[early].all()          # ...so every name is neutral 0.5
+    # signals() still returns a valid book despite the warm-up NaNs (no crash, no leverage).
+    sig = _if(p, w_insider=0.0, w_rating=0.0, w_ptrev=0.0, w_dtc=0.0, w_trend=1.0,
+              w_rsi=0.0, trend_fast=5, trend_slow=30)
+    assert sig["weights"].sum(axis=1).max() <= 1.0 + 1e-12
 
 
 def test_explain_reproduces_signals():
@@ -382,6 +506,33 @@ def test_to_grid_empty_is_index_only():
     index = pd.date_range("2024-01-02", periods=4, freq="B", tz="UTC")
     grid = F._to_grid(pd.DataFrame(columns=["symbol", "d", "value"]), index, fill="zero")
     assert grid.index.equals(index) and grid.shape[1] == 0
+
+
+def test_to_grid_level_is_seeded_from_before_the_panel_start():
+    """A level observed before the window must be live at bar 0, not a dead zone.
+
+    Fundamentals/short interest are slow levels: with a lower time bound the first
+    ~quarter of every backtest sat NaN waiting for the first in-window filing
+    (value_factor worked around it by ingesting from 2020 but training from 2021).
+    The as-of join seeds bar 0 from the last pre-window observation — still strictly
+    before the bar, so the PIT guarantee is unchanged.
+    """
+    index = pd.date_range("2024-01-02", periods=5, freq="B", tz="UTC")  # Tue..Fri + Mon
+    long = pd.DataFrame({
+        "symbol": ["AAA", "AAA"],
+        "d": [pd.Timestamp("2023-11-15").date(),      # filed BEFORE the panel start
+              pd.Timestamp("2024-01-03").date()],     # first in-window filing (bar 1)
+        "value": [2.0, 3.5],
+    })
+    grid = F._to_grid(long, index, fill="ffill")
+    assert grid["AAA"].iloc[0] == 2.0                 # seeded, not NaN
+    assert grid["AAA"].iloc[1] == 2.0                 # bar 1 can't see bar 1's filing
+    assert grid["AAA"].iloc[2] == 3.5                 # visible the next bar
+    # A weekend observation is carried onto the next bar, not dropped.
+    saturday = pd.DataFrame({"symbol": ["AAA"], "d": [pd.Timestamp("2024-01-06").date()],
+                             "value": [9.0]})
+    grid2 = F._to_grid(pd.concat([long, saturday]), index, fill="ffill")
+    assert grid2["AAA"].iloc[4] == 9.0                # Mon 01-08 sees Sat's level
 
 
 # --- the strategy's own holdings figure (strategies/informed_flow/plots.py) ---

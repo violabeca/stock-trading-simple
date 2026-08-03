@@ -1,5 +1,6 @@
 """Panel invariants and configuration loading (no database)."""
 
+import pytest
 import yaml
 
 from trading_simple.config import Settings, load_settings
@@ -19,10 +20,8 @@ def test_settings_defaults_and_universe_lookup():
     assert s.ibkr.extended_hours is False        # ETH is opt-in by default
     assert s.backtest.engine == "auto"
     assert s.universe_symbols("starter") == ["AAPL", "SPY"]
-    try:
+    with pytest.raises(KeyError, match="starter"):   # message lists known universes
         s.universe_symbols("nope")
-    except KeyError as exc:
-        assert "starter" in str(exc)             # message lists known universes
 
 
 def test_load_settings_merges_universes_file(tmp_path, monkeypatch):

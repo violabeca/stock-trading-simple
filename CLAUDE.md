@@ -32,9 +32,20 @@ git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook out
 
 - **The strategy contract is sacred.** A strategy = `strategies/<name>/` with a
   pure `signals(panel, **params) -> dict` (+ optional `valid`, `indicators`)
-  and a `config.yaml` with `data / params / sweep / optuna` blocks. Adding a
+  and a `config.yaml` with `data / optuna / params` blocks. Adding a
   strategy must never require touching `src/trading_simple/` — if it seems to,
   the design is wrong; stop and reconsider.
+- **One parameter, one declaration.** `params:` is the whole knob surface: each
+  entry carries `doc`, the shipped `value`, and optionally `search` (the Optuna
+  range) and `grid` (the coarse-sweep list); a bare scalar means value-only, and
+  **no `grid` pins the sweep at `value`**. `strategies._unpack` derives the flat
+  `params` / `sweep` / `optuna["space"]` views the engine consumes and **refuses to
+  load** a config whose `value` its own `search` cannot reach or whose own `grid`
+  excludes. That is not pedantry: both failures are silent, and both shipped here —
+  a sweep grid pinned to values the study had long since moved off meant §10b
+  walk-forward faithfully validated a strategy nobody ran, twice, with no error
+  anywhere. Bump `optuna.study` whenever a `search:` bound changes; a journal that
+  mixes two spaces is two experiments in one file and nothing detects it.
 - **Two execution models; pick the one the strategy actually is.** `signals()`
   returning `entries`/`exits` runs **per-symbol**: every symbol gets its own
   `init_cash` in its own account. Returning a `weights` frame (target fraction of the
@@ -51,6 +62,13 @@ git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook out
   bars a name's *own* weight changes, so a held position is bought once, left to drift
   while other names rotate around it, and sold whole when it leaves — never re-trimmed
   mid-hold (a whole-row mask would re-trim every holding on any single name's rotation).
+  The one opt-in exception is a **concentration cap**: a portfolio strategy that returns a
+  `retrim_k` scalar alongside `weights` has a held name trimmed back to its slot once its
+  realized book weight reaches `retrim_k ×` its target (so a runaway winner cannot dominate
+  the book; freed cash rotates into the next pick). It is off by default
+  (`backtest._retrim_loop`, a simulate-then-adjust fixed point since realized weight is only
+  knowable inside a run), so the benchmark and every strategy that omits it are unchanged;
+  `informed_flow` sets it to `2`.
   A signal strategy returns `cash_frac` (a scalar) alongside `entries`/`exits` to run
   the **cash-shared wallet** variant: ONE `init_cash` book, each entry deploying that
   fraction of the free cash — total invested can never exceed the wallet, the way a
@@ -189,6 +207,19 @@ test, adapt a strategy notebook, then pass:
   == 0.0` means *no prior target*, so it is stored NULL — read as zero it becomes a
   −100% revision. Rank the **revision**, never the target-to-price **level**
   (Han-Kang 2022: price drifts *against* the level, worst in large caps).
+- **FINRA's bulk files are pipe-delimited with NO quoting convention**, so `csv` must
+  read them with `quoting=csv.QUOTE_NONE` (`providers/finra._parse_bulk_file`). A `"` in
+  an issuer name (`"ELEMENTS ""Dogs of the Dow""`) otherwise opens a field that never
+  closes and swallows the rest of the file — surfacing as `field larger than field limit`
+  on a file whose longest line is 278 chars, and aborting the backfill mid-run. **Never
+  answer that error by raising `csv.field_size_limit`**: it "succeeds" while merging
+  15,398 rows into 3,881. This silently cost the DB its whole 2018-2019 short-interest
+  history until 2026-08-02.
+- SEC Form 4 `transactionDate` values are **sometimes wrong in the filing itself** (filers
+  keying 2029 for 2020 — 7 such rows are in the DB). Ingestion stores them verbatim, which
+  is correct for a point-in-time archive, and nothing downstream breaks because
+  `features.py` buckets every sleeve by `known_at` (the filing timestamp), never by the
+  event date. Do not "repair" them.
 - SEC EDGAR (insider provider) requires a User-Agent with a contact email or it
   returns 403; a working default is set, override with `TRADING_SEC_USER_AGENT`.
   Form 4 `primaryDocument` points at the XSL-styled HTML — fetch the raw XML at

@@ -1,8 +1,8 @@
 # ===========================================================================
 # value_factor — daily cross-sectional value + quality ranker on SEC XBRL
 # fundamentals (book-to-price + earnings yield + gross profitability).
-# Blocks: data (what to load, incl. the fundamentals feature matrices), params
-# (single-run defaults), sweep (grid exploration), optuna (study + search space).
+# Layout: data (what panel to load), optuna (study settings), params
+# (every knob: doc + shipped value + optional search space and sweep grid).
 # ===========================================================================
 
 data:
@@ -21,49 +21,64 @@ data:
   # silently becoming a tilt on the handful of names that do have data.
   features: [fund_equity, fund_assets, fund_shares, fund_ni_ttm, fund_gp_ttm]
 
-params:                    # single-backtest defaults; every key is a signals() argument
-  # Composite weights. signals() divides by their SUM, so only the RATIOS matter, and
-  # each factor can be zeroed (ablated). An equal-weight rank composite is the robust
-  # default — a fitted blend overfits badly at ~100 names over a few years.
-  w_bp: 1.0                # book-to-price (Fama-French value)
-  w_ey: 1.0                # earnings yield (value)
-  w_gp: 1.0                # gross profitability (Novy-Marx quality)
-  rebalance_days: 21       # re-select monthly; hold the book fixed in between (low turnover)
-  # THE capital constraint. The book is ONE shared cash account (engine portfolio mode),
-  # split into max_positions slots of 1/max_positions each — a new name is bought only by
-  # selling an existing one, and when fewer names qualify the rest stays in cash.
-  max_positions: 15
-  min_coverage: 0.5        # drop a factor covering less than half the universe
-
-sweep:                     # coarse grid; all satisfy valid(): some weight > 0
-  # The sweep is where factors get ABLATED (a 0.0 column removes that factor).
-  w_bp: [0.0, 1.0]         # 0.0 ablates book-to-price
-  w_ey: [0.0, 1.0]         # 0.0 ablates earnings yield
-  w_gp: [0.0, 1.0]         # 0.0 ablates gross profitability
-  rebalance_days: [21, 63]
-  max_positions: [10, 20]
-
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
 optuna:
   # Objectives are the engine defaults: info_ratio + excess_cagr against an equal-weight
   # buy-and-hold of the SAME panel (backtest.benchmark). A long-only ranker in a rising
   # market earns a positive absolute Sharpe just by being invested, so only the
   # benchmark-relative pair separates stock selection from market exposure.
-  study: value-factor-1d-v1
+  study: value-factor-1d-v2  # v2: 2026-07-19 engine realism (panel-priced costs,
+                           # benchmark mask, ffill feature seeding — the warm-up dead zone
+                           # is materially shorter now) — v1 journals not comparable
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
   n_trials: 400
   min_trades_per_year: 6   # admissibility floor (PER YEAR, not absolute): a monthly
                            # rebalance of ~15 slots turns over slowly — this floors the
                            # trading rate so a near-static book cannot crown a front.
-  space:                   # declarative search space -> optimize.suggest_params
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+params:
+  # Composite weights. signals() divides by their SUM, so only the RATIOS matter, and
+  # each factor can be zeroed (ablated). An equal-weight rank composite is the robust
+  # default — a fitted blend overfits badly at ~100 names over a few years.
+  w_bp:
+    doc: "book-to-price (Fama-French value)"
+    value: 1.0
     # Each factor floats in [0, 3]; 0.0 ablates, and only the ratios matter (signals()
     # renormalizes by the sum), so no fixed numeraire is needed at three dimensions.
-    w_bp:           { type: float, low: 0.0, high: 3.0, step: 0.25 }
-    w_ey:           { type: float, low: 0.0, high: 3.0, step: 0.25 }
-    w_gp:           { type: float, low: 0.0, high: 3.0, step: 0.25 }
+    search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
+    # The sweep is where factors get ABLATED (a 0.0 column removes that factor).
+    grid: [0.0, 1.0]   # 0.0 ablates book-to-price
+  w_ey:
+    doc: "earnings yield (value)"
+    value: 1.0
+    search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
+    grid: [0.0, 1.0]   # 0.0 ablates earnings yield
+  w_gp:
+    doc: "gross profitability (Novy-Marx quality)"
+    value: 1.0
+    search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
+    grid: [0.0, 1.0]   # 0.0 ablates gross profitability
+  rebalance_days:
+    doc: "re-select monthly; hold the book fixed in between (low turnover)"
+    value: 21
     # How often the book re-selects. Shorter chases the ranking (more turnover/cost),
     # longer is stickier; value/quality are slow, so the sensible range is weeks–quarter.
-    rebalance_days: { type: int, low: 5, high: 126, log: true }
+    search: { type: int, low: 5, high: 126, log: true }
+    grid: [21, 63]
+  max_positions:
+    doc: >-
+      Slots in the book; each holds 1/max_positions of the shared account at entry, so a new
+      name is bought only by selling an existing one and unfilled slots stay in cash.
+    value: 15
     # How concentrated the book is: fewer slots = a purer top-of-ranking signal but a
     # lumpier, riskier book.
-    max_positions:  { type: int, low: 5, high: 30 }
+    search: { type: int, low: 5, high: 30 }
+    grid: [10, 15, 20]
+  min_coverage:
+    doc: "drop a factor covering less than half the universe"
+    value: 0.5

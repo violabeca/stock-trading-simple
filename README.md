@@ -74,7 +74,7 @@ src/trading_simple/
   data.py                     DB → Panel (wide adjusted OHLCV matrices)
   features.py                 DB alt-data tables → Panel.features matrices
   backtest.py                 THE engine: run / sweep / metrics / helpers
-  optimize.py                 Optuna: journal storage, Pareto front, pick_best, boundary check
+  optimize.py                 Optuna: journal storage, Pareto front, pick_best, boundary + stability checks
   plots.py                    every figure, one consistent plotly design
   strategies.py               loads a strategy folder by name
   jobs.py                     notebooks → CLI subprocess handoff
@@ -90,6 +90,8 @@ strategies/
   candle_scalp/               strategy 6: intraday reversal candles at a stretched location, built to be falsified  (+ notebook)
   support_bounce/             strategy 7: intraday tested-support mean reversion  (+ notebook)
   value_factor/               strategy 8: DAILY cross-sectional value + quality on SEC XBRL fundamentals  (+ notebook)
+  conviction_flow/            strategy 9: informed_flow plus selectivity gates (quality, agreement, score floor)  (+ notebook)
+  gap_and_go/                 strategy 10: intraday opening-range breakout on overnight gaps  (+ notebook)
 notebooks/
   01_universe_screener.ipynb  find symbols worth loading
   02_backfill.ipynb           load daily AND intraday price history
@@ -229,7 +231,12 @@ scale-invariant — so what actually constrains the book is the number of positi
 may hold, not the `$10,000`. Rebalancing is **event-driven per name**: a target is
 placed only when a name's own weight changes (`backtest.rotation_targets` masks per
 name), so a held position is bought once, left to drift while other names rotate around
-it, and sold whole when it leaves — never re-trimmed mid-hold.
+it, and sold whole when it leaves. The one exception is an opt-in **concentration cap**:
+a portfolio strategy that returns a `retrim_k` scalar alongside its `weights` has any held
+name trimmed back to its slot once its realized book weight reaches `retrim_k ×` its
+target (e.g. `2` = double), so a single runaway winner cannot come to dominate the book;
+the freed cash rotates into the next name the strategy picks. The cap is off by default
+(`backtest._retrim_loop`), so the benchmark and every strategy that omits it are unaffected.
 
 There is a third, wallet-shaped variant of the signal path — and it is **the repo
 default**: a strategy returning a scalar `cash_frac` alongside `entries`/`exits` runs
@@ -324,8 +331,22 @@ No engine edits — ever. Three files in one folder:
        rank = score(panel).rank(axis=1, ascending=False)      # your cross-sectional score
        return {"weights": bt.next_bar(rank <= top_k).astype(float) / top_k}
    ```
-3. **Fill `config.yaml`** — every `signals()` argument appears under `params:`
-   (defaults) and `optuna.space:` (search ranges); optionally `sweep:` lists.
+3. **Fill `config.yaml`** — every `signals()` argument gets **one entry** under
+   `params:`, carrying what it means, what ships, and what may vary:
+
+   ```yaml
+   params:
+     top_k:
+       doc: How many names the book holds.
+       value: 10                                   # what SHIPS — the source of truth
+       search: {type: int, low: 5, high: 30}       # omit -> the study never touches it
+       grid: [5, 10, 20]                           # omit -> the sweep PINS it at `value`
+     cash_frac: 0.25                               # bare scalar = value only
+   ```
+
+   The config refuses to load if `value` is unreachable by its own `search`, or
+   missing from its own `grid` — the two ways a sweep or walk-forward ends up
+   validating a strategy nobody runs.
 
 Then copy either strategy notebook, change the name in `strategies.load(...)`,
 and Run All — the load/backtest/sweep/optimize/inspect flow is identical for
@@ -337,9 +358,13 @@ through exactly this recipe with a validation gate at the end.
 * **Global** (`config/settings.yaml`): database, IBKR connection/pacing,
   trading costs, engine choice, per-symbol exchange overrides, hand-edited
   universes. Every key maps 1:1 onto `src/trading_simple/config.py`.
-* **Per strategy** (`strategies/<name>/config.yaml`): four blocks —
-  `data` (which panel to load), `params` (single-run defaults),
-  `sweep` (grid lists), `optuna` (study name, sampler, trials, search space).
+* **Per strategy** (`strategies/<name>/config.yaml`): three blocks —
+  `data` (which panel to load), `optuna` (study name, sampler, trials), and
+  `params`, where each parameter is declared **once** with its `doc`, its shipped
+  `value`, and optionally the `search` range and `grid` list it varies over.
+  There is no separate sweep or space block: a knob's shipped value and the
+  ranges built around it cannot sit in two places and disagree, which is exactly
+  how a walk-forward once spent four folds validating a strategy nobody ran.
 * **Environment overrides** beat YAML: `TRADING_<SECTION>__<KEY>`, e.g.
   `TRADING_IBKR__PORT=4001`, `TRADING_DB__HOST=otherhost`. A `.env` file at
   the repo root is read automatically (see `.env.example`).
@@ -357,6 +382,9 @@ tsim subset    --universe HighOctane --top 20 pin the most liquid names as <U>To
 tsim backfill  --universe X --bar 1d --since 2015-01-01
                --bar 1m [--extended-hours]    provider picked by bar (yfinance/IBKR)
 tsim optimize  --strategy volume_momentum [--n-trials 300] [--study S] [--sampler tpe]
+tsim altdata   --dataset all --universe X --since 2020-01-01
+                                              ingest alt-data (prefer notebooks/03 — it audits)
+tsim altdata-status [--universe X] [--since D] per-(dataset,symbol,source) coverage + ledger view
 tsim init-db                                  apply schema.sql (no-op on the live DB)
 ```
 
@@ -398,6 +426,18 @@ universes (**HighOctane** = high volatility, **Trailblazers** = momentum,
 **SteadyEddies** = low volatility, **CheapQuality** = value); `tsim
 import-universes` copies those lists here, and `tsim subset` carves a pinned
 liquid top-N out of any of them (how `HighOctaneTop20`, the donchian_breakout
-universe, is defined). It never creates or migrates that database; `tsim
+universe, is defined).
+
+> **`tsim subset` is not point-in-time.** It ranks by dollar volume over
+> `now() - 90 days`, so a universe pinned today is *selected using data from
+> inside and after* any window you then backtest on. Measured cost:
+> `HighOctaneTop20`, pinned 2026-07, has an equal-weight buy-and-hold CAGR of
+> **+460%/yr** over the 2025-07 → 2026-04 window five 1m strategies test on —
+> which, since the objectives are benchmark-relative, is subtracted from every
+> trial. For a backtest, build the universe with a ranking window that closes
+> **before** the backtest opens: `notebooks/01_universe_screener.ipynb` §8 does
+> exactly that (`Morning200`, hurdle +47%/yr) and needs no new data.
+
+It never creates or migrates that database; `tsim
 init-db` merely re-applies the identical idempotent schema. Do not point it at
 a fresh Postgres without TimescaleDB installed.

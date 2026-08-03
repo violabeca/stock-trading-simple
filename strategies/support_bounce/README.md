@@ -86,7 +86,8 @@ cannot reorder parameter sets (the notebook's cost-stress rerun brackets it).
 Pareto front, the "tested level" story added nothing over generic dip-buying —
 that is a finding, not a success. If nothing admissible (≥300 train trades)
 survives the holdout and the cost-stress rerun, the edge is not there at this
-horizon; say so. Known caveats: overnight gaps through a stop fill AT the stop
+horizon; say so. Known caveats: overnight gaps through a stop fill at the (worse)
+next open with slippage charged (engine-pessimistic since 2026-07-19)
 level (engine-optimistic — the notebook scans trade records for those fills),
 and on 1m bars a bracket's intrabar win rate is not trustworthy — judge picks
 on the time-exit/EOD population.

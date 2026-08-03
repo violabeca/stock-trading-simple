@@ -1,7 +1,7 @@
 # ===========================================================================
 # keltner_reversion — all tunable settings for this strategy (intraday, 1m).
-# Blocks: data (what to load), params (single-run defaults), sweep (grid
-# exploration), optuna (optimization study + search space).
+# Layout: data (what panel to load), optuna (study settings), params
+# (every knob: doc + shipped value + optional search space and sweep grid).
 # ===========================================================================
 
 data:
@@ -12,30 +12,12 @@ data:
   session: regular         # bands assume one consistent session
   max_symbols: 20          # the pinned Top20 subset — matches the universe size
 
-params:                    # single-backtest defaults; every key is a signals() argument
-  trend_window: 960        # regime SMA (bars = minutes on 1m); ~2.5 sessions
-  band_window: 120         # midline SMA (bars); the reversion target and exit level
-  atr_window: 30           # ATR smoothing window (bars); sets the band scale
-  band_mult: 6.0           # entry stretch in ATRs below/above the midline (THE knob)
-                           # shallow stretches churn to death on costs at 1m — go deep
-  horizon: 240             # time stop (bars held) when the reversion never comes
-  direction: long          # long | short | both (short fades rallies in downtrends)
-  sl_mult: 0.0             # stop-loss distance in ATRs at entry; 0 disables
-  skip_open: 15            # no entries in the first N minutes of a session
-  skip_close: 15           # no entries in the last N minutes of a session
-  eod_exit: false          # false = deep dips may be held overnight (the gap-back pays);
-                           # true = strictly intraday — both are optimized below
-  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
-                           # deploys 25% of the FREE cash — params-only, not searched
-
-sweep:                     # coarse grid (24 combos; valid() reads band+trend, keep both here)
-  trend_window: [480, 960]
-  band_window: [60, 120]
-  band_mult: [5.0, 7.0, 9.0]
-  horizon: [120, 360]
-
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: keltner-1m-v3     # v3: capital model changed to one shared $10k wallet — v2
+  study: keltner-1m-v4     # v4: 2026-07-19 engine realism (panel-priced costs +
+                           # pessimistic stop fills, exit-wins signal conflicts) — v3 journals not comparable.
+                           # v3: capital model changed to one shared $10k wallet — v2
                            # scored independent per-symbol books; journal stays on disk
   sampler: nsga2           # nsga2 | tpe | random
   seed: 7
@@ -43,14 +25,60 @@ optuna:
   min_trades_per_year: 300  # admissibility floor (PER YEAR, not absolute — a short
                            # window shouldn't need fewer trades to pass): fewer-trade
                            # trials are pruned in-objective (a lucky fill can fake info_ratio)
-  space:                   # declarative search space -> optimize.suggest_params
-    trend_window: { type: int,   low: 60,   high: 2000, log: true }  # 1h .. ~5 sessions; longer
-                           # filters stop being an intraday regime and fit the train tape (v1 finding)
-    band_window:  { type: int,   low: 5,    high: 390,  log: true }
-    atr_window:   { type: int,   low: 5,    high: 120,  log: true }
-    band_mult:    { type: float, low: 0.25, high: 12.0, step: 0.25 }
-    horizon:      { type: int,   low: 5,    high: 1200, log: true }  # up to ~3 sessions (multi-day holds with eod_exit: false)
-    sl_mult:      { type: float, low: 0.0,  high: 6.0,  step: 0.5 }  # 0 = stop off, searchable
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+params:
+  trend_window:
+    doc: "regime SMA (bars = minutes on 1m); ~2.5 sessions"
+    value: 960
+    search: { type: int, low: 60, high: 2000, log: true }   # 1h .. ~5 sessions; longer filters stop being an intraday regime and fit the train tape (v1 finding)
+    grid: [480, 960]
+  band_window:
+    doc: "midline SMA (bars); the reversion target and exit level"
+    value: 120
+    search: { type: int, low: 5, high: 390, log: true }
+    grid: [60, 120]
+  atr_window:
+    doc: "ATR smoothing window (bars); sets the band scale"
+    value: 30
+    search: { type: int, low: 5, high: 120, log: true }
+  band_mult:
+    doc: >-
+      entry stretch in ATRs below/above the midline (THE knob) shallow stretches churn to
+      death on costs at 1m — go deep
+    value: 6.0
+    search: { type: float, low: 0.25, high: 12.0, step: 0.25 }
+    grid: [5.0, 6.0, 7.0, 9.0]
+  horizon:
+    doc: "time stop (bars held) when the reversion never comes"
+    value: 240
+    search: { type: int, low: 5, high: 1200, log: true }   # up to ~3 sessions (multi-day holds with eod_exit: false)
+    grid: [120, 240, 360]
+  direction:
+    doc: "long | short | both (short fades rallies in downtrends)"
+    value: long
     # (a boundary "widen low" flag on sl_mult just means the front prefers no stop — 0 is the floor)
-    direction:    { type: categorical, choices: [long, both] }       # fade dips only, or rips too
-    eod_exit:     { type: categorical, choices: [true, false] }      # flat at close vs hold overnight
+    search: { type: categorical, choices: [long, both] }   # fade dips only, or rips too
+  sl_mult:
+    doc: "stop-loss distance in ATRs at entry; 0 disables"
+    value: 0.0
+    search: { type: float, low: 0.0, high: 6.0, step: 0.5 }   # 0 = stop off, searchable
+  skip_open:
+    doc: "no entries in the first N minutes of a session"
+    value: 15
+  skip_close:
+    doc: "no entries in the last N minutes of a session"
+    value: 15
+  eod_exit:
+    doc: >-
+      false = deep dips may be held overnight (the gap-back pays); true = strictly intraday
+      — both are optimized below
+    value: false
+    search: { type: categorical, choices: [true, false] }   # flat at close vs hold overnight
+  cash_frac:
+    doc: >-
+      ONE shared $10k wallet (engine cash-shared mode): each entry deploys 25% of the FREE
+      cash — params-only, not searched
+    value: 0.25

@@ -123,6 +123,13 @@ def _cik_map() -> dict[str, int]:
     Fetched once per process. Tickers are upper-cased; EDGAR's dotted classes
     (``BRK.B``) are stored both dotted and dash-formed so either resolves.
 
+    When the directory lists one ticker under several CIKs, the LOWEST wins:
+    operating companies registered decades ago carry low CIKs, while the
+    colliding entries are recently-registered shells (EDGAR listed ``XOM``
+    under both Exxon Mobil Corp, CIK 34088, and an "ExxonMobil Holdings Corp"
+    shell, CIK 2115436 — last-write-wins resolved to the shell, so every
+    SEC-sourced sleeve silently returned zero rows for XOM).
+
     Returns:
         Mapping of ticker to integer CIK.
     """
@@ -131,9 +138,10 @@ def _cik_map() -> dict[str, int]:
         data = _get(_TICKERS_URL, as_json=True)
         out: dict[str, int] = {}
         for row in data.values():
-            tkr = str(row["ticker"]).upper()
-            out[tkr] = int(row["cik_str"])
-            out[tkr.replace("-", ".")] = int(row["cik_str"])
+            tkr, cik = str(row["ticker"]).upper(), int(row["cik_str"])
+            for key in (tkr, tkr.replace("-", ".")):
+                if key not in out or cik < out[key]:
+                    out[key] = cik
         _cik_cache = out
     return _cik_cache
 

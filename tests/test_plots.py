@@ -141,6 +141,47 @@ def test_equity_traces_share_one_x_grid():
     assert fig.layout.xaxis.type == "date"
 
 
+def test_sensitivity_draws_every_knob_and_marks_the_pick():
+    """One profile per perturbed knob, each with its picked value marked on it.
+
+    The figure this replaced marginalized a global grid over a PINNED parameter, so it
+    drew a one-row heatmap that could not show the optimum at all.
+    """
+    star = pd.DataFrame([
+        {"perturbed": "", "offset": 0.0, "fast": 20, "slow": 60, "excess_cagr": 0.10},
+        {"perturbed": "fast", "offset": -0.05, "fast": 15, "slow": 60, "excess_cagr": 0.04},
+        {"perturbed": "fast", "offset": 0.05, "fast": 25, "slow": 60, "excess_cagr": 0.08},
+        {"perturbed": "slow", "offset": -0.05, "fast": 20, "slow": 50, "excess_cagr": -0.02},
+        {"perturbed": "slow", "offset": 0.05, "fast": 20, "slow": 70, "excess_cagr": 0.09},
+    ])
+    fig = plots.plot_sensitivity(star)
+    bars = [t for t in fig.data if t.type == "bar"]
+    assert len(bars) == 1 and set(bars[0].y) == {"fast", "slow"}          # one tornado bar each
+    picks = [t for t in fig.data if t.type == "scatter" and t.mode == "markers"]
+    assert [tuple(t.y) for t in picks] == [(0.10,), (0.10,)]             # the pick, on both
+    # A knob whose neighborhood reaches below the benchmark is drawn as a loss.
+    assert dict(zip(bars[0].y, bars[0].marker.color, strict=True))["slow"] == plots._LOSS
+    assert len(fig.layout.shapes) >= 2                                    # zero lines survived
+
+
+def test_sensitivity_profiles_zoom_to_their_own_neighborhood():
+    """A near-flat knob gets a near-flat axis, not one stretched down to zero.
+
+    Both profile axes are pinned explicitly because plotly grows an *autoranged*
+    axis to fit its shapes: the ``y=0`` reference line was dragging every panel to
+    zero, so a knob moving the metric by a tenth of a percent drew as a dead flat
+    line at the top of a 30-point axis.
+    """
+    star = pd.DataFrame([
+        {"perturbed": "", "offset": 0.0, "q_in": 0.75, "excess_cagr": 0.3012},
+        {"perturbed": "q_in", "offset": -0.05, "q_in": 0.73, "excess_cagr": 0.3008},
+        {"perturbed": "q_in", "offset": 0.05, "q_in": 0.77, "excess_cagr": 0.3021},
+    ])
+    lo, hi = plots.plot_sensitivity(star).layout.yaxis2.range
+    assert hi - lo < 0.01, "the profile axis is not zoomed to its own neighborhood"
+    assert lo > 0.30 and hi > 0.3021, "the zero line pulled the profile axis open again"
+
+
 def test_daily_panel_is_untouched(panel):
     """Daily figures already fit the budget, so thinning must be a no-op for them."""
     res = bt.run(panel, {"entries": panel.close > 0, "exits": panel.close < 0},
@@ -148,3 +189,36 @@ def test_daily_panel_is_untouched(panel):
     curve = bt.equity_curve(res)
     fig = plots.plot_equity(curve)
     assert len(fig.data[0].x) == len(curve)
+
+
+def coverage_timeline() -> pd.DataFrame:
+    """A synthetic monthly coverage timeline: one full name, one late, one holed."""
+    months = pd.date_range("2015-01-01", "2015-12-01", freq="MS", tz="UTC")
+    rows = [{"symbol": "FULL", "period": m, "bars": 21, "regular": 21, "extended": 0}
+            for m in months]
+    rows += [{"symbol": "LATE", "period": m, "bars": 21, "regular": 21, "extended": 0}
+             for m in months[6:]]
+    rows += [{"symbol": "HOLED", "period": m, "bars": 21, "regular": 21, "extended": 0}
+             for m in months if m.month != 5]
+    return pd.DataFrame(rows)
+
+
+def test_coverage_map_separates_a_late_start_from_a_hole():
+    """The whole point of the map: absent months stay absent instead of closing up."""
+    fig = plots.plot_coverage(coverage_timeline())
+    z = pd.DataFrame(fig.data[0].z, index=list(fig.data[0].y))
+    assert z.shape == (3, 12), "the bucket axis lost the months nobody covers"
+    assert list(z.index) == ["FULL", "HOLED", "LATE"], "rows are not ordered by first bucket"
+    assert z.loc["LATE"].isna().sum() == 6, "the late listing's empty months got filled in"
+    assert pd.isna(z.loc["HOLED"].iloc[4]), "the mid-history hole was silently closed up"
+    assert z.loc["FULL"].notna().all() and (z.loc["FULL"] == 1.0).all()
+
+
+def test_coverage_map_shades_a_partial_bucket_below_a_full_one():
+    """Shading is relative to the fullest name that bucket, so a thin month reads thin."""
+    tl = coverage_timeline()
+    tl.loc[(tl["symbol"] == "FULL") & (tl["period"] == tl["period"].max()), "bars"] = 7
+    trace = plots.plot_coverage(tl).data[0]
+    z = pd.DataFrame(trace.z, index=list(trace.y))
+    assert z.loc["FULL"].iloc[-1] == pytest.approx(1 / 3)
+    assert z.loc["LATE"].iloc[-1] == 1.0, "the fullest name that month is not the reference"

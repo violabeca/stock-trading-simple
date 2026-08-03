@@ -1,7 +1,7 @@
 # ===========================================================================
 # squeeze_breakout — all tunable settings for this strategy (intraday, 1m).
-# Blocks: data (what to load), params (single-run defaults), sweep (grid
-# exploration), optuna (optimization study + search space).
+# Layout: data (what panel to load), optuna (study settings), params
+# (every knob: doc + shipped value + optional search space and sweep grid).
 # ===========================================================================
 
 data:
@@ -12,38 +12,12 @@ data:
   session: regular         # channel + volume profile assume one consistent session
   max_symbols: 20          # the pinned Top20 subset — matches the universe size
 
-params:                    # single-backtest defaults; every key is a signals() argument
-  break_window: 60         # channel lookback (bars = minutes on 1m); breakout = new N-bar extreme
-  trend_window: 390        # regime SMA (bars; 390 = one session); 0 disables the trend gate
-  atr_window: 14           # ATR smoothing (bars); squeeze numerator + spot leg of the stop scale
-  squeeze_window: 390      # ATR baseline (bars) — "normal" volatility for gate AND stop scale
-  squeeze_thresh: 0.6      # squeeze gate: lagged ATR/baseline must be below; 0 disables.
-                           # Measured on this panel the ratio's MEDIAN is ~0.82 — the
-                           # selective regime is ~0.45-0.7, so 0.8 would be a coin-flip gate
-  squeeze_lag: 5           # bars the squeeze ratio is lagged ("quiet before the move STARTED")
-  vol_mult: 3.0            # participation gate: k-bar volume sum vs expected; 0 disables
-  vol_bars: 3              # bars in the participation sums (decorrelates gate from the break bar)
-  profile_days: 10         # sessions in the time-of-day volume baseline
-  sl_mult: 2.0             # stop distance in stop-scale units (max of ATR and its baseline)
-  tp_mult: 0.0             # profit target in the same units; 0 = no target, winners run
-  horizon: 60              # time stop (bars held) when the break goes nowhere
-  direction: both          # long | short | both (gates are symmetric)
-  skip_open: 15            # no entries in the first N minutes of a session
-  skip_close: 15           # no entries in the last N minutes of a session
-  eod_exit: true           # flat on each session's final bar; nothing held overnight
-  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
-                           # deploys 25% of the FREE cash — params-only, not searched
-
-sweep:                     # coarse grid (24 combos; valid() reads trend/break/sl/tp — keep all here)
-  squeeze_thresh: [0.5, 0.6, 0.7]
-  vol_mult: [2.0, 4.0]
-  break_window: [30, 60]
-  trend_window: [390]
-  sl_mult: [2.0]
-  tp_mult: [0.0, 3.0]      # no-target vs 1.5R bracket, side by side
-
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: squeeze-1m-v2     # v2: capital model changed to one shared $10k wallet — v1
+  study: squeeze-1m-v3     # v3: 2026-07-19 engine realism (panel-priced costs +
+                           # pessimistic stop fills, exit-wins signal conflicts) — v2 journals not comparable.
+                           # v2: capital model changed to one shared $10k wallet — v1
                            # scored independent per-symbol books (and predates the
                            # benchmark-relative objectives); journal stays on disk
   sampler: nsga2           # nsga2 | tpe | random
@@ -52,17 +26,81 @@ optuna:
   min_trades_per_year: 300  # admissibility floor (PER YEAR, not absolute — a short
                            # window shouldn't need fewer trades to pass): fewer-trade
                            # trials are pruned in-objective (a lucky fill can fake info_ratio)
-  space:                   # declarative search space -> optimize.suggest_params
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+params:
+  break_window:
+    doc: "channel lookback (bars = minutes on 1m); breakout = new N-bar extreme"
+    value: 60
     # Gates stay ON everywhere in these ranges — turning a gate off is the notebook's
     # ablation job, not the optimizer's. A front piling on squeeze_thresh's high edge or
     # vol_mult's low edge means "gate not earning its keep": remove it, don't widen.
-    break_window:   { type: int,   low: 15,   high: 240, log: true }
-    trend_window:   { type: categorical, choices: [240, 390, 780] }  # regime switch, not a fine dial
-    squeeze_thresh: { type: float, low: 0.45, high: 0.85, step: 0.05 }  # 0.45 ~ 2nd pct, 0.85 ~ median
-    vol_mult:       { type: float, low: 1.5,  high: 6.0,  step: 0.25 }
-    sl_mult:        { type: float, low: 1.0,  high: 5.0,  step: 0.25 }  # <1 ATR = noise-floor stops
-    tp_mult:        { type: float, low: 0.0,  high: 10.0, step: 0.5 }
+    search: { type: int, low: 15, high: 240, log: true }
+    grid: [30, 60]
+  trend_window:
+    doc: "regime SMA (bars; 390 = one session); 0 disables the trend gate"
+    value: 390
+    search: { type: categorical, choices: [240, 390, 780] }   # regime switch, not a fine dial
+    grid: [390]
+  atr_window:
+    doc: "ATR smoothing (bars); squeeze numerator + spot leg of the stop scale"
+    value: 14
+  squeeze_window:
+    doc: "ATR baseline (bars) \u2014 \"normal\" volatility for gate AND stop scale"
+    value: 390
+  squeeze_thresh:
+    doc: >-
+      squeeze gate: lagged ATR/baseline must be below; 0 disables. Measured on this panel
+      the ratio's MEDIAN is ~0.82 — the selective regime is ~0.45-0.7, so 0.8 would be a
+      coin-flip gate
+    value: 0.6
+    search: { type: float, low: 0.45, high: 0.85, step: 0.05 }   # 0.45 ~ 2nd pct, 0.85 ~ median
+    grid: [0.5, 0.6, 0.7]
+  squeeze_lag:
+    doc: "bars the squeeze ratio is lagged (\"quiet before the move STARTED\")"
+    value: 5
+  vol_mult:
+    doc: "participation gate: k-bar volume sum vs expected; 0 disables"
+    value: 3.0
+    search: { type: float, low: 1.5, high: 6.0, step: 0.25 }
+    grid: [2.0, 3.0, 4.0]
+  vol_bars:
+    doc: "bars in the participation sums (decorrelates gate from the break bar)"
+    value: 3
+  profile_days:
+    doc: "sessions in the time-of-day volume baseline"
+    value: 10
+  sl_mult:
+    doc: "stop distance in stop-scale units (max of ATR and its baseline)"
+    value: 2.0
+    search: { type: float, low: 1.0, high: 5.0, step: 0.25 }   # <1 ATR = noise-floor stops
+    grid: [2.0]
+  tp_mult:
+    doc: "profit target in the same units; 0 = no target, winners run"
+    value: 0.0
+    search: { type: float, low: 0.0, high: 10.0, step: 0.5 }
+    grid: [0.0, 3.0]   # no-target vs 1.5R bracket, side by side
+  horizon:
+    doc: "time stop (bars held) when the break goes nowhere"
+    value: 60
     # (a boundary "widen low" flag on tp_mult just means the front prefers no target — 0 is the floor)
-    horizon:        { type: int,   low: 15,   high: 390,  log: true }   # <15m rarely clears costs
-    # frozen structural params (not searched): atr_window, squeeze_window, squeeze_lag,
-    # vol_bars, profile_days, direction, skip_open/skip_close, eod_exit
+    search: { type: int, low: 15, high: 390, log: true }   # <15m rarely clears costs
+  direction:
+    doc: "long | short | both (gates are symmetric)"
+    value: both
+  skip_open:
+    doc: "no entries in the first N minutes of a session"
+    value: 15
+  skip_close:
+    doc: "no entries in the last N minutes of a session"
+    value: 15
+  eod_exit:
+    doc: "flat on each session's final bar; nothing held overnight"
+    value: true
+  cash_frac:
+    doc: >-
+      ONE shared $10k wallet (engine cash-shared mode): each entry deploys 25% of the FREE
+      cash — params-only, not searched
+    value: 0.25

@@ -36,9 +36,10 @@ donchian's exit thesis; the bracket is this one's.
 Engine semantics worth knowing (vectorbt, verified): stop fractions are read
 at the FILL bar's row and anchor at that bar's close, activating the next
 bar; when one bar spans both stop and target the STOP fills (pessimistic);
-a stop hit swallows same-bar signal exits; stop legs pay fees but no
-slippage, and a bar gapping through a stop fills at the stop level
-(optimistic — engine-level, shared by every strategy here). As everywhere in
+a stop hit swallows same-bar signal exits; stop legs are market orders
+(fees AND slippage), and a bar gapping through a stop fills at its true
+open (engine-pessimistic since 2026-07-19, shared by every strategy here,
+via ``open=`` + ``stop_exit_price="stopmarket"``). As everywhere in
 this repo, ``exit_after`` schedules a time exit for every *signal*, including
 ones ignored while a position was already open — phantom exits can clip a
 later trade early; rare at this selectivity.

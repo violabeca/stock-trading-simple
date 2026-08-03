@@ -3,6 +3,7 @@
 import pandas as pd
 import pytest
 
+from trading_simple import backtest as bt
 from trading_simple import strategies
 
 
@@ -22,6 +23,103 @@ def test_loaded_strategy_shape():
     assert callable(strat.signals) and callable(strat.valid)
     assert strat.data["bar"] in {"1d", "1m"}
     assert set(strat.optuna["space"]) <= set(strat.params)
+
+
+# --- the unified params: block ------------------------------------------------
+def _write(tmp_path, params: str):
+    """A minimal strategy folder whose config carries the given params block."""
+    folder = tmp_path / "strategies" / "probe"
+    folder.mkdir(parents=True)
+    (folder / "strategy.py").write_text("def signals(panel, **p):\n    return {}\n")
+    (folder / "config.yaml").write_text(f"data:\n  bar: 1d\nparams:\n{params}")
+    return folder
+
+
+@pytest.fixture
+def probe_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(strategies, "STRATEGIES_DIR", tmp_path / "strategies")
+    return tmp_path
+
+
+def test_params_block_derives_all_three_views(probe_dir):
+    _write(probe_dir, """  window:
+    doc: how far back
+    value: 20
+    search: {type: int, low: 5, high: 100}
+    grid: [10, 20]
+  pinned: 0.25
+""")
+    strat = strategies.load("probe")
+    assert strat.params == {"window": 20, "pinned": 0.25}      # scalar shorthand included
+    assert strat.sweep == {"window": [10, 20]}                 # `pinned` has no grid ...
+    assert strat.optuna["space"] == {"window": {"type": "int", "low": 5, "high": 100}}
+    assert strat.docs == {"window": "how far back"}
+
+
+def test_value_outside_its_own_search_is_rejected(probe_dir):
+    """A shipped value the study can never suggest makes every boundary report a fiction."""
+    _write(probe_dir, """  window:
+    value: 200
+    search: {type: int, low: 5, high: 100}
+""")
+    with pytest.raises(ValueError, match="search space .* cannot reach"):
+        strategies.load("probe")
+
+
+def test_grid_that_cannot_express_the_shipped_value_is_rejected(probe_dir):
+    """THE regression: a walk-forward re-picking from this grid validates another strategy.
+
+    It shipped twice — informed_flow's grid pinned q_in=0.75/max_positions=15 while the
+    study ran 0.85/8, so four folds faithfully scored a strategy nobody runs, with no error
+    anywhere. The config now refuses to load instead.
+    """
+    _write(probe_dir, """  window:
+    value: 30
+    grid: [10, 20]
+""")
+    with pytest.raises(ValueError, match="validating a strategy this config does not run"):
+        strategies.load("probe")
+
+
+def test_categorical_value_must_be_a_choice(probe_dir):
+    _write(probe_dir, """  mode:
+    value: sideways
+    search: {type: categorical, choices: [long, short]}
+""")
+    with pytest.raises(ValueError, match="cannot reach"):
+        strategies.load("probe")
+
+
+def test_typo_in_an_entry_key_is_rejected(probe_dir):
+    """`serach:` would otherwise mean 'not searched' — silently, and forever."""
+    _write(probe_dir, """  window:
+    value: 20
+    serach: {type: int, low: 5, high: 100}
+""")
+    with pytest.raises(ValueError, match="unknown key"):
+        strategies.load("probe")
+
+
+@pytest.mark.parametrize("name", strategies.available())
+def test_every_shipped_config_satisfies_its_own_invariants(name):
+    """Every strategy in the repo — the check that keeps the fleet aligned, not just one.
+
+    The final assert goes one step beyond what :func:`strategies._unpack` can see: it
+    builds the real grid, so a shipped value that survives the declaration check but is
+    filtered out by ``valid()`` (an exit band crossing its entry band, say) still fails.
+    """
+    strat = strategies.load(name)                    # raises if either invariant is broken
+    for key, grid in strat.sweep.items():
+        assert strat.params[key] in grid, f"{name}.{key} ships a value its grid excludes"
+    assert set(strat.optuna["space"]) <= set(strat.params)
+    assert not set(strat.docs) - set(strat.params)
+
+    combos = bt.grid_from_config(strat.sweep, strat.valid)
+    assert combos or not strat.sweep, f"{name}: valid() rejects every grid combo"
+    for key in strat.sweep:
+        assert strat.params[key] in {c[key] for c in combos}, (
+            f"{name}: valid() filters every combo carrying the shipped {key}="
+            f"{strat.params[key]}; a walk-forward could never re-pick it")
 
 
 # --- volume_momentum signal logic ---------------------------------------------

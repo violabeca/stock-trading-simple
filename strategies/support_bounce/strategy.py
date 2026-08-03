@@ -50,8 +50,9 @@ fails loudly. Engine stop semantics (vectorbt-verified, shared by every
 strategy here): stop fractions anchor at the fill bar's close and activate
 the next bar, evaluated intrabar against high/low; when one bar spans both
 stop and target the STOP fills (pessimistic); a gap through a stop fills at
-the stop level (optimistic for overnight holds — judge ``eod_exit: false``
-configs with the notebook's gap scan). On a 1-minute bar the intrabar path is
+the (worse) next open with slippage charged — engine-pessimistic since
+2026-07-19, so ``eod_exit: false`` configs now pay overnight gap-throughs in
+full (the notebook's gap scan shows where). On a 1-minute bar the intrabar path is
 unknown, so a tight bracket's win rate is not trustworthy — judge on the
 time-stop / EOD exit population.
 """

@@ -17,6 +17,7 @@ None`` to draw every bar; figures then switch to ``Scattergl`` above
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -161,7 +162,7 @@ def _intraday_breaks(index: pd.DatetimeIndex) -> list[dict] | None:
             for i, gap in diffs[diffs > step].items()] or None
 
 
-def plot_sweep(stats: pd.DataFrame, *, metric: str = "sharpe", top: int = 20) -> go.Figure:
+def plot_sweep(stats: pd.DataFrame, *, metric: str = "excess_cagr", top: int = 20) -> go.Figure:
     """Ranked horizontal bars of a sweep's best parameter combos.
 
     Bar color encodes the metric's sign (blue positive, red negative); the
@@ -195,7 +196,7 @@ def plot_sweep(stats: pd.DataFrame, *, metric: str = "sharpe", top: int = 20) ->
                  height=max(300, 24 * len(best) + 120))
 
 
-def plot_heatmap(stats: pd.DataFrame, *, x: str, y: str, metric: str = "sharpe") -> go.Figure:
+def plot_heatmap(stats: pd.DataFrame, *, x: str, y: str, metric: str = "excess_cagr") -> go.Figure:
     """Mean ``metric`` over two parameters (marginalizing the others).
 
     Uses the diverging blue/red scale centered at zero, so sign is readable
@@ -574,7 +575,7 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
 
 
 def plot_heatmap_grid(stats: pd.DataFrame, *, pairs: list[tuple[str, str]],
-                      metrics: tuple[str, ...] = ("sharpe", "total_return")) -> go.Figure:
+                      metrics: tuple[str, ...] = ("excess_cagr", "sharpe")) -> go.Figure:
     """Small-multiple heatmaps: one row per metric, one column per parameter pair.
 
     The multi-objective view of a sweep: the same parameter pairs judged by
@@ -617,21 +618,201 @@ def plot_heatmap_grid(stats: pd.DataFrame, *, pairs: list[tuple[str, str]],
     return fig
 
 
-def plot_coverage(cov: pd.DataFrame) -> go.Figure:
-    """Stored bars per symbol, split into regular vs extended session.
+def _pad(values: pd.Series, frac: float) -> list[float] | None:
+    """An explicit axis range hugging ``values``, padded by ``frac`` of their span.
+
+    Pinning a range is the only way to keep an axis off a shape: plotly grows an
+    *autoranged* axis to contain its shapes, so a ``y=0`` reference line drags a
+    panel all the way to zero however tight the data is.
 
     Args:
-        cov: ``data.coverage`` output for a universe (per-symbol rows).
+        values: The points the axis must show.
+        frac: Padding on each side, as a fraction of the data's span.
+
+    Returns:
+        ``[lo, hi]``, or ``None`` when the span is zero or unusable (no finite
+        points, one repeated value) and autorange is the better answer.
+    """
+    nums = pd.to_numeric(values, errors="coerce")
+    finite = nums[nums.abs() != float("inf")].dropna()
+    if finite.empty:
+        return None
+    lo, hi = float(finite.min()), float(finite.max())
+    return None if hi == lo else [lo - frac * (hi - lo), hi + frac * (hi - lo)]
+
+
+def plot_sensitivity(star: pd.DataFrame, *, metric: str = "excess_cagr",
+                     cols: int = 3) -> go.Figure:
+    """Local robustness of one picked parameter set: a tornado over 1-D profiles.
+
+    Two questions, two panels, because they are answered differently:
+
+    * **Which knobs matter?** The tornado — one bar per parameter, spanning the
+      worst and best its own perturbations produced. Long bar = the result hangs
+      on that value; short bar = the knob is not load-bearing. A bar is drawn red
+      when it reaches ``0``, i.e. when some nearby value gives the benchmark back.
+    * **Is the pick on a plateau or a spike?** The profiles — one mini-chart per
+      parameter, the metric against that parameter's actual values, with the picked
+      value marked. A flat top is a plateau; a lone peak between two drops is the
+      overfit case; a value sitting on the shoulder of a drop is a cliff to step
+      away from.
+
+    Each profile is scaled to **its own** neighborhood, both axes pinned to the
+    points it draws: a knob whose neighborhood spans a tenth of a percent gets a
+    tenth-of-a-percent y-axis, so its shape is readable next to a knob that swings
+    ten points. The zero line therefore only appears where the neighborhood
+    actually reaches the benchmark — which is the case it is there to flag — and
+    the shared, comparable view of all knobs at once is the tornado above. (The
+    ranges are set explicitly rather than left to autorange because plotly grows
+    an autoranged axis to fit its shapes, so the ``y=0`` line alone was stretching
+    every panel down to zero and flattening the curve against the top of it.)
+
+    The verdicts and the actions they imply come from
+    :func:`optimize.stability_report`, which reads the same frame.
+
+    Args:
+        star: Output of :func:`optimize.sensitivity` — the center row plus the
+            one-at-a-time perturbations, labelled by ``perturbed``/``offset``.
+        metric: Column to judge on; benchmark-relative by default, so ``0`` is the
+            meaningful reference line rather than an arbitrary threshold.
+        cols: Profile charts per row.
 
     Returns:
         The figure.
     """
-    fig = go.Figure([
-        go.Bar(x=cov["symbol"], y=cov["regular"], name="regular hours",
-               marker={"color": SERIES[0]}),
-        go.Bar(x=cov["symbol"], y=cov["extended"], name="extended hours",
-               marker={"color": SERIES[2]}),
-    ])
-    fig.update_layout(barmode="stack", bargap=0.25)
-    fig.update_yaxes(title="bars stored")
-    return _base(fig, title="Price coverage per symbol (regular vs extended session)")
+    center = star[star["perturbed"] == ""]
+    groups = [(name, g) for name, g in
+              star[star["perturbed"] != ""].groupby("perturbed", sort=False)]
+    mid = float(center[metric].iloc[0])
+    fmt = ".3f" if metric in {"sharpe", "info_ratio", "n_trades", "trades_per_year"} else ".2%"
+
+    rows = 1 + -(-len(groups) // cols)
+    specs = ([[{"colspan": cols}] + [None] * (cols - 1)]
+             + [[{} for _ in range(cols)] for _ in range(rows - 1)])
+    titles = ([f"how far each knob moves {metric} — bar spans its whole neighborhood"]
+              + [name for name, _ in groups] + [""] * ((rows - 1) * cols - len(groups)))
+    # The tornado grows with the knob count: on a fixed share of the height, plotly drops
+    # every other category label as soon as a strategy searches more than a few knobs.
+    tornado_h, profile_h = 30 * len(groups) + 70, 200
+    fig = make_subplots(rows=rows, cols=cols, specs=specs, subplot_titles=titles,
+                        row_heights=[tornado_h] + [profile_h] * (rows - 1),
+                        horizontal_spacing=0.07,
+                        vertical_spacing=min(0.11, 0.8 / max(rows - 1, 1)))
+    fig.update_annotations(font_size=12)      # the subplot titles; vline labels come later
+
+    # --- the tornado, widest bar on top ---------------------------------------
+    span = {name: (min(float(g[metric].min()), mid), max(float(g[metric].max()), mid))
+            for name, g in groups}
+    order = sorted(span, key=lambda name: span[name][1] - span[name][0])
+    lo = [span[name][0] for name in order]
+    hi = [span[name][1] for name in order]
+    fig.add_trace(go.Bar(
+        y=order, x=[h - low for low, h in zip(lo, hi, strict=True)], base=lo, orientation="h",
+        # The outline is load-bearing: a knob whose whole neighborhood scores identically
+        # has a zero-width bar, and without a stroke it renders as nothing at all — which
+        # reads as missing data rather than as the perfectly flat result it is.
+        marker={"color": [_LOSS if low <= 0 else SERIES[0] for low in lo],
+                "line": {"color": [_LOSS if low <= 0 else SERIES[0] for low in lo],
+                         "width": 1.5}},
+        customdata=list(zip(lo, hi, strict=True)), showlegend=False,
+        hovertemplate=(f"%{{y}}<br>worst %{{customdata[0]:{fmt}}}"
+                       f" · best %{{customdata[1]:{fmt}}}<extra></extra>")), row=1, col=1)
+    fig.update_xaxes(tickformat=fmt, row=1, col=1)
+    fig.update_yaxes(type="category", dtick=1, automargin=True, tickfont={"size": 10},
+                     row=1, col=1)
+
+    # --- one profile per parameter --------------------------------------------
+    for i, (name, g) in enumerate(groups):
+        r, c = 2 + i // cols, 1 + i % cols
+        pts = pd.concat([g[[name, metric]], center[[name, metric]]]).sort_values(name)
+        numeric = (pd.api.types.is_numeric_dtype(pts[name])
+                   and not pd.api.types.is_bool_dtype(pts[name]))
+        x = pts[name] if numeric else pts[name].astype(str)
+        picked = center[name].iloc[0] if numeric else str(center[name].iloc[0])
+        fig.add_trace(go.Scatter(
+            x=x, y=pts[metric], mode="lines+markers", showlegend=False,
+            line={"color": SERIES[0], "width": 1.5}, marker={"size": 5, "color": SERIES[0]},
+            hovertemplate=f"{name}=%{{x}}<br>{metric}=%{{y:{fmt}}}<extra></extra>"), row=r, col=c)
+        fig.add_trace(go.Scatter(
+            x=[picked], y=[mid], mode="markers", showlegend=False,
+            marker={"size": 10, "color": _INK, "symbol": "diamond"},
+            hovertemplate=f"picked: {name}=%{{x}}<br>{metric}=%{{y:{fmt}}}<extra></extra>"),
+            row=r, col=c)
+        # Reference lines go in AFTER their subplot's traces: add_hline/add_vline default
+        # to exclude_empty_subplots=True and are dropped SILENTLY on a traceless subplot.
+        fig.add_hline(y=0.0, row=r, col=c, line={"color": _GRID, "width": 1}, layer="below")
+        fig.update_xaxes(title_text=name, title_standoff=2, title_font={"size": 10},
+                         tickfont={"size": 9}, range=_pad(x, 0.06) if numeric else None,
+                         row=r, col=c)
+        # Percent ticks at 2dp read as one repeated label once the whole neighborhood
+        # fits inside 0.5pp, which is exactly the panel this zoom exists for.
+        span = float(pts[metric].max() - pts[metric].min())
+        fine = {".2%": ".3%", ".3f": ".4f"}[fmt]
+        fig.update_yaxes(tickformat=fine if 0 < span < (0.005 if fmt == ".2%" else 0.05) else fmt,
+                         tickfont={"size": 9}, range=_pad(pts[metric], 0.12), row=r, col=c)
+
+    fig.add_vline(x=0.0, row=1, col=1, line={"color": _GRID, "width": 1}, layer="below")
+    fig.add_vline(x=mid, row=1, col=1, line={"color": _INK, "width": 1, "dash": "dot"},
+                  annotation_text="picked", annotation_font_size=10)
+    fig = _base(fig, title=f"Neighborhood stability around the picked parameters — {metric}",
+                height=tornado_h + profile_h * (rows - 1) + 110)
+    fig.update_layout(margin={"t": 80}, bargap=0.45)
+    return fig
+
+
+def plot_coverage(timeline: pd.DataFrame, *, bar: str = "1d", freq: str = "MS") -> go.Figure:
+    """When each symbol actually has data — a symbol × time coverage map.
+
+    One cell per (symbol, bucket), shaded by how complete that bucket is
+    *relative to the best-covered symbol in the same bucket*. That normalization
+    needs no exchange calendar and works for any bar size: a full cell means
+    "as many bars as the fullest name that period", a pale cell means a partial
+    period, and an empty cell means nothing stored at all.
+
+    This is the figure that answers "do I really have history since 2015?" — a
+    total bar count cannot, because a late listing, an early stop and a hole in
+    the middle all look identical once the time axis is collapsed. Symbols are
+    ordered by first bucket, so genuine IPO/listing starts form a clean staircase
+    at the bottom and a failed backfill shows up as a hole that breaks it.
+
+    Args:
+        timeline: ``data.coverage_timeline`` output for one bar size.
+        bar: Bar size, for the title.
+        freq: Pandas offset alias matching the timeline's bucket width
+            (``"MS"`` for monthly, ``"D"`` daily, ``"YS"`` yearly).
+
+    Returns:
+        The figure.
+    """
+    z = timeline.pivot(index="symbol", columns="period", values="bars")
+    # Reindex to a gapless bucket axis: a period missing for EVERY symbol has no
+    # rows at all, and without this the heatmap would silently close the gap up.
+    z = z.reindex(columns=pd.date_range(z.columns.min(), z.columns.max(), freq=freq))
+    z = z.loc[z.notna().idxmax(axis=1).sort_values(kind="stable").index]  # earliest start first
+    pct = z.div(z.max(axis=0), axis=1)                                    # vs the fullest name
+
+    ext = timeline.pivot(index="symbol", columns="period", values="extended")
+    ext = ext.reindex(index=z.index, columns=z.columns)
+    fig = go.Figure(go.Heatmap(
+        z=pct.to_numpy(), x=_epoch(pct.columns), y=pct.index.to_numpy(),
+        customdata=np.dstack([z.to_numpy(), ext.to_numpy()]),
+        # Floor the ramp at a visible blue: a month holding 1 bar of 21 must not
+        # fade into the white that means "nothing stored at all".
+        colorscale=[(0.0, "#cfe0f4"), (1.0, SERIES[0])], zmin=0, zmax=1,
+        hoverongaps=False,
+        colorbar={"title": {"text": "of fullest name<br>(blank = nothing stored)",
+                            "side": "top", "font": {"size": 10}},
+                  "tickformat": ".0%", "thickness": 12, "len": 0.35, "y": 1,
+                  "yanchor": "top", "outlinewidth": 0, "tickfont": {"size": 10}},
+        hovertemplate="<b>%{y}</b>  %{x|%b %Y}<br>%{customdata[0]:,.0f} bars "
+                      "(%{customdata[1]:,.0f} extended)<br>%{z:.0%} of fullest<extra></extra>",
+    ))
+    first, last = z.columns.min(), z.columns.max()
+    early = int((z.notna().idxmax(axis=1) == first).sum())
+    current = int((z.iloc[:, ::-1].notna().idxmax(axis=1) == last).sum())
+    fig.update_yaxes(tickfont={"size": 8}, autorange="reversed")
+    fig.update_xaxes(type="date", showgrid=False)  # _epoch packs x; type pins the axis back
+    fig = _base(fig, title=f"{bar} coverage over time — {early}/{len(z)} symbols reach back to "
+                           f"{first:%b %Y}, {current}/{len(z)} run to {last:%b %Y}",
+                height=max(420, 70 + 11 * len(z)))
+    return fig

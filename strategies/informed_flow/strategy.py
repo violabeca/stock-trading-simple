@@ -41,16 +41,25 @@ look-ahead.
 strategy runs in the engine's portfolio mode: it returns a ``weights`` frame, not
 entries/exits, so all names share **one** cash account of ``init_cash`` *total*.
 There are exactly ``max_positions`` slots, each ``1 / max_positions`` of the book
-**at entry** (then left to drift — a held name is bought once and sold whole, never
-re-trimmed mid-hold), and **a new name can only be bought by selling an existing
-one**. That constraint is not incidental — it is what the earlier design got wrong. With a cash
+**at entry** (then left to drift — a held name is bought once and sold whole), and
+**a new name can only be bought by selling an existing one**. That constraint is not
+incidental — it is what the earlier design got wrong. With a cash
 account *per symbol*, a strategy holding 40 of 100 names sat ~30% invested against a
 100%-invested benchmark, forfeiting most of the market's return to buy a selection
 edge, and the ranking was diluted across four times as many names as the edge could
 survive (measured: top decile +5.8%/yr active, top 40% +0.6%/yr). Slots fix both.
 ``displace`` decides what happens when a better name arrives and the book is full:
 wait for a vacancy (low turnover), or evict the weakest holding (chases the top of
-the ranking, pays for it in trading costs).
+the ranking, pays for it in trading costs). ``displace_margin`` is the brake on that:
+a challenger must out-rank the weakest holding **by a clear gap**, not by an epsilon.
+It exists because the bare comparison turned out to drive essentially all the turnover
+and to carry no information — see :func:`_select`.
+
+The one exception to "left to drift" is the ``retrim_k`` concentration cap: a held name
+whose book weight reaches ``retrim_k ×`` its slot (double it, by default) is trimmed back
+to the slot on the next bar, and the freed cash rotates into the next pick — so a single
+lucky pop cannot come to dominate the book. It is risk control, not signal, and a fixed
+policy rather than a searched one (see :func:`trading_simple.backtest._retrim_loop`).
 
 **The ranked universe is only the eligible names.** A name with fewer than
 ``min_events`` insider/rating events in the trailing window is dropped from the
@@ -81,9 +90,11 @@ import pandas as pd
 from trading_simple import backtest as bt
 from trading_simple.data import Panel
 
-#: Feature name -> the weight parameter that scales it.
+#: Feature name -> the weight parameter that scales it. The last two are the
+#: price-derived market-condition sleeves (trend + RSI); every other one is alt-data.
 _WEIGHT_KEY = {"insider": "w_insider", "ratings": "w_rating",
-               "price_target": "w_ptrev", "short_interest": "w_dtc"}
+               "price_target": "w_ptrev", "short_interest": "w_dtc",
+               "trend": "w_trend", "rsi": "w_rsi"}
 
 #: A sleeve must carry data for at least this fraction of the universe on its
 #: best-covered bar to count as live. Without this floor, a barely-ingested table
@@ -102,16 +113,23 @@ def signals(
     insider_window: int = 63,
     rating_halflife: int = 21,
     ptrev_halflife: int = 21,
+    trend_fast: int = 21,
+    trend_slow: int = 126,
+    rsi_period: int = 14,
     w_insider: float = 0.4,
     w_rating: float = 0.3,
     w_ptrev: float = 0.3,
     w_dtc: float = 0.3,
+    w_trend: float = 0.0,
+    w_rsi: float = 0.0,
     q_in: float = 0.8,
     q_out: float = 0.6,
     max_hold: int = 126,
     min_events: int = 1,
     max_positions: int = 10,
     displace: bool = False,
+    displace_margin: float = 0.0,
+    retrim_k: float | None = 2.0,
 ) -> dict:
     """Build long-only target weights from the ranked informed-flow composite.
 
@@ -124,10 +142,21 @@ def signals(
             dollar-volume normalizer, and the eligibility event count) accumulate.
         rating_halflife: EMA half-life in bars for the rating-change stream.
         ptrev_halflife: EMA half-life in bars for the price-target revision stream.
+        trend_fast: Fast-MA lookback (bars) for the price-derived MA-trend sleeve
+            (``SMA(trend_fast) / SMA(trend_slow) - 1``) — a fast-over-slow crossover, so it
+            reads the trend's direction/slope rather than a single bar's extension. A
+            market-condition tilt scaled by ``w_trend``.
+        trend_slow: Slow-MA lookback (bars) for the MA-trend sleeve; must exceed
+            ``trend_fast`` (enforced by :func:`valid`).
+        rsi_period: Lookback (bars) for the price-derived Wilder-RSI sleeve — persistent
+            up- vs down-close pressure. A market-condition tilt scaled by ``w_rsi``.
         w_insider: Composite weight on the insider signal.
         w_rating: Composite weight on the rating-change signal.
         w_ptrev: Composite weight on the price-target revision signal.
         w_dtc: Composite weight on the (negated) days-to-cover signal.
+        w_trend: Composite weight on the MA-trend sleeve; ``0`` ablates it. Config ships
+            ``1.0`` (on by default); the signature default is ``0.0``.
+        w_rsi: Composite weight on the RSI sleeve; ``0`` ablates it. Config ships ``1.0``.
         q_in: A name may be bought when its composite cross-sectional rank is at/above
             this quantile (e.g. 0.8 = top 20%). Qualifying is necessary, not sufficient
             — it still needs a free slot.
@@ -141,23 +170,39 @@ def signals(
             slots are filled and holds cash when fewer names qualify.
         displace: What happens when a qualifying name arrives and the book is full.
             ``False`` — it waits for a vacancy. ``True`` — it evicts the weakest current
-            holding if it outranks it.
+            holding if it outranks it by ``displace_margin``.
+        displace_margin: How much a challenger must out-rank the weakest holding by, in
+            composite-rank units, before it may evict it. ``0.0`` reproduces the bare
+            "any epsilon wins" comparison; one rank place in a 90-name cross-section is
+            ~0.011, so e.g. ``0.05`` means "about five places clear". Ignored when
+            ``displace`` is off. See :func:`_select` for why it exists.
+        retrim_k: Single-name concentration cap. A held name drifts untouched until its
+            book weight reaches ``retrim_k ×`` its ``1 / max_positions`` slot (``2.0`` =
+            double), at which point the engine trims it back to the slot and the freed cash
+            rotates into the next name the selection picks — so a lucky pop cannot come to
+            dominate the book (and flatter a parameter set). ``None`` disables the cap.
+            Enforced in :func:`trading_simple.backtest._retrim_loop`; a fixed policy, not a
+            search dimension (kept out of the Optuna space on purpose).
 
     Returns:
-        ``{"weights"}`` — a target-weight frame, next-bar-open executed, which puts the
-        run in the engine's **portfolio mode**: one shared cash account, so buying is
-        funded by selling. Long only; no stops (the rank-exit band is the exit thesis).
+        ``{"weights", "retrim_k"}`` — a target-weight frame plus the concentration-cap
+        scalar, next-bar-open executed, which puts the run in the engine's **portfolio
+        mode**: one shared cash account, so buying is funded by selling. Long only; no
+        stops (the rank-exit band is the exit thesis).
     """
     parts = _compose(panel, insider_window=insider_window, rating_halflife=rating_halflife,
                      ptrev_halflife=ptrev_halflife, w_insider=w_insider, w_rating=w_rating,
-                     w_ptrev=w_ptrev, w_dtc=w_dtc, min_events=min_events)
+                     w_ptrev=w_ptrev, w_dtc=w_dtc, min_events=min_events,
+                     trend_fast=trend_fast, trend_slow=trend_slow, rsi_period=rsi_period,
+                     w_trend=w_trend, w_rsi=w_rsi)
     if not parts["present"]:
         flat = pd.DataFrame(0.0, index=panel.close.index, columns=panel.close.columns)
-        return {"weights": flat}
+        return {"weights": flat, "retrim_k": retrim_k}
 
     held = _select(parts, q_in=q_in, q_out=q_out, max_hold=max_hold,
-                   max_positions=max_positions, displace=displace)["held"]
-    return {"weights": _weights(held, max_positions)}
+                   max_positions=max_positions, displace=displace,
+                   displace_margin=displace_margin)["held"]
+    return {"weights": _weights(held, max_positions), "retrim_k": retrim_k}
 
 
 def _weights(held: pd.DataFrame, max_positions: int) -> pd.DataFrame:
@@ -169,9 +214,11 @@ def _weights(held: pd.DataFrame, max_positions: int) -> pd.DataFrame:
     qualify. The ``1 / max_positions`` is the target **at entry**: the engine
     (:func:`trading_simple.backtest.rotation_targets`) masks per name, so a held name is
     bought once, **left to drift** while other names rotate around it, and sold whole in
-    one order when it leaves the mask — it is never re-trimmed mid-hold. ``bt.next_bar``
-    keeps the execution discipline identical to the rest of the repo: decided on bar t
-    from data already lagged a bar, filled at the open of t+1.
+    one order when it leaves the mask — the only mid-hold trim is the optional ``retrim_k``
+    concentration cap (:func:`trading_simple.backtest._retrim_loop`), which sells a runaway
+    winner back to its slot. ``bt.next_bar`` keeps the execution discipline identical to the
+    rest of the repo: decided on bar t from data already lagged a bar, filled at the open of
+    t+1.
 
     Args:
         held: Boolean (bars x symbols) mask of names the book wants to own.
@@ -181,6 +228,32 @@ def _weights(held: pd.DataFrame, max_positions: int) -> pd.DataFrame:
         Target fraction of the book per symbol, per bar. Rows sum to at most 1.0.
     """
     return bt.next_bar(held).astype(float) / max_positions
+
+
+def _rsi(close: pd.DataFrame, period: int) -> pd.DataFrame:
+    """Wilder's RSI in [0, 100] with a strict warm-up (NaN until ``period`` bars).
+
+    Momentum as *persistent buying pressure*: the ratio of the average up-move to the
+    average down-move over the trailing ``period``, smoothed the same way as
+    :func:`trading_simple.backtest.atr` (``ewm(alpha=1/period)``) and mapped onto 0-100.
+    Higher = buyers have been in control, so it ranks like every other sleeve (higher is
+    favourable) and the 0-100 scale is immaterial once cross-sectionally ranked. A flat
+    stretch leaves up = down = 0 -> RS = 0/0 = NaN; that bar lands on the neutral 0.5 fill
+    via :func:`_compose`'s ``ranks.fillna(0.5)``, exactly like a missing alt-data cell. An
+    only-up stretch gives RS = inf -> RSI 100; only-down gives RS = 0 -> RSI 0.
+
+    Args:
+        close: Wide ``(bars x symbols)`` adjusted-close frame.
+        period: Trailing bars for the Wilder average (the classic default is 14).
+
+    Returns:
+        A ``(bars x symbols)`` RSI frame in [0, 100]; NaN during warm-up and on flat names.
+    """
+    delta = close.diff()
+    avg_up = delta.clip(lower=0.0).ewm(alpha=1.0 / period, min_periods=period).mean()
+    avg_down = (-delta.clip(upper=0.0)).ewm(alpha=1.0 / period, min_periods=period).mean()
+    rs = avg_up / avg_down
+    return 100.0 - 100.0 / (1.0 + rs)
 
 
 def _compose(
@@ -194,6 +267,11 @@ def _compose(
     w_ptrev: float,
     w_dtc: float,
     min_events: int,
+    trend_fast: int = 21,
+    trend_slow: int = 126,
+    rsi_period: int = 14,
+    w_trend: float = 0.0,
+    w_rsi: float = 0.0,
     **_,
 ) -> dict:
     """Build every intermediate the composite rests on (shared by signals + explain).
@@ -211,6 +289,11 @@ def _compose(
         w_ptrev: Weight on the price-target revision signal.
         w_dtc: Weight on the (negated) days-to-cover signal.
         min_events: Eligibility floor on trailing insider+rating events.
+        trend_fast: Fast-MA lookback (bars) for the price-derived MA-trend sleeve.
+        trend_slow: Slow-MA lookback (bars) for the MA-trend sleeve (> trend_fast).
+        rsi_period: Lookback (bars) for the price-derived Wilder-RSI sleeve.
+        w_trend: Weight on the MA-trend sleeve (``0`` ablates it — the default).
+        w_rsi: Weight on the RSI sleeve (``0`` ablates it — the default).
         **_: Ignored, so callers can splat a full parameter dict.
 
     Returns:
@@ -239,8 +322,18 @@ def _compose(
     if "short_interest" in feats:
         raw["short_interest"] = -feats["short_interest"]  # low days-to-cover is favourable
 
+    # Price-derived "market-condition" sleeves. Unlike the alt-data sleeves above they need
+    # no feature table — they read panel.close directly — so they are always available and
+    # are ablated purely by a 0 weight in the `present` filter below. Higher = more
+    # favourable for both (fast MA above slow = a confirmed uptrend / stronger up-close
+    # pressure), so, unlike short_interest, neither is negated. They tilt the ranking toward
+    # names in a favourable price regime and away from ones drifting sideways or down.
+    raw["trend"] = bt.sma(panel.close, trend_fast) / bt.sma(panel.close, trend_slow) - 1.0
+    raw["rsi"] = _rsi(panel.close, rsi_period)
+
     weights = {"insider": w_insider, "ratings": w_rating,
-               "price_target": w_ptrev, "short_interest": w_dtc}
+               "price_target": w_ptrev, "short_interest": w_dtc,
+               "trend": w_trend, "rsi": w_rsi}
     present = [k for k in raw if weights[k] > 0 and _coverage(raw[k]) >= _MIN_COVERAGE]
     n_events = _eligibility(feats, insider_window)
     eligible = n_events >= min_events
@@ -288,7 +381,7 @@ def _score_from_raw(raw: dict, weights: dict, present: list, wsum: float,
 
 
 def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
-            max_positions: int, displace: bool) -> dict:
+            max_positions: int, displace: bool, displace_margin: float = 0.0) -> dict:
     """Walk the bars and decide which names the book owns, subject to a slot limit.
 
     The single place the ``q_in``/``q_out`` bands, the time-stop and the capital
@@ -311,8 +404,23 @@ def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
        the model has stopped evaluating it, so holding it is holding an unscored
        position), or ran out its ``max_hold`` clock. This is what frees a slot.
     3. **Optionally displace.** With ``displace``, a qualifying challenger that outranks
-       the weakest holding takes its place. Without it, the challenger waits.
+       the weakest holding **by ``displace_margin``** takes its place. Without it, the
+       challenger waits.
     4. **Fill free slots** from the qualifying names, best-ranked first.
+
+    **Why the margin exists.** Steps 1-2 gate a name's rank *level*; step 3 is an
+    *ordering* comparison, and nothing in the ``q_in``/``q_out`` band or the ``max_hold``
+    clock can see it. Measured on the v16 pick's holdout book, that asymmetry was the
+    whole story: **122 of 127 exits were displacements** (5 were ``q_out``/eligibility,
+    zero were ``max_hold``), the median challenger won by ~2 rank places out of ~91
+    eligible names, and 16% won by a single place. Because ``score_pct`` is a
+    *percentile*, a name can lose its slot with its composite bit-identical to the
+    previous bar — MRVL was sold whole on 2025-12-15 on a one-place slip with an
+    unchanged composite, and re-bought seven bars later. An event study over all 121
+    holdout evictions found the challenger's forward return minus the evicted name's to
+    be indistinguishable from zero at every horizon (-0.28% at 5 bars, -0.45% at 10,
+    +0.04% at 21, +1.84% at 63; win rate ~50%, p >= 0.67) — the swaps were a coin flip
+    paying two legs of costs each. The margin is the missing hysteresis on the ordering.
 
     Args:
         parts: A :func:`_compose` result with a non-empty ``present``.
@@ -322,6 +430,8 @@ def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
         max_hold: Time-stop horizon in bars.
         max_positions: Number of slots.
         displace: Whether a better name may evict the weakest holding.
+        displace_margin: Rank gap a challenger must clear the weakest holding by to evict
+            it. ``0.0`` is the bare comparison; ignored when ``displace`` is off.
 
     Returns:
         ``{"held", "qualified", "slot_blocked"}`` boolean frames on the *signal* clock
@@ -354,7 +464,10 @@ def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
                        if row[j] >= q_in and j not in current]
         while displace and len(current) >= max_positions and challengers:
             weakest = min(current, key=lambda j: row[j])
-            if row[challengers[0]] <= row[weakest]:
+            # The margin is what makes this a real preference rather than a rank-noise
+            # coin flip: a challenger inside the band is simply not better enough to be
+            # worth two legs of costs. At 0.0 this is the bare comparison.
+            if row[challengers[0]] <= row[weakest] + displace_margin:
                 break                               # no challenger beats the worst holding
             current.remove(weakest)
             entered[weakest] = -1
@@ -424,13 +537,17 @@ def valid(params: dict) -> bool:
 
     Returns:
         True when the exit band sits below the entry band (``q_out < q_in``, the
-        hysteresis requirement), at least one composite weight is positive, and the book
-        has at least one slot.
+        hysteresis requirement), at least one composite weight is positive, the MA-trend
+        crossover is ordered (``trend_fast < trend_slow``) whenever both are given, and the
+        book has at least one slot.
     """
     q_in = params.get("q_in", 0.8)
     q_out = params.get("q_out", 0.6)
     weights = sum(params.get(key, 0.0) for key in _WEIGHT_KEY.values())
-    return q_out < q_in and weights > 0 and params.get("max_positions", 10) >= 1
+    fast, slow = params.get("trend_fast"), params.get("trend_slow")
+    trend_ok = fast is None or slow is None or fast < slow
+    return (q_out < q_in and weights > 0 and trend_ok
+            and params.get("max_positions", 10) >= 1)
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +630,8 @@ def explain(panel: Panel, symbol: str, **params) -> pd.DataFrame:
 
     composite, score = parts["composite"], parts["score_pct"]
     selected = _select(parts, q_in=p["q_in"], q_out=p["q_out"], max_hold=p["max_hold"],
-                       max_positions=p["max_positions"], displace=p["displace"])
+                       max_positions=p["max_positions"], displace=p["displace"],
+                       displace_margin=p["displace_margin"])
     target = _weights(selected["held"], p["max_positions"])
 
     out = pd.DataFrame(index=panel.close.index)

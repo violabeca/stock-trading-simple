@@ -1,4 +1,4 @@
-# TEMPLATE strategy config — every strategy has exactly these four blocks.
+# TEMPLATE strategy config — three blocks: data, optuna, params.
 
 data:                      # which panel the notebook / optimizer loads
   universe: starter        # a name from settings.yaml or universes.yaml
@@ -10,16 +10,13 @@ data:                      # which panel the notebook / optimizer loads
   session: regular         # regular | extended | both (rth filter; matters intraday)
   max_symbols: 20          # cap at the best-covered names
 
-params:                    # single-run defaults = signals() keyword arguments
-  example_window: 20
-  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
-                           # deploys 25% of the FREE cash — params-only, not searched
-
-sweep:                     # value lists for grid exploration (optional block)
-  example_window: [10, 20, 50]
-
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: template-v1       # journal file: studies/<study>.log (rename = fresh study)
+  study: template-v1       # journal file: studies/<study>.log (rename = fresh study).
+                           # BUMP IT whenever a `search:` bound, the objective or the
+                           # execution model changes: a journal that mixes two spaces
+                           # cannot be read, and nothing detects that for you.
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
   n_trials: 100
@@ -28,9 +25,28 @@ optuna:
                            # than a long one for the same trading style): trials
                            # trading below this rate are pruned in-objective
                            # (300 fits intraday; ~25 for a daily portfolio-mode strategy)
-  space:                   # one entry per tunable parameter
-    example_window: { type: int, low: 5, high: 100 }
-    # other types:
-    #   { type: float, low: 0.5, high: 5.0, step: 0.25 }   # step optional
-    #   { type: int,   low: 1,   high: 60,  log: true }    # log-scaled
-    #   { type: categorical, choices: [long, short, both] }
+
+# EVERY PARAMETER IS DECLARED ONCE, here — there is no separate sweep or space block:
+#
+#   doc:    what the knob means, and anything a future reader would otherwise re-derive
+#   value:  what SHIPS. The single source of truth: `bt.evaluate` starts from it, and
+#           every knob the sweep grid omits falls back to it
+#   search: the optuna range (omit -> the study never touches this knob)
+#   grid:   the coarse-sweep values (omit -> the sweep PINS it at `value`)
+#
+# A bare scalar (`cash_frac: 0.25`) is shorthand for value-only. Two invariants are
+# enforced when the config loads, because both failures are silent: `value` must be
+# reachable by its own `search`, and `value` must appear in its own `grid` — otherwise the
+# sweep, and every walk-forward that re-picks from it, validates a strategy nobody runs.
+params:
+  example_window:
+    doc: Lookback in bars for the example signal.
+    value: 20
+    search: { type: int, low: 5, high: 100 }
+    grid: [10, 20, 50]     # contains `value` — the load-time invariant checks that
+  cash_frac:
+    doc: >-
+      ONE shared $10k wallet (engine cash-shared mode): each entry deploys this fraction of
+      the FREE cash, so total invested can never exceed the wallet. Params-only, not
+      searched — the repo default for a multi-symbol signal strategy.
+    value: 0.25

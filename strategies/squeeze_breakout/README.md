@@ -40,7 +40,8 @@ cannot reverse in one order).
 3. Engine fine print (verified): stop fractions anchor at the fill bar's
    close and activate the next bar; when one bar spans both stop and target
    the **stop** fills (pessimistic); stop legs pay fees but no slippage and
-   gap-throughs fill at the stop level (optimistic — engine-level, shared by
+   gap-throughs fill at the bar's true open with slippage charged
+   (engine-pessimistic since 2026-07-19, shared by
    all strategies). Treat same-bar R:R as approximate.
 
 **Parameters** (all in `config.yaml`):

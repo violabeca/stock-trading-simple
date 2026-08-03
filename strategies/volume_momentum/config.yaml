@@ -1,7 +1,7 @@
 # ===========================================================================
 # volume_momentum — all tunable settings for this strategy (intraday, 1m).
-# Blocks: data (what to load), params (single-run defaults), sweep (grid
-# exploration), optuna (optimization study + search space).
+# Layout: data (what panel to load), optuna (study settings), params
+# (every knob: doc + shipped value + optional search space and sweep grid).
 # ===========================================================================
 
 data:
@@ -13,32 +13,12 @@ data:
   session: regular         # profile baseline assumes one consistent session
   max_symbols: 20          # the pinned Top20 subset — matches the universe size
 
-params:                    # single-backtest defaults; every key is a signals() argument
-  fast: 15                 # fast price-SMA window (bars = minutes on 1m)
-  slow: 60                 # slow price-SMA window (bars); must be > fast
-  threshold: 4.0           # volume must be >= threshold x expected volume
-  horizon: 30              # bars held after entry (minutes on 1m)
-  baseline: auto           # auto | sma | profile (auto: profile intraday, sma on 1d)
-  vol_window: 20           # sma-baseline window (bars); only used with baseline: sma
-  profile_days: 5          # profile-baseline lookback (sessions)
-  smooth_minutes: 2        # profile compares to ±N minutes around the same time-of-day
-  skip_open: 15            # no entries in the first N minutes of a session
-  skip_close: 15           # no entries in the last N minutes of a session
-  sl_pct: 0.02             # stop-loss distance (fraction of entry price); 0 disables
-  sl_trail: false          # false = fixed at entry, true = trails the best price
-  eod_exit: true           # always flat on each session's final bar
-  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
-                           # deploys 25% of the FREE cash — params-only, not searched
-
-sweep:                     # coarse grid for notebook exploration (invalid fast>=slow dropped)
-  fast: [10, 30]
-  slow: [60, 180]
-  threshold: [3.0, 5.0, 8.0]
-  horizon: [15, 30, 60]
-  sl_pct: [0.01, 0.02]
-
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: vm-1m-v2          # v2: shared $10k wallet + HighOctaneTop20 + the common train
+  study: vm-1m-v3          # v3: 2026-07-19 engine realism (panel-priced costs +
+                           # pessimistic stop fills, exit-wins signal conflicts) — v2 journals not comparable.
+                           # v2: shared $10k wallet + HighOctaneTop20 + the common train
                            # window — v1 (starter, per-symbol books) stays on disk
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
@@ -46,12 +26,65 @@ optuna:
   min_trades_per_year: 300  # admissibility floor (PER YEAR, not absolute — a short
                            # window shouldn't need fewer trades to pass): fewer-trade
                            # trials are pruned in-objective (a lucky fill can fake info_ratio)
-  space:                   # declarative search space -> optimize.suggest_params
-    fast:           { type: int,   low: 5,     high: 60 }
-    slow:           { type: int,   low: 30,    high: 240 }
-    threshold:      { type: float, low: 2.0,   high: 10.0, step: 0.5 }
-    horizon:        { type: int,   low: 5,     high: 120, log: true }
-    profile_days:   { type: int,   low: 3,     high: 10 }
-    smooth_minutes: { type: int,   low: 0,     high: 5 }
-    sl_pct:         { type: float, low: 0.005, high: 0.04, step: 0.005 }
-    sl_trail:       { type: categorical, choices: [true, false] }
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+params:
+  fast:
+    doc: "fast price-SMA window (bars = minutes on 1m)"
+    value: 15
+    search: { type: int, low: 5, high: 60 }
+    grid: [10, 15, 30]
+  slow:
+    doc: "slow price-SMA window (bars); must be > fast"
+    value: 60
+    search: { type: int, low: 30, high: 240 }
+    grid: [60, 180]
+  threshold:
+    doc: "volume must be >= threshold x expected volume"
+    value: 4.0
+    search: { type: float, low: 2.0, high: 10.0, step: 0.5 }
+    grid: [3.0, 4.0, 5.0, 8.0]
+  horizon:
+    doc: "bars held after entry (minutes on 1m)"
+    value: 30
+    search: { type: int, low: 5, high: 120, log: true }
+    grid: [15, 30, 60]
+  baseline:
+    doc: "auto | sma | profile (auto: profile intraday, sma on 1d)"
+    value: auto
+  vol_window:
+    doc: "sma-baseline window (bars); only used with baseline: sma"
+    value: 20
+  profile_days:
+    doc: "profile-baseline lookback (sessions)"
+    value: 5
+    search: { type: int, low: 3, high: 10 }
+  smooth_minutes:
+    doc: "profile compares to \u00b1N minutes around the same time-of-day"
+    value: 2
+    search: { type: int, low: 0, high: 5 }
+  skip_open:
+    doc: "no entries in the first N minutes of a session"
+    value: 15
+  skip_close:
+    doc: "no entries in the last N minutes of a session"
+    value: 15
+  sl_pct:
+    doc: "stop-loss distance (fraction of entry price); 0 disables"
+    value: 0.02
+    search: { type: float, low: 0.005, high: 0.04, step: 0.005 }
+    grid: [0.01, 0.02]
+  sl_trail:
+    doc: "false = fixed at entry, true = trails the best price"
+    value: false
+    search: { type: categorical, choices: [true, false] }
+  eod_exit:
+    doc: "always flat on each session's final bar"
+    value: true
+  cash_frac:
+    doc: >-
+      ONE shared $10k wallet (engine cash-shared mode): each entry deploys 25% of the FREE
+      cash — params-only, not searched
+    value: 0.25

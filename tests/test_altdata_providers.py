@@ -139,6 +139,29 @@ def test_quarters_since_spans_year_boundary():
     assert sec._quarters_since(date(2024, 1, 1), date(2024, 1, 31)) == ["2024q1"]
 
 
+def test_cik_map_prefers_the_lowest_cik_on_ticker_collisions(monkeypatch):
+    """A recently-registered shell must not shadow the operating company.
+
+    EDGAR's directory listed XOM under both Exxon Mobil Corp (CIK 34088) and an
+    "ExxonMobil Holdings Corp" shell (CIK 2115436); last-write-wins resolved to
+    the shell and every SEC-sourced sleeve silently returned zero XOM rows.
+    Operating companies carry old, low CIKs — the lowest must win either way
+    the directory orders the rows.
+    """
+    directory = {
+        "0": {"ticker": "XOM", "cik_str": 34088, "title": "EXXON MOBIL CORP"},
+        "1": {"ticker": "XOM", "cik_str": 2115436, "title": "ExxonMobil Holdings Corp"},
+        "2": {"ticker": "BRK-B", "cik_str": 1067983, "title": "BERKSHIRE HATHAWAY INC"},
+    }
+    monkeypatch.setattr(sec, "_cik_cache", None)
+    monkeypatch.setattr(sec, "_get", lambda url, **kw: directory)
+    assert sec._cik_map()["XOM"] == 34088
+    assert sec._cik_map()["BRK.B"] == 1067983          # dotted alias still resolves
+    monkeypatch.setattr(sec, "_cik_cache", None)       # shell FIRST — order must not matter
+    monkeypatch.setattr(sec, "_get", lambda url, **kw: dict(reversed(directory.items())))
+    assert sec._cik_map()["XOM"] == 34088
+
+
 def test_parse_ddmonyyyy_handles_sec_format_and_junk():
     assert sec._parse_ddmonyyyy("05-FEB-2024") == date(2024, 2, 5)
     assert sec._parse_ddmonyyyy("") is None and sec._parse_ddmonyyyy("garbage") is None
@@ -159,6 +182,29 @@ def test_parse_bulk_file_is_pipe_delimited_and_feeds_records_to_rows():
     assert recs[0]["symbolCode"] == "AAPL" and recs[0]["settlementDate"] == "2024-01-31"
     rows = finra._records_to_rows(recs)                       # the shipped parser, reused as-is
     assert rows[0].symbol == "AAPL" and rows[0].days_to_cover == 4.0   # 1e6/250000, derived
+
+
+def test_a_quote_in_an_issuer_name_cannot_swallow_the_file():
+    """The bug that silently cost this repo the 2018-2019 short-interest history.
+
+    FINRA's pipe format has no quoting convention, so a ``"`` in an issuer name is data.
+    Read with :mod:`csv`'s default quoting, the unbalanced quotes below open a field that
+    never closes and every later row is absorbed into it — surfacing as ``field larger
+    than field limit`` on a file whose longest line is a few hundred characters, which
+    aborted the backfill and left a two-year hole that read as "FINRA has no data".
+
+    The rows after the offending one are what matters: losing them is the silent part.
+    """
+    text = (_BULK_HEADER + "\n"
+            "202401|AAPL|Apple Inc.|R|NNM|1000000|900000||250000||||100000|2024-01-31\n"
+            '201803|DOD|"ELEMENTS ""Dogs of the Dow""|E|ARCA|613|2318||4445|1.00|'
+            "||-1705|2024-01-31\n"
+            "202401|MSFT|Microsoft Corp|R|NNM|2000000|1900000||500000||||100000|2024-01-31\n")
+    recs = finra._parse_bulk_file(text)
+    assert [r["symbolCode"] for r in recs] == ["AAPL", "DOD", "MSFT"]
+    # The row AFTER the quoted name survives intact — that is the regression.
+    assert recs[2]["currentShortPositionQuantity"] == "2000000"
+    assert {row.symbol for row in finra._records_to_rows(recs)} == {"AAPL", "DOD", "MSFT"}
 
 
 def test_si_request_body_adds_upper_bound_only_when_until_set():

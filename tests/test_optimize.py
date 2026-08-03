@@ -111,6 +111,112 @@ def test_boundary_report_counts_front_share():
     assert report.loc["w", "action"] == "widen low & widen high"
 
 
+SPACE = {
+    "window": {"type": "int", "low": 10, "high": 100},
+    "horizon": {"type": "int", "low": 5, "high": 120, "log": True},
+    "weight": {"type": "float", "low": 0.25, "high": 3.0, "step": 0.25},
+    "events": {"type": "int", "low": 1, "high": 3},          # too coarse for ±10% of its span
+    "displace": {"type": "categorical", "choices": [True, False]},
+}
+PICKED = {"window": 50, "horizon": 24, "weight": 1.0, "events": 1, "displace": True}
+
+
+def test_neighbors_moves_one_coordinate_at_a_time_on_the_searched_scale():
+    star = opt.neighbors(PICKED, SPACE)
+    center = star[star["perturbed"] == ""]
+    assert len(center) == 1 and center["offset"].iloc[0] == 0.0
+    for _, row in star[star["perturbed"] != ""].iterrows():
+        differs = [k for k in PICKED if row[k] != PICKED[k]]
+        assert differs == [row["perturbed"]], "a neighbor must move exactly one knob"
+
+    def values(name):
+        return star.loc[star["perturbed"] == name, name].tolist()
+
+    window = values("window")
+    assert all(isinstance(v, int) for v in window)            # an int space stays integral
+    assert window == sorted(window) and window[0] < 50 < window[-1]
+    assert all(SPACE["window"]["low"] <= v <= SPACE["window"]["high"] for v in window)
+    # A log range is perturbed multiplicatively, so the up-move is the bigger absolute one.
+    horizon = values("horizon")
+    assert horizon[-1] - 24 > 24 - horizon[0]
+    # 5% and 10% of the weight span both snap onto the same 0.25 grid point: one row, not two.
+    assert values("weight") == [0.75, 1.25]
+    # 10% of a 1-3 span rounds straight back to the pick. Falling back to the smallest
+    # representable step is what stops a coarse knob being reported inert by construction.
+    assert values("events") == [2]                            # 0 is out of bounds, dropped
+    switch = star[star["perturbed"] == "displace"]
+    assert switch["displace"].tolist() == [False] and switch["offset"].isna().all()
+
+
+def test_neighbors_drops_perturbations_the_strategy_rejects():
+    """A neighbor that violates valid() is never backtested — nor silently kept."""
+    space = {"q_in": {"type": "float", "low": 0.6, "high": 0.95, "step": 0.05},
+             "q_out": {"type": "float", "low": 0.4, "high": 0.9, "step": 0.05}}
+    star = opt.neighbors({"q_in": 0.75, "q_out": 0.70}, space,
+                         valid=lambda p: p["q_out"] < p["q_in"])
+    assert (star["q_out"] < star["q_in"]).all()
+    assert 0.75 not in star["q_out"].tolist()   # the step up would tie the entry band
+
+
+def _star(rows: list[dict], center: float = 0.10) -> pd.DataFrame:
+    """A synthetic sensitivity() frame: one center row plus labelled perturbations."""
+    base = {"knob": 1.0, "switch": True, "n_trades": 100}
+    out = [{**base, "perturbed": "", "offset": 0.0, "excess_cagr": center}]
+    out += [{**base, **r} for r in rows]
+    return pd.DataFrame(out)
+
+
+def test_stability_report_verdicts_and_the_action_each_implies():
+    def verdict(low, high, **over):
+        star = _star([{"perturbed": "knob", "offset": -0.05, "knob": 0.9, "excess_cagr": low},
+                      {"perturbed": "knob", "offset": 0.05, "knob": 1.1, "excess_cagr": high}],
+                     **over)
+        return opt.stability_report(star).loc["knob"]
+
+    assert verdict(0.099, 0.101)["verdict"] == "inert"        # nothing moves -> stop searching it
+    assert verdict(0.070, 0.065)["verdict"] == "plateau"      # it costs something, nothing breaks
+    assert verdict(0.090, 0.140)["verdict"] == "off-center"   # a neighbor wins in sample
+    assert verdict(0.010, 0.010)["verdict"] == "spike"        # both sides collapse
+    cliff = verdict(0.090, 0.020)
+    assert cliff["verdict"] == "cliff (high)"
+    assert cliff["suggest"] == 0.9                            # step AWAY from the edge
+    assert "knob=0.9" in cliff["action"]
+
+    # A pick on a searched BOUND has no safe side to step onto: suggesting the picked
+    # value back would be a no-op move, and the real fix is a wider bound (§8), not this.
+    on_bound = opt.stability_report(_star(
+        [{"perturbed": "knob", "offset": 0.05, "knob": 1.1, "excess_cagr": 0.02}])).loc["knob"]
+    assert on_bound["verdict"] == "cliff (high)" and on_bound["suggest"] is None
+    assert "widen" in on_bound["action"]
+    # A negative center is the trap the old 'median > 0.5 * max' rule inverted on: half of
+    # a negative best is BIGGER than it, so a failing strategy reported a healthy plateau.
+    assert verdict(-0.20, -0.30, center=-0.10)["verdict"] == "n/a"
+
+
+def test_stability_report_reads_a_categorical_and_counts_thin_neighbors():
+    star = _star([{"perturbed": "switch", "offset": float("nan"), "switch": False,
+                   "excess_cagr": 0.01, "n_trades": 3}])
+    row = opt.stability_report(star, min_trades=30).loc["switch"]
+    assert row["verdict"] == "decisive"          # the other choice gives the edge back
+    assert row["n_thin"] == 1                    # counted, not hidden: the book starved
+    assert opt.stability_report(_star([])).empty
+
+
+def test_sensitivity_runs_the_star_through_the_engine(panel):
+    """End to end: labelled rows in, one backtested row each out, types intact."""
+    from trading_simple.config import Settings
+
+    strat = strategies.load("volume_momentum")
+    picked = {k: strat.params[k] for k in strat.optuna["space"]}
+    star = opt.sensitivity(strat, panel, picked, settings=Settings())
+    assert len(star) == len(opt.neighbors(picked, strat.optuna["space"], valid=strat.valid))
+    assert {"perturbed", "offset", "excess_cagr", "n_trades"} <= set(star.columns)
+    assert star["excess_cagr"].notna().all()
+    assert star["fast"].dtype.kind == "i"        # an int knob must not reach signals() as a float
+    report = opt.stability_report(star, min_trades=1)
+    assert set(report.index) <= set(picked) and "action" in report.columns
+
+
 def test_objective_prunes_below_min_trades_per_year():
     """A handful of lucky trades must not crown the front: the floor prunes them.
 

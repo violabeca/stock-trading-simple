@@ -47,7 +47,8 @@ anything that does not, which is exactly the point of building it this way.
 Engine stop semantics (shared by every strategy here, vectorbt-verified): stop
 fractions anchor at the fill bar's close and activate the next bar; when one bar
 spans both stop and target the STOP fills (pessimistic); a gap through a stop
-fills at the stop level. On a 1-minute bar the intrabar path is unknown, so a
+fills at the bar's true open with slippage charged (engine-pessimistic since
+2026-07-19). On a 1-minute bar the intrabar path is unknown, so a
 tight bracket's win rate is not trustworthy — judge on the time-stop / EOD exits.
 """
 

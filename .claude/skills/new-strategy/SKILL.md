@@ -65,12 +65,27 @@ cp -r strategies/_template strategies/<snake_case_name>
 
 ## 4 · Fill `config.yaml`
 
-Four blocks — `data`, `params`, `sweep`, `optuna`. Every `signals()` keyword
-argument MUST appear under `params:` (default); `optuna.space:` covers the
-subset worth searching (structural switches like `baseline` and fixed session
-guards stay params-only); `sweep:` gets a small hand-picked grid (≤ ~30
-combos after `valid`). Comment every parameter with its meaning in one line.
-Make each `space` range generously wide rather than pre-tuned — the
+Three blocks — `data`, `optuna` (study settings only), `params`. Every
+`signals()` keyword argument MUST appear under `params:`, declared **once**:
+
+```yaml
+params:
+  entry_window:
+    doc: Channel lookback in bars; a breakout is a new N-bar extreme.
+    value: 30                                  # what SHIPS
+    search: {type: int, low: 10, high: 200, log: true}   # omit -> never searched
+    grid: [15, 30, 60]                         # omit -> the sweep PINS it at `value`
+  skip_open: 15                                # bare scalar = value only
+```
+
+`search` covers the subset worth searching (structural switches like `baseline`
+and fixed session guards stay value-only); `grid` gets a small hand-picked list
+(≤ ~30 combos after `valid`). **The config will not load** unless every `value`
+is reachable by its own `search` and present in its own `grid` — so never write
+a grid that brackets the shipped value without including it (`value: 3.0`,
+`grid: [2.0, 4.0]` is the exact mistake, and it was live in six strategies).
+`doc:` is required in spirit: it is the only description that survives.
+Make each `search` range generously wide rather than pre-tuned — the
 post-optimization boundary check (§6) will say if it still needs widening;
 use `log: true` for window/horizon-style ranges spanning an order of
 magnitude. Two comparability keys:

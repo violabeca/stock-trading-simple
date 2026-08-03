@@ -147,6 +147,17 @@ def _parse_bulk_file(text: str) -> list[dict]:
     ``currentShortPositionQuantity`` / ``averageDailyVolumeQuantity`` /
     ``daysToCoverQuantity``), so :func:`_records_to_rows` consumes the output directly.
 
+    ``QUOTE_NONE`` is load-bearing: the format has **no quoting convention**, so a ``"``
+    in an issuer name is data, not a delimiter. Without it one row like
+    ``DOD|"ELEMENTS ""Dogs of the Dow""|...`` opens a quoted field that never closes, and
+    :mod:`csv` swallows the rest of the file into a single value — raising
+    ``field larger than field limit`` on a file whose longest line is 278 characters.
+    That is how the 2018-2019 short-interest history came to be missing: the download
+    aborted mid-backfill and the gap sat there looking like "FINRA has no data".
+    Do **not** "fix" a recurrence by raising :func:`csv.field_size_limit` — that silently
+    turns 15,398 rows into 3,881, which is the same quiet-failure mode this repo has
+    already shipped once.
+
     Args:
         text: The downloaded file body.
 
@@ -156,7 +167,7 @@ def _parse_bulk_file(text: str) -> list[dict]:
     import csv
     import io
 
-    return list(csv.DictReader(io.StringIO(text), delimiter="|"))
+    return list(csv.DictReader(io.StringIO(text), delimiter="|", quoting=csv.QUOTE_NONE))
 
 
 def iter_short_interest_bulk(symbols: list[str], since: date, *, until: date | None = None):

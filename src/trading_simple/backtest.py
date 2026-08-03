@@ -22,7 +22,9 @@ Two execution models, chosen by what a strategy's ``signals()`` returns:
   This is the only way to express "hold the best K names, fully invested": with
   per-symbol accounts a strategy holding 30 of 100 names is structurally ~30%
   invested and cannot beat a fully-invested benchmark however good its selection.
-  See :func:`_run_portfolio`.
+  Held names drift untouched, but a strategy may add a ``retrim_k`` **concentration
+  cap** (:func:`_retrim_loop`) so a runaway winner is trimmed back to its slot rather
+  than left to dominate the book. See :func:`_run_portfolio`.
 * **Cash-shared signals** (``entries``/``exits`` + ``cash_frac``) — the wallet
   variant of the signal path: ONE shared account of ``init_cash`` *total*, and
   each entry deploys ``cash_frac`` of the currently *free* cash, so the book can
@@ -72,6 +74,15 @@ WEIGHTS_KEY = "weights"
 #: exceed the book. Percent sizing cannot reverse a position, so an opposite-direction
 #: entry closes the open position instead of flipping it.
 CASH_FRAC_KEY = "cash_frac"
+#: Returning this scalar (``k > 1``) alongside ``weights`` opts a portfolio-mode strategy
+#: into a **concentration cap**: whenever a held name's realized book weight reaches
+#: ``k ×`` its target (e.g. 2x its slot), it is trimmed back to target on the next bar and
+#: the freed cash returns to the shared wallet, where the next rotation redeploys it. This
+#: is what stops one runaway winner from quietly coming to dominate a book of otherwise
+#: drifting positions. ``None`` = off, the **default** — so :func:`benchmark` and any
+#: strategy that does not set it keep the pure buy-and-once-hold behavior. See
+#: :func:`_run_portfolio` and :func:`_retrim_loop`.
+RETRIM_K_KEY = "retrim_k"
 #: Every metric a sweep/trial frame may carry; anything else in such a frame is a
 #: strategy parameter. One definition, so a new metric cannot be mistaken for a knob.
 #: ``years``/``trades_per_year`` are sample-size columns and belong here for exactly
@@ -299,12 +310,39 @@ def leg_costs(costs: CostSettings, *, price: float = 20.0,
     return fees, costs.slippage_bps / 1e4
 
 
+def panel_costs(costs: CostSettings, panel: Panel, *,
+                notional: float = 10_000.0) -> tuple[float, float]:
+    """:func:`leg_costs` priced at the panel's own median close.
+
+    The per-share commission depends on the share price (500 shares of a $20
+    name cost $2.50; 50 shares of a $200 name hit the $1 minimum), so a fixed
+    ``price=20`` undercharges cheap names ~4x and overcharges expensive ones.
+    The median of the per-symbol median closes is one honest scalar per panel —
+    per-symbol fees are not expressible here because vectorbt takes one fee
+    fraction per portfolio.
+
+    Args:
+        costs: The ``costs:`` block from settings.
+        panel: The panel the backtest will run on.
+        notional: Assumed position size in dollars.
+
+    Returns:
+        ``(fees_fraction, slippage_fraction)`` per leg.
+    """
+    price = float(panel.close.median().median())
+    if not np.isfinite(price) or price <= 0:
+        price = 20.0
+    return leg_costs(costs, price=price, notional=notional)
+
+
 def grid_from_config(sweep_cfg: dict[str, list], valid=lambda p: True) -> list[dict]:
     """Expand per-parameter value lists into a filtered cartesian grid.
 
     Args:
-        sweep_cfg: The ``sweep:`` block of a strategy config
-            (``{param: [values...]}``).
+        sweep_cfg: A strategy's ``sweep`` view — ``{param: [values...]}``, assembled
+            by the loader from every parameter that declares a ``grid:``. Parameters
+            without one are absent here and stay pinned at their shipped ``value``,
+            which :func:`sweep` supplies from ``strategy.params``.
         valid: The strategy's combo validator; invalid combos are dropped.
 
     Returns:
@@ -332,7 +370,8 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
     Args:
         panel: Price panel.
         signals: Strategy output — either :data:`WEIGHTS_KEY` (a target-weight
-            frame), or any subset of :data:`SIGNAL_KEYS` (boolean frames) and
+            frame, optionally with a :data:`RETRIM_K_KEY` scalar to cap single-name
+            concentration), or any subset of :data:`SIGNAL_KEYS` (boolean frames) and
             :data:`STOP_KEYS` (scalars or frames; stop distances are fractions of
             entry price, NaN = no stop), optionally plus :data:`CASH_FRAC_KEY`
             (a scalar fraction of free cash deployed per entry).
@@ -356,10 +395,16 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
         raise ValueError("signals may set 'weights' OR 'cash_frac', not both")
     if WEIGHTS_KEY in signals:
         return _run_portfolio(panel, signals[WEIGHTS_KEY], fees=fees, slippage=slippage,
-                              init_cash=init_cash)
+                              init_cash=init_cash, retrim_k=signals.get(RETRIM_K_KEY))
     kwargs = {k: signals[k] for k in (*SIGNAL_KEYS, *STOP_KEYS) if k in signals}
     if any(k in signals for k in STOP_KEYS):
-        kwargs |= {"high": panel.high, "low": panel.low}
+        # open= lets a bar that GAPS through a stop fill at its (worse) true open
+        # instead of at the stop level, and "stopmarket" makes stop legs pay
+        # slippage like any market order — without these, vectorbt's defaults
+        # ("stoplimit", close substituted for open) are optimistic on exactly the
+        # bars where stops matter most.
+        kwargs |= {"open": panel.open_, "high": panel.high, "low": panel.low,
+                   "stop_exit_price": "stopmarket"}
     if CASH_FRAC_KEY in signals:
         # One shared wallet of init_cash TOTAL: each entry deploys `cash_frac` of the
         # free cash, so the book can never be more than 100% invested. call_seq="auto"
@@ -371,7 +416,15 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
                        upon_opposite_entry="close")
     return vbt.Portfolio.from_signals(
         panel.close, price=panel.open_, fees=fees, slippage=slippage,
-        init_cash=init_cash, freq=panel.freq, **kwargs,
+        init_cash=init_cash, freq=panel.freq,
+        # The EXIT wins when an entry and an exit signal land on the same bar.
+        # vectorbt's default ("ignore") cancels BOTH: a time stop coinciding with a
+        # fresh entry signal was swallowed, so the position ran PAST its supposed
+        # hard stop and the entry evaporated too (~11% of informed_flow's top-ranked
+        # symbol-days back when it was signal-mode). Exit-wins makes exit_after and
+        # the EOD flat true hard stops; the same-bar entry is still dropped, which
+        # is the one thing from_signals cannot express (exit then re-enter).
+        upon_long_conflict="exit", upon_short_conflict="exit", **kwargs,
     )
 
 
@@ -401,8 +454,80 @@ def rotation_targets(weights: pd.DataFrame) -> pd.DataFrame:
     return weights.where(changed, np.nan)
 
 
+def _book_weights(pf) -> pd.DataFrame:
+    """Each name's realized weight in its shared book, per bar: asset value / book value.
+
+    The realized weight only exists *inside* a run — :func:`rotation_targets` sees targets,
+    never live position values — so this is how :func:`_retrim_loop` reads back what a held
+    name's drift actually did. Works for both a single grouped book (:func:`_run_portfolio`,
+    where ``pf.value()`` is one Series and every column divides by it) and a column-stacked
+    per-combo sweep (where it is a per-combo frame and each ``(combo, symbol)`` column
+    divides by *its own* combo's value).
+    """
+    asset_value = pf.asset_value(group_by=False)
+    value = pf.value()
+    if isinstance(value, pd.Series):
+        return asset_value.div(value, axis=0)
+    return asset_value.div(value, axis=1, level="combo")
+
+
+#: Backstop on retrim re-simulations. A held name's book weight cannot exceed 1.0 and a
+#: slot targets ``1 / max_positions``, so a name can breach a ``k >= 2`` band at most
+#: ``log2(max_positions)`` times before it is capped — ~5 for the widest book. The loop
+#: converges well inside this; the cap only guards against a pathological non-convergence.
+_MAX_RETRIM_ITERS = 8
+
+
+def _retrim_loop(build, targets: pd.DataFrame, weights: pd.DataFrame,
+                 threshold: pd.DataFrame):
+    """Iterated concentration cap: re-simulate, trimming any over-band holding, to a fixed point.
+
+    Portfolio mode leaves a held name to drift (:func:`rotation_targets`), so one runaway
+    winner can come to dominate the book. When a strategy sets ``retrim_k`` this caps it:
+    after a run, any held name whose *realized* book weight has reached ``threshold``
+    (``k ×`` its target) is trimmed back to target on the **next** bar — the freed cash
+    returns to the shared wallet, where the next rotation redeploys it into whatever the
+    strategy selects next (usually a fresh name). The trim is decided from the realized
+    weight at a bar's close and executed at the next bar's open, so it carries **no
+    look-ahead** — the same discipline as every other order in the engine.
+
+    Realized weight is knowable only inside a simulation, so this is a simulate-then-adjust
+    fixed point, not a preprocessing of the weight frame: run, find the first still-untrimmed
+    over-band bar per name, un-mask it (re-emit the target there so target-percent sizing
+    sells the name back to target), and repeat until no held name is over the band. A trim
+    only ever *lowers* a weight, so the un-masked set grows monotonically and the loop
+    converges in a handful of passes (:data:`_MAX_RETRIM_ITERS`). A book with no runaway
+    costs exactly one extra weight read and no re-run.
+
+    Args:
+        build: ``targets -> vectorbt.Portfolio`` — runs one ``from_orders`` pass. Both call
+            sites pass their own (single-book vs per-combo grouped) builder.
+        targets: The masked target frame (:func:`rotation_targets` output) to start from.
+        weights: The dense (un-masked) target frame — the level a trim rebalances back to.
+        threshold: ``k × weights`` — the realized book weight at which a held name is trimmed.
+
+    Returns:
+        The final ``vectorbt.Portfolio`` with the cap applied.
+    """
+    pf = build(targets)
+    for _ in range(_MAX_RETRIM_ITERS):
+        # Over-band at a bar's CLOSE; act on the NEXT bar (shift) so the trim never uses
+        # information from the bar it fills on, and only where the name is still drifting
+        # (target NaN) so a real rotation is never fought.
+        over = ((_book_weights(pf) >= threshold) & (weights > 0)).shift(1, fill_value=False)
+        cand = over & targets.isna()
+        # The FIRST still-untrimmed breach per name this pass. Trimming resets the name to
+        # target, so a later re-doubling is found and capped on a subsequent pass.
+        edge = cand & (cand.cumsum() == 1)
+        if not edge.to_numpy().any():
+            break
+        targets = targets.where(~edge, weights)
+        pf = build(targets)
+    return pf
+
+
 def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, fees: float, slippage: float,
-                   init_cash: float):
+                   init_cash: float, retrim_k: float | None = None):
     """One shared cash account rebalanced to target weights — buying requires selling.
 
     The ``from_orders`` call site. ``from_signals`` cannot do this: it rejects
@@ -416,22 +541,32 @@ def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, fees: float, slippage
         fees: Per-leg fee fraction.
         slippage: Per-leg slippage fraction.
         init_cash: The whole book's starting cash.
+        retrim_k: Concentration cap. ``None`` (default) leaves held names to drift
+            untouched — one ``from_orders`` pass, identical to the original behavior and
+            zero extra cost. A number ``> 1`` trims a held name back to its slot once its
+            realized book weight reaches ``retrim_k ×`` its target, via :func:`_retrim_loop`.
 
     Returns:
         A grouped, cash-sharing ``vectorbt.Portfolio``.
     """
     import vectorbt as vbt
 
-    return vbt.Portfolio.from_orders(
-        panel.close, size=rotation_targets(weights), size_type="targetpercent",
-        price=panel.open_, fees=fees, slippage=slippage, init_cash=init_cash,
-        group_by=True, cash_sharing=True,
-        # MANDATORY, not cosmetic: sorts sells before buys within a bar. Without it a
-        # buy gets partially rejected because the sell funding it has not executed yet,
-        # silently leaving cash idle — the exact bug this whole mode exists to remove.
-        call_seq="auto",
-        freq=panel.freq,
-    )
+    def build(targets):
+        return vbt.Portfolio.from_orders(
+            panel.close, size=targets, size_type="targetpercent",
+            price=panel.open_, fees=fees, slippage=slippage, init_cash=init_cash,
+            group_by=True, cash_sharing=True,
+            # MANDATORY, not cosmetic: sorts sells before buys within a bar. Without it a
+            # buy gets partially rejected because the sell funding it has not executed yet,
+            # silently leaving cash idle — the exact bug this whole mode exists to remove.
+            call_seq="auto",
+            freq=panel.freq,
+        )
+
+    targets = rotation_targets(weights)
+    if retrim_k is None:
+        return build(targets)
+    return _retrim_loop(build, targets, weights, retrim_k * weights)
 
 
 def run_strategy(strategy: LoadedStrategy, panel: Panel, params: dict | None = None,
@@ -448,7 +583,7 @@ def run_strategy(strategy: LoadedStrategy, panel: Panel, params: dict | None = N
         A ``vectorbt.Portfolio``.
     """
     merged = {**strategy.params, **(params or {})}
-    fees, slippage = leg_costs(settings.costs)
+    fees, slippage = panel_costs(settings.costs, panel)
     return run(panel, strategy.signals(panel, **merged), fees=fees, slippage=slippage,
                init_cash=settings.backtest.init_cash)
 
@@ -488,12 +623,22 @@ def benchmark(panel: Panel, *, fees: float, slippage: float) -> tuple[float, pd.
         ``(total_return, per_bar_returns)``.
     """
     key = (panel.close.index[0], panel.close.index[-1], panel.close.shape,
-           tuple(panel.symbols), fees, slippage)
+           tuple(panel.symbols), fees, slippage,
+           # Listing pattern: the weights below depend on WHERE each name's prices
+           # start, so two panels sharing window/shape/symbols but not listing dates
+           # (e.g. one refreshed with a newly backfilled IPO) must not share a cache row.
+           tuple(panel.close.notna().idxmax()))
     if key not in _BENCHMARK:
         weights = pd.DataFrame(1.0 / len(panel.close.columns), index=panel.close.index,
                                columns=panel.close.columns)   # own everything, forever:
-        pf = run(panel, {WEIGHTS_KEY: weights},   # constant weights -> bar 0 is the only
-                 fees=fees, slippage=slippage)    # rotation, so it buys once and holds
+        # Masked to bars where the name actually trades: a late-listed symbol has NaN
+        # prices at bar 0, so its one dense-frame order would be silently skipped and
+        # its 1/N would sit in cash for the whole backtest — an understated hurdle.
+        # With the mask, rotation_targets sees NaN -> 1/N on the first valid bar and
+        # buys the name at its listing, which is what buy-and-hold actually means.
+        weights = weights.where(panel.close.notna())
+        pf = run(panel, {WEIGHTS_KEY: weights},   # constant weights -> a name's listing
+                 fees=fees, slippage=slippage)    # bar is its only rotation: buy + hold
         curve = equity_curve(pf)["value"].pct_change().fillna(0.0)
         if len(_BENCHMARK) > 16:                    # bounded: walk-forward makes many panels
             _BENCHMARK.clear()
@@ -556,7 +701,7 @@ def evaluate(strategy: LoadedStrategy, panel: Panel, params: dict, *, settings: 
     """
     pf = run_strategy(strategy, panel, params, settings=settings)
     stats = portfolio_stats(pf)
-    fees, slippage = leg_costs(settings.costs)
+    fees, slippage = panel_costs(settings.costs, panel)
     stats.update(active_stats(pf, panel, fees=fees, slippage=slippage,
                               total_return=stats["total_return"]))
     return stats
@@ -587,7 +732,7 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
     import vectorbt as vbt
 
     chunk_size = chunk_size or settings.backtest.chunk_size
-    fees, slippage = leg_costs(settings.costs)
+    fees, slippage = panel_costs(settings.costs, panel)
     init_cash = settings.backtest.init_cash
     index, columns = panel.close.index, panel.close.columns
     years = _years(index)
@@ -623,13 +768,30 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
         if WEIGHTS_KEY in combo_signals[0]:
             # Portfolio mode: group by the combo level, so each combo is its own shared
             # cash account of `init_cash` — not one giant book pooling every combo.
-            pf = vbt.Portfolio.from_orders(
-                tile(panel.close),
-                size=stack([rotation_targets(s[WEIGHTS_KEY]) for s in combo_signals]),
-                size_type="targetpercent", price=tile(panel.open_),
-                fees=fees, slippage=slippage, init_cash=init_cash,
-                group_by="combo", cash_sharing=True, call_seq="auto", freq=panel.freq,
-            )
+            weights_stacked = stack([s[WEIGHTS_KEY] for s in combo_signals])
+            targets = stack([rotation_targets(s[WEIGHTS_KEY]) for s in combo_signals])
+
+            def build(t):
+                return vbt.Portfolio.from_orders(
+                    tile(panel.close), size=t, size_type="targetpercent",
+                    price=tile(panel.open_), fees=fees, slippage=slippage,
+                    init_cash=init_cash, group_by="combo", cash_sharing=True,
+                    call_seq="auto", freq=panel.freq,
+                )
+
+            retrim_k = combo_signals[0].get(RETRIM_K_KEY)
+            if retrim_k is None:
+                pf = build(targets)
+            else:
+                # Same concentration cap as _run_portfolio, per combo. retrim_k is a fixed
+                # policy (never swept), so every combo shares it — but a per-column threshold
+                # tolerates a hand-swept k all the same. _book_weights divides each
+                # (combo, symbol) column by its own combo's book value (group_by="combo").
+                k_per_col = np.repeat(
+                    [float(s[RETRIM_K_KEY]) if s.get(RETRIM_K_KEY) is not None else np.nan
+                     for s in combo_signals], len(columns))
+                pf = _retrim_loop(build, targets, weights_stacked,
+                                  weights_stacked.mul(k_per_col, axis=1))
             # A one-combo chunk has one group and cannot be indexed into further.
             rows += [{**grid[cid], **_grouped_stats(pf[cid] if len(ids) > 1 else pf)}
                      for cid in ids]
@@ -644,7 +806,10 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
             kwargs["tp_stop"] = stack([as_frame(s.get("tp_stop"), no_stop) for s in combo_signals])
             kwargs["sl_trail"] = stack(
                 [as_frame(s.get("sl_trail", False), empty_bool) for s in combo_signals])
-            kwargs |= {"high": tile(panel.high), "low": tile(panel.low)}
+            # Same pessimistic stop-fill semantics as run() — sweep numbers must
+            # match what evaluate() reports for the same combo.
+            kwargs |= {"open": tile(panel.open_), "high": tile(panel.high),
+                       "low": tile(panel.low), "stop_exit_price": "stopmarket"}
 
         grouped = CASH_FRAC_KEY in combo_signals[0]
         if grouped:
@@ -661,7 +826,10 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
 
         pf = vbt.Portfolio.from_signals(
             tile(panel.close), price=tile(panel.open_),
-            fees=fees, slippage=slippage, init_cash=init_cash, freq=panel.freq, **kwargs,
+            fees=fees, slippage=slippage, init_cash=init_cash, freq=panel.freq,
+            # Exit-wins conflict resolution, same as run() — sweep numbers must
+            # match what evaluate() reports for the same combo.
+            upon_long_conflict="exit", upon_short_conflict="exit", **kwargs,
         )
         if grouped:
             # A one-combo chunk has one group and cannot be indexed into further.
@@ -742,6 +910,29 @@ def portfolio_stats(pf) -> dict:
     return stats
 
 
+def _bar_sharpe(returns, index):
+    """Sharpe of per-bar returns, annualized by ACTUAL bars per calendar year.
+
+    vectorbt's own ``sharpe_ratio`` annualizes with its ``year_freq`` default of 365
+    calendar days over the bar frequency: √365 on daily bars that number ~252 a year
+    (~20% high), and ~2.3x high on 1m bars. ``info_ratio`` already annualizes with
+    ``sqrt(len(index)/years)``; the diagnostic Sharpe must sit on the same clock or
+    the two risk-adjusted numbers on one trial disagree by construction. Diagnostic
+    only — the objectives are benchmark-relative and never read this.
+
+    Args:
+        returns: Per-bar returns — a Series (one book) or DataFrame (per column).
+        index: The panel/backtest index the returns live on.
+
+    Returns:
+        Float for a Series, per-column Series for a DataFrame; non-finite where
+        the standard deviation is zero (callers null those out).
+    """
+    ann = np.sqrt(len(index) / _years(index))
+    with np.errstate(invalid="ignore", divide="ignore"):   # flat returns -> NaN, nulled by callers
+        return returns.mean() / returns.std() * ann
+
+
 def _grouped_stats(pf) -> dict:
     """The shared book's metrics, read as the scalars vectorbt returns when grouped."""
     def scalar(fn) -> float:
@@ -755,7 +946,7 @@ def _grouped_stats(pf) -> dict:
     by_symbol = trades.groupby("symbol")["pnl"].sum() if len(trades) else pd.Series(dtype=float)
     return {
         "total_return": scalar(pf.total_return),
-        "sharpe": scalar(pf.sharpe_ratio),
+        "sharpe": scalar(lambda: _bar_sharpe(pf.returns(), pf.wrapper.index)),
         "max_drawdown": scalar(pf.max_drawdown),
         "win_rate": scalar(pf.trades.win_rate),
         # No symbol has a standalone return here — they share one pot — so ask the
@@ -809,7 +1000,8 @@ def _metric_frame(pf, cols: pd.Index) -> pd.DataFrame:
     total_return = safe(pf.total_return)
     return pd.DataFrame({
         "total_return": total_return,
-        "sharpe": safe(pf.sharpe_ratio),
+        "sharpe": safe(lambda group_by: _bar_sharpe(pf.returns(group_by=group_by),
+                                                    pf.wrapper.index)),
         "max_drawdown": safe(pf.max_drawdown),
         "win_rate": safe(pf.trades.win_rate),
         "profitable": (total_return > 0).astype(float),

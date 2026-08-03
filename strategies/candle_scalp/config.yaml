@@ -1,7 +1,7 @@
 # ===========================================================================
 # candle_scalp — all tunable settings for this strategy (intraday, 1m).
-# Blocks: data (what to load), params (single-run defaults), sweep (grid
-# exploration), optuna (optimization study + search space).
+# Layout: data (what panel to load), optuna (study settings), params
+# (every knob: doc + shipped value + optional search space and sweep grid).
 # ===========================================================================
 
 data:
@@ -12,34 +12,12 @@ data:
   session: regular         # the band/ATR assume one consistent session
   max_symbols: 20          # the pinned Top20 subset — matches the universe size
 
-params:                    # single-backtest defaults; every key is a signals() argument
-  pattern: hammer          # hammer | engulfing | any (any = location-only ablation control)
-  wick_mult: 2.0           # hammer strictness: rejection wick >= this x (body + opposite wick)
-  band_window: 120         # midline SMA (bars = minutes on 1m); the mean price overshoots
-  atr_window: 30           # ATR smoothing (bars); sets the stretch + stop scale
-  stretch_mult: 3.0        # entry stretch in ATRs below/above the midline; 0 = location gate off
-                           # shallow stretches churn to death on costs at 1m — go deep
-  trend_window: 960        # regime SMA (bars); ~2.5 sessions. 0 = trend gate off
-  vol_mult: 0.0            # entry-bar volume >= this x its time-of-day expectation; 0 = volume gate off
-  profile_days: 10         # trailing sessions in the time-of-day volume baseline
-  sl_mult: 2.0             # stop-loss distance in ATRs at entry (must be > 0)
-  tp_mult: 3.0             # take-profit distance in ATRs; 0 = no target (run to the time stop)
-  horizon: 60             # time stop (bars held) when neither stop nor target hits
-  direction: both          # long | both (short fades rallies in downtrends)
-  skip_open: 15            # no entries in the first N minutes of a session
-  skip_close: 15           # no entries in the last N minutes of a session
-  eod_exit: true           # flat on each session's final bar (intraday only)
-  cash_frac: 0.25          # ONE shared $10k wallet (engine cash-shared mode): each entry
-                           # deploys 25% of the FREE cash — params-only, not searched
-
-sweep:                     # coarse grid (24 combos; all valid at these band/trend/sl defaults)
-  pattern: [hammer, engulfing, any]
-  stretch_mult: [2.0, 4.0]
-  tp_mult: [2.0, 4.0]
-  horizon: [30, 120]
-
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: candle_scalp-1m-v2  # v2: capital model changed to one shared $10k wallet — v1
+  study: candle_scalp-1m-v3  # v3: 2026-07-19 engine realism (panel-priced costs +
+                           # pessimistic stop fills, exit-wins signal conflicts) — v2 journals not comparable.
+                           # v2: capital model changed to one shared $10k wallet — v1
                              # scored 20 independent $10k books (and predates the
                              # benchmark-relative objectives); journal stays on disk
   sampler: nsga2           # nsga2 | tpe | random
@@ -48,18 +26,78 @@ optuna:
   min_trades_per_year: 300  # admissibility floor (PER YEAR, not absolute — a short
                            # window shouldn't need fewer trades to pass): fewer-trade
                            # trials are pruned in-objective (a lucky fill can fake info_ratio)
-  space:                   # declarative search space -> optimize.suggest_params
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+params:
+  pattern:
+    doc: "hammer | engulfing | any (any = location-only ablation control)"
+    value: hammer
     # pattern=any and stretch_mult=0 are the two ablation controls, searched first-class;
     # trend/volume gates stay ON in the search (ablate them by hand in the notebook).
-    pattern:      { type: categorical, choices: [hammer, engulfing, any] }
-    wick_mult:    { type: float, low: 1.0,  high: 5.0,  step: 0.5 }   # only bites for pattern=hammer
-    band_window:  { type: int,   low: 10,   high: 180,  log: true }   # a scalp's reversion mean is short
-    atr_window:   { type: int,   low: 5,    high: 120,  log: true }
-    stretch_mult: { type: float, low: 0.0,  high: 8.0,  step: 0.25 }  # 0 = location off (tests naked candles)
-    trend_window: { type: int,   low: 180,  high: 2000, log: true }   # regime filter, kept slower than the band
-    vol_mult:     { type: float, low: 0.0,  high: 5.0,  step: 0.5 }    # 0 = volume gate off
-    sl_mult:      { type: float, low: 0.5,  high: 6.0,  step: 0.5 }    # a scalp always keeps a stop
-    tp_mult:      { type: float, low: 0.0,  high: 8.0,  step: 0.5 }    # 0 = no target, run to time/EOD
-    horizon:      { type: int,   low: 10,   high: 480,  log: true }    # up to ~1.25 sessions
-    direction:    { type: categorical, choices: [long, both] }        # fade dips only, or rips too
-    eod_exit:     { type: categorical, choices: [true, false] }        # flat at close vs hold overnight
+    search: { type: categorical, choices: [hammer, engulfing, any] }
+    grid: [hammer, engulfing, any]
+  wick_mult:
+    doc: "hammer strictness: rejection wick >= this x (body + opposite wick)"
+    value: 2.0
+    search: { type: float, low: 1.0, high: 5.0, step: 0.5 }   # only bites for pattern=hammer
+  band_window:
+    doc: "midline SMA (bars = minutes on 1m); the mean price overshoots"
+    value: 120
+    search: { type: int, low: 10, high: 180, log: true }   # a scalp's reversion mean is short
+  atr_window:
+    doc: "ATR smoothing (bars); sets the stretch + stop scale"
+    value: 30
+    search: { type: int, low: 5, high: 120, log: true }
+  stretch_mult:
+    doc: >-
+      entry stretch in ATRs below/above the midline; 0 = location gate off shallow stretches
+      churn to death on costs at 1m — go deep
+    value: 3.0
+    search: { type: float, low: 0.0, high: 8.0, step: 0.25 }   # 0 = location off (tests naked candles)
+    grid: [2.0, 3.0, 4.0]
+  trend_window:
+    doc: "regime SMA (bars); ~2.5 sessions. 0 = trend gate off"
+    value: 960
+    search: { type: int, low: 180, high: 2000, log: true }   # regime filter, kept slower than the band
+  vol_mult:
+    doc: "entry-bar volume >= this x its time-of-day expectation; 0 = volume gate off"
+    value: 0.0
+    search: { type: float, low: 0.0, high: 5.0, step: 0.5 }   # 0 = volume gate off
+  profile_days:
+    doc: "trailing sessions in the time-of-day volume baseline"
+    value: 10
+  sl_mult:
+    doc: "stop-loss distance in ATRs at entry (must be > 0)"
+    value: 2.0
+    search: { type: float, low: 0.5, high: 6.0, step: 0.5 }   # a scalp always keeps a stop
+  tp_mult:
+    doc: "take-profit distance in ATRs; 0 = no target (run to the time stop)"
+    value: 3.0
+    search: { type: float, low: 0.0, high: 8.0, step: 0.5 }   # 0 = no target, run to time/EOD
+    grid: [2.0, 3.0, 4.0]
+  horizon:
+    doc: "time stop (bars held) when neither stop nor target hits"
+    value: 60
+    search: { type: int, low: 10, high: 480, log: true }   # up to ~1.25 sessions
+    grid: [30, 60, 120]
+  direction:
+    doc: "long | both (short fades rallies in downtrends)"
+    value: both
+    search: { type: categorical, choices: [long, both] }   # fade dips only, or rips too
+  skip_open:
+    doc: "no entries in the first N minutes of a session"
+    value: 15
+  skip_close:
+    doc: "no entries in the last N minutes of a session"
+    value: 15
+  eod_exit:
+    doc: "flat on each session's final bar (intraday only)"
+    value: true
+    search: { type: categorical, choices: [true, false] }   # flat at close vs hold overnight
+  cash_frac:
+    doc: >-
+      ONE shared $10k wallet (engine cash-shared mode): each entry deploys 25% of the FREE
+      cash — params-only, not searched
+    value: 0.25
