@@ -87,8 +87,24 @@ def test_off_defaults_match_informed_flow():
     cf = strategies.load("conviction_flow")
     iff = strategies.load("informed_flow")
     # Only pass params informed_flow knows; conviction_flow's new levers stay at defaults.
+    # TWO translations are needed, and both are deliberate divergences, not drift:
+    #
+    # 1. The two spell "never displace" differently: conviction_flow still carries the
+    #    `displace` boolean, while informed_flow collapsed it into `displace_margin` (1.0
+    #    is unreachable for a percentile rank, so it is the same instruction).
+    # 2. informed_flow v21 grew a `recency` sleeve (bars since the last insider/rating
+    #    event) to replace the `min_events` cliff that had become its dominant exit rule.
+    #    conviction_flow is a FORK, with its own config and study journal, and has NOT
+    #    been ported — so ablate the sleeve to compare like with like. Until it is ported,
+    #    conviction_flow still exits on the eligibility cliff this sleeve exists to
+    #    remove, and the two strategies are equivalent only with `w_recency = 0`.
+    #
+    # Without the translations the two would diverge for reasons that have nothing to do
+    # with the fundamentals levers this test is actually pinning.
+    shared = {k: v for k, v in _PARAMS.items() if k != "displace"}
     w_cf = cf.signals(p, **{**cf.params, **_PARAMS})["weights"]
-    w_if = iff.signals(p, **{**iff.params, **_PARAMS})["weights"]
+    w_if = iff.signals(p, **{**iff.params, **shared,
+                             "displace_margin": 1.0, "w_recency": 0.0})["weights"]
     assert w_cf.equals(w_if)
 
 

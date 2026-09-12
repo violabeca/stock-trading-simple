@@ -111,6 +111,81 @@ def test_boundary_report_counts_front_share():
     assert report.loc["w", "action"] == "widen low & widen high"
 
 
+def _clone_front():
+    """A front where an INERT knob mints 4 copies of one outcome, plus 2 real ones.
+
+    Trials 3/1/7/5 differ only in `inert` and score identically — exactly what a
+    parameter that cannot affect the book produces (informed_flow's `max_hold` under a
+    low displacement margin, and its `displace_margin` under `displace=False`).
+    """
+    return pd.DataFrame({
+        "trial":       [3,   1,   7,   5,   2,    9],
+        "inert":       [10,  20,  30,  40,  10,   10],
+        "w":           [1,   1,   1,   1,   50,   60],
+        "info_ratio":  [1.0, 1.0, 1.0, 1.0, 1.20, 0.80],
+        "excess_cagr": [0.1, 0.1, 0.1, 0.1, 0.05, 0.30],
+    })
+
+
+def test_distinct_front_collapses_clones_and_keeps_the_earliest_trial():
+    """Same objectives + different params = one outcome, however many rows it occupies."""
+    distinct = opt.distinct_front(_clone_front())
+    assert len(distinct) == 3                                # 6 rows, 3 real outcomes
+    # The kept clone is the EARLIEST trial (first discovery), not whichever row sorted
+    # first — otherwise the survivor depends on the caller's sort order.
+    assert sorted(distinct["trial"]) == [1, 2, 9]
+    # Genuinely distinct outcomes are never merged, even at identical params.
+    same_params = pd.DataFrame({"trial": [0, 1], "w": [5, 5],
+                                "info_ratio": [1.0, 2.0], "excess_cagr": [0.1, 0.2]})
+    assert len(opt.distinct_front(same_params)) == 2
+    assert opt.distinct_front(pd.DataFrame()).empty          # degenerate inputs survive
+
+
+def test_pick_from_front_says_out_loud_when_the_pick_was_a_tie():
+    """A coin flip between identical-scoring strategies must not look like a decision."""
+    front = _clone_front()
+    # Weight only the first objective: the 4 clones at info_ratio 1.0 lose to trial 2.
+    outright = opt.pick_from_front(front, weights=(1.0, 0.0))
+    assert outright["trial"] == 2 and outright["n_tied"] == 1
+
+    # A front that is ONE outcome wearing 4 hats: the pick is arbitrary and says so.
+    tied = opt.pick_from_front(front[front["w"] == 1])
+    assert tied["n_tied"] == 4 and tied["front_distinct"] == 1
+    assert tied["trial"] == 1                                # deterministic: earliest
+
+    with pytest.raises(ValueError, match="empty front"):
+        opt.pick_from_front(pd.DataFrame())
+
+
+def test_pick_from_front_defaults_to_the_one_shared_preference():
+    """PICK_WEIGHTS is the single source of truth, and it is balanced."""
+    assert opt.PICK_WEIGHTS == (1.0, 1.0)
+    front = _clone_front()
+    assert (opt.pick_from_front(front)["trial"]
+            == opt.pick_from_front(front, weights=opt.PICK_WEIGHTS)["trial"])
+    # ...and the preference still steers: each objective alone picks its own champion.
+    assert opt.pick_from_front(front, weights=(1.0, 0.0))["info_ratio"] == 1.20
+    assert opt.pick_from_front(front, weights=(0.0, 1.0))["excess_cagr"] == 0.30
+
+
+def test_boundary_report_shares_are_not_multiplicity_weighted():
+    """One strategy cannot vote four times to widen a bound just by having an inert knob.
+
+    `front_at_low`/`front_at_high` are plain means over rows and `action` fires at 0.5,
+    so a clone-padded front used to be able to demand a wider search space on the
+    strength of a single result. informed_flow v18 would have cast 33 of its 55 votes
+    that way.
+    """
+    space = {"w": {"type": "int", "low": 1, "high": 100}}
+    front = _clone_front()                     # 4 clones sit at w=1, the low bound
+    report = opt.boundary_report({"w": 50}, space, front=front)
+    assert report.loc["w", "front_at_low"] == pytest.approx(1 / 3)   # 1 of 3 outcomes...
+    assert report.loc["w", "action"] == "ok"                         # ...so: no demand
+    # Without the collapse it would have been 4 of 6 rows, i.e. over the 0.5 trigger.
+    raw = front[["w"]]                          # no objective columns -> nothing to collapse
+    assert opt.boundary_report({"w": 50}, space, front=raw).loc["w", "action"] == "widen low"
+
+
 SPACE = {
     "window": {"type": "int", "low": 10, "high": 100},
     "horizon": {"type": "int", "low": 5, "high": 120, "log": True},

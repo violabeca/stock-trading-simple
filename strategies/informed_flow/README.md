@@ -33,6 +33,14 @@ analysts, and short sellers are doing, and holds the top-ranked names long.
   the value-weighted effect is weak (Asquith-Pathak-Ritter). So this strategy is
   **long-only** and treats *low* days-to-cover as a favourable tilt — it never
   shorts crowded names.
+- **How recently any of them acted** (`recency`, added in v21). Not a fifth source but a
+  **decay on the other four**: each of them reads its signal through a trailing window or
+  an EMA, and *inside* that window an event's age is invisible — a three-day-old insider
+  buy scores exactly like a three-month-old one. This sleeve ranks bars since the name's
+  last insider or rating event, so freshness is priced explicitly, by a weight the study
+  sizes and the sweep can ablate. It exists because that information used to reach the
+  book by accident, through the `min_events` filter, and did real damage; see **The
+  eligibility cliff** below.
 
 **A price-regime overlay.** The four sleeves above are all
 *alternative-data* signals; none of them knows anything about the stock's own price
@@ -77,21 +85,23 @@ conditioning variable points away from this universe. Also excluded: classic PEA
    Israel-Kelly-Moskowitz) — then re-rank into one composite score in [0, 1].
 2. A name **qualifies** to be bought when its composite rank is at or above `q_in`
    (top quantile). Only *eligible* names are ranked at all — a name needs at least
-   `min_events` insider+rating events in the trailing `insider_window`, and one that
+   `min_events` insider/rating event days in the trailing `insider_window`, and one that
    does not is **dropped from the cross-section entirely**, not merely blocked from
    buying. (Ranking it and then refusing to buy it would be the worst of both: it
    could never be held, yet it would still take up rank space and push every other
-   name's percentile around.) **Hold** under **TopK-Drop hysteresis**: sell when the
-   rank falls below the wider `q_out` band, or when the name drops out of the ranked
-   universe altogether, with a `max_hold` time-stop backstop. The `q_in`–`q_out` gap
-   damps turnover.
+   name's percentile around.) `min_events` is a **universe floor and nothing else** —
+   pinned at `1`, deliberately unsearched, for reasons the cliff section below explains
+   at length. **Hold** under **TopK-Drop hysteresis**: sell when the rank falls below the
+   wider `q_out` band, or when the name drops out of the ranked universe altogether, with
+   a `max_hold` time-stop backstop. The `q_in`–`q_out` gap damps turnover.
 3. **Qualifying is necessary, not sufficient — the book has only `max_positions`
    slots.** All names share one cash account, so a new name is bought only when a slot
    is free, and a slot frees only when a holding is sold. If more names qualify than
    there are slots, the highest-ranked ones win; the rest wait on the bench
-   (`slot_blocked` in the diagnostic). With `displace`, a qualifying newcomer that
-   outranks the weakest holding **by `displace_margin`** may take its slot outright
-   instead of waiting.
+   (`slot_blocked` in the diagnostic). A qualifying newcomer that outranks the weakest
+   holding **by `displace_margin`** may take its slot outright instead of waiting; at
+   `displace_margin = 1.0` — the shipped value — that can never happen and every
+   newcomer waits.
 4. Long only, no stops — the rank-exit band is the exit thesis. Fills are at the next
    bar's open; between rotations, weights are left to drift rather than trimmed daily,
    so trading stays event-driven and the fee drag stays small.
@@ -109,19 +119,19 @@ conservative, immaterial at these horizons.
 
 | param | default | meaning |
 |---|---|---|
-| `insider_window` | 63 | trailing bars for insider dollars, the dollar-volume normalizer, and eligibility |
+| `insider_window` | 63 | trailing bars for insider dollars, the dollar-volume normalizer, and eligibility — **triple duty**, so a pick here is not a clean statement about the insider horizon |
 | `rating_halflife` | 21 | EMA half-life (bars) for the rating-change stream |
 | `ptrev_halflife` | 21 | EMA half-life (bars) for the price-target revision stream |
 | `w_insider` / `w_rating` / `w_ptrev` / `w_dtc` | 0.4 / 0.3 / 0.3 / 0.3 | composite weights (a weight of 0, or a missing feature, ablates that signal) |
+| `w_recency` | 1.0 | weight on the coverage-recency sleeve (bars since the last insider/rating event, negated). It has **no window of its own**, so staleness is decoupled from `insider_window` |
 | `trend_fast` / `trend_slow` | 21 / 126 | fast / slow MA legs (bars) of the price-derived MA-trend crossover sleeve (`valid()` requires `trend_fast < trend_slow`) |
 | `rsi_period` | 14 | Wilder-RSI lookback (bars) for the RSI market-condition sleeve |
 | `w_trend` / `w_rsi` | 1.0 / 1.0 | weights on the MA-trend and RSI sleeves — **on by default** (0 ablates, like any sleeve); a soft price-regime tilt |
 | `q_in` / `q_out` | 0.8 / 0.6 | qualify above `q_in`, sell below `q_out` (hysteresis band) |
 | `max_hold` | 126 | time-stop backstop (bars) — see below; it only bites in the band |
-| `min_events` | 1 | eligibility floor: insider+rating events in the window. Below it, a name is dropped from the ranking |
+| `min_events` | 1 | eligibility floor: insider/rating event days in the window. Below it, a name is dropped from the ranking. **Pinned, not searched** — see below |
 | `max_positions` | 10 | slots in the book. Each is a fixed `1/max_positions` of the capital, so fewer names qualifying means idle cash, never a concentrated bet |
-| `displace` | false | when the book is full: `false` = a qualifying newcomer waits for a vacancy; `true` = it evicts the weakest holding if it outranks it |
-| `displace_margin` | 0.0 | how far a challenger must out-rank the weakest holding before it may evict it (one rank place in ~91 names ≈ 0.011). The only brake on displacement — see below |
+| `displace_margin` | 1.0 | when the book is full, how far a challenger must out-rank the weakest holding to take its slot (one rank place in ~91 names ≈ 0.011). `0.0` evicts on any epsilon; `1.0` is unreachable, so every newcomer waits for a vacancy. One axis, no separate on/off flag — see below |
 
 **What `max_hold` is actually for.** It is the least load-bearing parameter here, and
 it exists for exactly one failure case: a name **parked in the hysteresis band**. Such
@@ -149,13 +159,110 @@ indistinguishable from zero at every horizon — −0.28% at 5 bars, −0.45% at
 21, +1.84% at 63, win rate ~50%, p ≥ 0.67. The swaps were a coin flip paying two legs of
 costs each. `displace_margin` is the missing hysteresis on the ordering.
 
-It **ships at 0.0**, i.e. today's exact behaviour, on purpose. Backtesting a margin
-improves the holdout (excess CAGR 0.43 → 0.56 at 0.05, with 53% fewer trades) and *hurts*
-the train window (0.272 → 0.189) — but train is where those parameters were fitted, so it
-is rigged to prefer no brake, and picking the value off the holdout would be peeking.
-The event study is the evidence that does not depend on either fit; the *size* of the
-margin is left to the study (`search` 0.0–0.15) and its *existence* to the sweep grid
-(`[0.0, 0.05]`), the same division of labour as the sleeve weights.
+**Why it is one knob and not two.** There used to be a separate `displace` boolean in
+front of the comparison, and study v18 proved the two were the *same axis*: `score_pct`
+is a percentile in (0, 1], so `challenger ≤ weakest + 1.0` holds for every possible pair
+of ranks, and a margin of 1.0 produces a **bit-identical held mask** to `displace=False`.
+That is not a resemblance — it is an identity, pinned by
+`test_margin_one_is_exactly_the_old_displace_off_flag`.
+
+Keeping both spellings did real damage:
+
+* **A dead parameter.** Every trial that drew `displace=False` carried a
+  `displace_margin` that could not do anything, so the value was unidentifiable. **33 of
+  v18's 55 Pareto-front trials were one strategy** recorded under 14 different margins,
+  all scoring `info_ratio 1.056178 / excess_cagr 0.097963 / 43.458317 trades per year` to
+  the last digit, and the pick reported a `displace_margin` that had had no effect in the
+  trial that earned it. Clone padding does **not** distort the min–max normalization
+  `pick_from_front` applies — min and max do not move when a point is repeated — but it
+  does corrupt every statistic taken *over* the front: `boundary_report`'s edge shares are
+  plain means over rows, so 33 clones vote 33 times to widen whatever bound they carry.
+  `optimize.distinct_front` now collapses ties before either is computed.
+* **An unreachable region.** The objective was still improving at the margin's old `0.15`
+  ceiling, so "brake harder" could only be expressed by flipping a categorical that
+  jumped straight to infinity — leaving everything between 0.15 and 1.0 unexplorable.
+
+One continuous knob is strictly more expressive *and* one dimension smaller. `1.0` ships,
+which is exactly the old `displace: false` the config shipped before, bit for bit — so
+the collapse changes the search space, not the strategy. The sweep grid `[0.0, 1.0]` is
+now the honest ablation: chase the ranking, or pure hysteresis.
+
+**How the choice depends on book width.** Displacement is not good or bad in itself — it
+pays only where the *marginal* name in the book still carries signal. Toggling it with
+everything else fixed at the v18 pick, on the train window, excess CAGR runs:
+
+| slots | 5 | 8 | 15 | 17 | 20 | 30 |
+|---|---|---|---|---|---|---|
+| `margin 1.0` (never displace) | 0.061 | **0.074** | **0.090** | **0.090** | **0.064** | −0.007 |
+| `margin 0.0` (chase the top) | **0.069** | 0.026 | 0.021 | 0.019 | 0.021 | −0.007 |
+
+Chasing pays at 5–8 slots and stops paying from ~15, which is exactly what the
+concentration measurement below predicts: active return is +5.8%/yr in the top decile but
++1.7% at the top 30% and +0.6% at top 40%. A 5-slot book *is* the top decile, so keeping
+it exactly sorted chases real signal; a 15–30 slot book's boundary sits where the edge is
+already gone, so re-sorting it daily pays costs for noise. At 30 slots the two rows are
+identical because the book can no longer fill (median 23 names held), so displacement has
+nothing to displace. **Read a margin pick as a statement about book width**, not as a
+free parameter — and note v18's four walk-forward folds split 3–1 *against* the main
+study's choice, so this is not a converged decision.
+
+**The eligibility cliff — the same bug one layer down (v21).** `displace_margin` fixed a
+*rank ordering* with no hysteresis. `min_events` was a *rolling integer count* with no
+hysteresis, and it was worse, because it did not merely rotate the book — it emptied
+slots. Eligibility is a rolling sum of event days over `insider_window`, so the count
+steps **down** when an old filing ages out, on a bar where nothing whatsoever happened to
+the name; a held name that falls below the floor is force-sold, since the model has
+stopped scoring it. Measured on the v20 pick (which drew `insider_window = 31`,
+`min_events = 3`):
+
+| | train 2018-2024 | holdout 2025-2026 |
+|---|---|---|
+| exits from **eligibility loss** | **140 / 196 (71%)** | **19 / 29 (66%)** |
+| …a single event ageing out (3 → 2) | 95% | 95% |
+| …median `score_pct` on the last bar held | **0.94** | 0.94 |
+| …still above `q_in` when sold | 92% | 89% |
+| exits from `q_out` | 52 | 8 |
+| exits from displacement | 4 | 2 |
+| exits from `max_hold` | 0 | 0 |
+
+So the three brakes this README documents at length governed under a third of exits
+between them, and **the SEC/Yahoo filing calendar governed the rest**. Eligibility was
+lost 1,606 times on train, and 47% of those names were eligible again within 21 bars —
+14% within 3. AMZN's 2-bar holdout position is the mechanism in miniature: PLTR's count
+fell 3 → 2 on 2025-11-05 (after a 180-bar hold) and freed a slot, AMZN's rose 2 → 3 the
+same bar and took it, then on 11-07 AMZN's fell back while PLTR's recovered and they
+swapped again. Four legs of costs, 31 bars apart, and **neither name's composite moved**.
+
+Two things follow, and only the second is obvious. The obvious one: this is turnover
+bought with no information. The other: the forced exits were *not* pure noise. An event
+study over them (cross-sectionally demeaned forward returns, replacement minus sold)
+gives **+1.04% at 5 bars (p = 0.052)** and **+1.57% at 10 (p = 0.030)**, decaying to
++0.62% at 63 (p = 0.78). Coverage recency carries a little real signal — the strategy was
+harvesting it through a bookkeeping cliff that also paid four legs of costs on every
+calendar coincidence.
+
+The fix is therefore not a grace period but a **sleeve**: `w_recency` prices staleness
+continuously and inside the ranking, so a name whose coverage goes stale drifts *down*
+the composite and leaves through `q_out` on an ordering, while `min_events` shrinks to a
+pinned universe floor (`1` — "has the model seen anything at all?"). Unsearched, and that
+matters: leaving the threshold in the space lets the optimizer re-discover the cliff,
+which is exactly what v20 did. At the shipped v21 parameters the exit mix inverts:
+
+| exits by cause | train | holdout |
+|---|---|---|
+| `q_out` | 228 (87%) | 60 (92%) |
+| eligibility loss | 35 (13%) | 5 (8%) |
+| sold while still ranked ≥ `q_in` | 13 (5%) | 5 (8%) |
+
+**Read that as a mechanism check, not a result.** It says the strategy now exits for the
+reason it claims to; it says nothing about whether it makes more money, and it cannot,
+because those are config defaults rather than a tuned pick — the v20 journal cannot be
+read against v21's space at all. Every de-cliffing variant tested at *v20's* pick scored
+below it (train `excess_cagr` 0.446 → 0.25–0.32, holdout 0.780 → 0.28–0.61), and that
+comparison is biased beyond use: `insider_window = 31` with `min_events = 3` is precisely
+the pair that maximizes flicker, chosen by 1,000 trials that could see and exploit this
+exit channel. Bolting a fix onto co-adapted parameters measures the fix against its own
+removal. **Run study v21 and the four walk-forward folds before quoting any number.**
 
 **Data.** `data.features: [insider, ratings, price_target, short_interest]` attaches
 the alt-data matrices to the panel at load time. Populate them by running
@@ -185,6 +292,18 @@ contribution, the raw point-in-time events, and the resulting book. `signals()` 
 from what the backtest traded** — a test asserts they agree. §4 of the notebook renders
 it (rank + bands + real positions; the attribution stack; the triggering events), and
 §4b shows every name's state at once.
+
+**And the book-wide counterpart: which *rule* is trading this?** `strategy.exit_causes(
+panel, **params)` returns one row per completed hold with the rule that ended it —
+`q_out`, `ineligible`, `max_hold` or `displaced` — recorded inside `_select` as each
+decision is made, so it cannot disagree with the book that traded. §10g runs it on every
+holdout, and it is the cheapest check in the notebook: **both of this strategy's worst
+bugs were one `value_counts()` away from obvious and invisible in every other statistic.**
+Displacement owned 122 of 127 exits on the v16 pick; the eligibility cliff owned 140 of
+196 on v20. Neither moves an equity curve in a way you would notice, and both mean the
+strategy is not the one the docstrings describe. Read the `cause` column first, then
+`score_held` — a name sold while still ranked near the top was not sold by a decayed
+thesis. If one mechanism owns most of the exits, **that mechanism is the strategy**.
 
 Four behaviours look like bugs and are not:
 
@@ -272,10 +391,11 @@ signal across four times as many names as it could survive.
 
 The strategy now runs in **portfolio mode**: it returns a `weights` frame, so all names
 share ONE cash account, split into `max_positions` slots of `1/max_positions` each. A
-new name can only be bought by selling an existing one. `displace` decides what happens
-when a better name arrives and the book is full — wait for a vacancy, or evict the
-weakest holding — and is *searched*, not assumed, because concentration argues for
-chasing the top of the ranking and turnover costs argue against it.
+new name can only be bought by selling an existing one. `displace_margin` decides what
+happens when a better name arrives and the book is full — wait for a vacancy, or evict
+the weakest holding, and by how clear a margin — and is *searched*, not assumed, because
+concentration argues for chasing the top of the ranking and turnover costs argue against
+it. Which of the two wins turns out to depend on `max_positions`; see the table above.
 
 One honest caveat: with fractional shares the whole model is scale-invariant, so the
 `init_cash` figure is a **reporting convention, not a constraint**. $10,000 and
@@ -396,10 +516,26 @@ only what runs today.)
 | v15 | alt-data weight floors `0.0 → 0.25` (study sizes a sleeve, the sweep decides existence); `max_positions` low bound widened; sweep grids re-pinned to the shipped values | **no** |
 | v16 | closes the open issue below: same space as v15's *later* trials, cleanly journalled | no |
 | v17 | `insider_window` high bound widened `189 → 378`; **and** the new `displace_margin` dimension, added while this journal still held **zero trials** — so it cost no further bump, and v17 has only ever meant the space described above | **no** |
+| v18 | `max_positions` low bound raised `5 → 15`. Worth reading as a pair with v17: v17 picked `displace=true` at 5 slots (93% of its trials, 35/35 of its front), v18 picked `displace=false` at 15+ (93%, 55/55) — the same objective, opposite answer, because the answer was always conditional on book width | v17 ↔ v18 **no** (different `max_positions` range) |
+| v19 | the `displace` categorical **collapsed into** `displace_margin`, whose range widened `0.0–0.15 → 0.0–1.0`; `displace_margin = 1.0` is bit-identical to the old `displace=false`, so the shipped strategy is unchanged and only the search space is. One dimension smaller, and no longer contains a parameter that silently does nothing | **no** |
+| v21 | the **`recency` sleeve** (`w_recency`, searched like any weight) is added, and **`min_events` loses its `search:`** and is pinned at 1. Both halves of one change: the searched threshold on a rolling count had become the strategy's dominant exit rule (see "The eligibility cliff"), and leaving it searchable would let the optimizer re-discover it. A new dimension and one removed; the shipped strategy changes too, not just the space | **no** |
+| v20 | `max_positions` low bound `15 → 3`. Both journals are populated (v19 5,005 trials, v20 2,500) and both fronts are a **single dominating trial**, so their picks are not tie-breaks — but v20's pick sits at `max_positions = 3`, the new floor, continuing the unbroken run of floor-pinned picks (30 → 15 → 8 → 5 → 3). Read it as a statement about concentration, not a converged value, and note `excess_cagr = 0.446` on a 3-name book is exactly where a concentration artifact would show up | v19 ↔ v20 **no** |
 
-**Open issue in the current journal.** `max_positions`'s low bound was widened `8 → 5`
-without a study bump, so `informed-flow-1d-v15.log` now holds 4,457 trials that could only
-reach 8 and 412 that reached below it — two spaces in one journal. Bump to v16 (or revert
-the bound) before reading `boundary_report` off it. The unified `params:` block cannot
-catch this one: it compares the config against itself, not against a journal written
-weeks ago.
+**Resolved (v15).** `max_positions`'s low bound had been widened `8 → 5` without a study
+bump, so `informed-flow-1d-v15.log` held 4,457 trials that could only reach 8 and 412 that
+reached below it — two spaces in one journal, and `boundary_report` was unreadable off it.
+v16 closed it. Note what the unified `params:` block can and cannot catch: it compares the
+config against itself, never against a journal written weeks ago, so **a bound change is
+still only caught by a human bumping the study name**.
+
+**Open issue in v21: nothing has been run in it yet.** The `recency` sleeve plus the
+pinned `min_events` changed both the space *and* the shipped strategy, so v20's 2,500
+trials cannot be read against it and `informed-flow-1d-v21.log` starts empty. Until it is
+run, the shipped `params:` values **are** the strategy — and they are v20's *defaults*,
+not v20's pick. That matters more than usual this time: v20's pick is the parameter set
+that drew `insider_window = 31` / `min_events = 3`, i.e. the one co-adapted to the exit
+channel v21 removes, so it is not a baseline the new strategy can be measured against.
+Re-run the study **and** the four walk-forward folds (§10b·i re-searches per fold, so it
+is the instrument that can actually judge this change) before quoting any tuned number.
+§10b·ii's `w_recency: [0.0, 1.0]` grid column is the out-of-sample vote on whether the new
+sleeve earns its weight — that vote belongs to the folds, never to the holdout.

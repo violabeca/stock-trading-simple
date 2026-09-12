@@ -739,6 +739,7 @@ universe:
   - AAPL
   - ABBV
   - ABT
+  - ACN
   - AMAT
   - AMD
   - AMGN
@@ -754,13 +755,21 @@ universe:
   - BBVA
   - BKNG
   - BLK
+  - BMO
+  - BMY
+  - BNS
+  - BP
   - BTI
   - BUD
   - C
   - CAT
   - CB
   - CCZ
+  - COF
+  - COP
   - COST
+  - CRM
+  - CRWD
   - CSCO
   - CVS
   - CVX
@@ -775,9 +784,7 @@ universe:
   - GOOGL
   - GS
   - HD
-  - HDB
   - HSBC
-  - IBKR
   - IBM
   - INTC
   - ISRG
@@ -787,27 +794,39 @@ universe:
   - KO
   - LIN
   - LLY
+  - LMT
   - LRCX
   - MA
   - MCD
+  - MDT
   - META
+  - MFG
+  - MNST
+  - MO
   - MRK
   - MRVL
   - MS
   - MSFT
   - MU
   - MUFG
+  - NEE
+  - NEM
   - NVDA
   - NVO
   - NVS
   - ORCL
   - PANW
+  - PBR
   - PEP
   - PFE
   - PG
   - PGR
+  - PH
+  - PLD
   - PLTR
   - PM
+  - QCOM
+  - RIO
   - RTX
   - RY
   - SAN
@@ -816,6 +835,7 @@ universe:
   - SCHW
   - SNDK
   - SPGI
+  - STX
   - T
   - TD
   - TJX

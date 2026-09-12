@@ -18,7 +18,7 @@ _PARAMS = {"insider_window": 10, "rating_halflife": 5, "ptrev_halflife": 5,
            # Enough slots that the panel's whole universe fits, so tests about *ranking*
            # are not silently also testing the capital constraint. The tests that DO
            # exercise the slot limit set it themselves.
-           "max_positions": 5, "displace": False}
+           "max_positions": 5, "displace_margin": 1.0}
 
 
 def _if(panel, **overrides):
@@ -33,6 +33,10 @@ def _module():
 
 def _explain(panel, symbol, **overrides):
     return _module()["explain"](panel, symbol, **{**_PARAMS, **overrides})
+
+
+def _causes(panel, **overrides):
+    return _module()["exit_causes"](panel, **{**_PARAMS, **overrides})
 
 
 def _bought(sig, sym) -> np.ndarray:
@@ -100,15 +104,46 @@ def test_ineligible_names_leave_the_ranked_universe():
 
 
 def test_held_name_that_becomes_ineligible_is_exited():
-    """If a name falls out of the ranked universe, close it — do not carry it unscored."""
+    """If a name falls out of the ranked universe, close it — do not carry it unscored.
+
+    `w_recency=0` isolates the eligibility path on purpose: with the recency sleeve live,
+    AAA's rank decays as its coverage goes stale and `q_out` sells it *first* — which is
+    the whole point of the sleeve and is pinned by the next test. Here we want the cliff
+    itself, and nothing else, to do the selling.
+    """
     p = _panel(symbols=("AAA", "BBB"))
     p.features["insider"].iloc[30, 0] = 5_000_000.0   # AAA's only event
     p.features["insider"].iloc[30, 1] = 1_000_000.0   # keeps BBB in the universe too
     p.features["ratings"].iloc[30:, 1] = 1.0          # BBB stays eligible; AAA does not
-    sig = _if(p, max_hold=200)                        # rule out the time-stop
+    sig = _if(p, max_hold=200, w_recency=0.0)         # rule out the time-stop and recency
     # AAA's event ages out of the 10-bar window at bar 40 -> ineligible -> sold.
     assert _bought(sig, "AAA").size
     assert 40 <= _sold(sig, "AAA")[0] <= 43
+    exits = _causes(p, max_hold=200, w_recency=0.0)
+    assert exits[exits["symbol"] == "AAA"]["cause"].iloc[0] == "ineligible"
+
+
+def test_stale_coverage_exits_through_the_band_before_the_cliff():
+    """The v21 fix, pinned: staleness sells on an ORDERING, not on a bookkeeping step.
+
+    Same panel as the test above. AAA's coverage goes stale after bar 30 while BBB keeps
+    filing every bar, so with the recency sleeve live AAA's composite rank falls and
+    `q_out` closes it — strictly *before* bar 40, where the `min_events` count would have
+    stepped down and force-sold a name that was still ranked at the top of its universe.
+    That step-down was the strategy's dominant exit rule (140 of 196 train exits on the
+    v20 pick) and is what put AMZN in the holdout book for two bars.
+    """
+    p = _panel(symbols=("AAA", "BBB"))
+    p.features["insider"].iloc[30, 0] = 5_000_000.0
+    p.features["insider"].iloc[30, 1] = 1_000_000.0
+    p.features["ratings"].iloc[30:, 1] = 1.0          # BBB's coverage stays fresh
+    sig = _if(p, max_hold=200)                        # recency on (config ships w_recency=1)
+    sold = _sold(sig, "AAA")
+    assert sold.size and sold[0] < 40                 # gone before the cliff could fire
+    exits = _causes(p, max_hold=200)
+    aaa = exits[exits["symbol"] == "AAA"].iloc[0]
+    assert aaa["cause"] == "q_out"                    # ...and for a reason the bands own
+    assert not np.isnan(aaa["score_exit"])            # it still had a score when sold
 
 
 def test_hysteresis_exit_when_rank_drops():
@@ -227,32 +262,32 @@ _DISPLACE = {"w_insider": 0.0, "w_rating": 1.0, "w_dtc": 0.0, "rating_halflife":
 #: Sending EEE to 10 there leaves a late ranking of EEE 1.0, BBB 0.8, CCC 0.6, AAA 0.4,
 #: DDD 0.2. So the book (AAA, BBB) is full, EEE outranks everything, and **AAA is the
 #: weakest holding** — clinging on at exactly q_out. Whether EEE gets in is entirely a
-#: question of `displace`.
+#: question of `displace_margin`.
 
 
 def test_a_qualified_name_waits_for_a_vacancy():
-    """With displace off, the best name in the market cannot buy in — the money is spent.
+    """At margin 1.0 the best name in the market cannot buy in — the money is spent.
 
     This state simply did not exist under per-symbol cash accounts, where every name had
     its own money and a qualifying name was ALWAYS bought.
     """
     p = _band_panel()
     p.features["ratings"].loc[p.close.index[40:], "EEE"] = 10.0   # EEE storms to the top
-    late = _if(p, **_DISPLACE, displace=False)["weights"].iloc[70]
+    late = _if(p, **_DISPLACE, displace_margin=1.0)["weights"].iloc[70]
     assert late["AAA"] > 0 and late["BBB"] > 0         # both original holdings keep their slots
     assert late["EEE"] == 0                            # the best name in the market: unbought
 
-    exp = _explain(p, "EEE", **_DISPLACE, displace=False)
+    exp = _explain(p, "EEE", **_DISPLACE, displace_margin=1.0)
     bar = exp.index[69]                                # the signal bar behind weights[70]
     assert exp.loc[bar, "qualified"] and exp.loc[bar, "slot_blocked"]
     assert exp.loc[bar, "state"] == "slot_blocked"     # and the diagnostic says exactly why
 
 
 def test_displace_evicts_the_weakest_holding():
-    """With displace on, the same newcomer takes the WEAKEST holding's slot — not any slot."""
+    """At margin 0 the same newcomer takes the WEAKEST holding's slot — not any slot."""
     p = _band_panel()
     p.features["ratings"].loc[p.close.index[40:], "EEE"] = 10.0
-    late = _if(p, **_DISPLACE, displace=True)["weights"].iloc[70]
+    late = _if(p, **_DISPLACE, displace_margin=0.0)["weights"].iloc[70]
     assert late["EEE"] > 0                             # EEE is in...
     assert late["AAA"] == 0                            # ...and AAA, the weaker holding, is out
     assert late["BBB"] > 0                             # the stronger holding is untouched
@@ -272,14 +307,14 @@ def test_displace_margin_blocks_a_one_place_challenger():
     holding — the marginal case the margin exists for.
     """
     p = _band_panel()
-    bare = _if(p, **_DISPLACE, displace=True)["weights"].iloc[70]
+    bare = _if(p, **_DISPLACE, displace_margin=0.0)["weights"].iloc[70]
     assert bare["CCC"] > 0 and bare["AAA"] == 0        # one place is enough, unbraked
 
-    braked = _if(p, **_DISPLACE, displace=True, displace_margin=0.25)["weights"].iloc[70]
+    braked = _if(p, **_DISPLACE, displace_margin=0.25)["weights"].iloc[70]
     assert braked["AAA"] > 0 and braked["CCC"] == 0    # ...and not enough, with the brake
     assert braked["BBB"] > 0 and (braked > 0).sum() == 2   # still exactly two slots
     # CCC is not merely unbought, it is on the bench for the stated reason.
-    exp = _explain(p, "CCC", **_DISPLACE, displace=True, displace_margin=0.25)
+    exp = _explain(p, "CCC", **_DISPLACE, displace_margin=0.25)
     assert exp.loc[exp.index[69], "state"] == "slot_blocked"
 
 
@@ -291,9 +326,27 @@ def test_a_decisive_challenger_still_displaces_through_the_margin():
     """
     p = _band_panel()
     p.features["ratings"].loc[p.close.index[40:], "EEE"] = 10.0
-    late = _if(p, **_DISPLACE, displace=True, displace_margin=0.25)["weights"].iloc[70]
+    late = _if(p, **_DISPLACE, displace_margin=0.25)["weights"].iloc[70]
     assert late["EEE"] > 0 and late["AAA"] == 0
     assert (late > 0).sum() == 2
+
+
+def test_margin_one_is_exactly_the_old_displace_off_flag():
+    """The whole justification for collapsing two knobs into one, pinned as a test.
+
+    `score_pct` is a percentile in (0, 1], so `challenger <= weakest + 1.0` holds for
+    every possible pair of ranks and the displacement loop can never fire. That is what
+    makes `displace_margin = 1.0` a faithful replacement for the old `displace=False`
+    boolean rather than an approximation of it — and it must hold for ANY margin at or
+    above 1.0, since the study can only reach exactly 1.0 but a hand-set value need not.
+    """
+    p = _band_panel()
+    p.features["ratings"].loc[p.close.index[40:], "EEE"] = 10.0
+    never = _if(p, **_DISPLACE, displace_margin=1.0)["weights"]
+    for bigger in (1.0001, 2.0, 10.0):
+        assert _if(p, **_DISPLACE, displace_margin=bigger)["weights"].equals(never)
+    # ...and it is genuinely the no-displacement book, not a coincidence of this panel.
+    assert never.iloc[70]["EEE"] == 0 and never.iloc[70]["AAA"] > 0
 
 
 def test_thin_selection_leaves_cash_rather_than_concentrating():
@@ -330,6 +383,120 @@ def test_low_coverage_sleeve_is_dropped():
     dtc["CCC"] = 3.0
     parts = _module()["_compose"](p, **{**_PARAMS, "w_dtc": 0.9})
     assert "short_interest" in parts["present"]
+
+
+# --- the recency sleeve (v21) ------------------------------------------------
+def _staggered_panel(last_event_bars, n=90):
+    """One insider event per name, at the bar given — so the names differ ONLY in staleness.
+
+    ``last_event_bars`` maps symbol -> the bar its (single) event lands on. Every event is
+    the same size, so the insider sleeve ranks every name identically and any ordering the
+    composite produces comes from recency alone.
+    """
+    syms = list(last_event_bars)
+    index = pd.date_range("2020-01-02", periods=n, freq="B", tz="UTC")
+    close = pd.DataFrame(100.0, index=index, columns=syms)
+    panel = Panel(close=close, open_=close * 0.999, high=close * 1.01, low=close * 0.99,
+                  volume=pd.DataFrame(1e6, index=index, columns=syms), bar="1d")
+    zero = pd.DataFrame(0.0, index=index, columns=syms)
+    panel.features = {"insider": zero.copy(), "ratings": zero.copy()}
+    for sym, bar in last_event_bars.items():
+        panel.features["insider"].iloc[bar, syms.index(sym)] = 5_000_000.0
+    return panel
+
+
+def test_recency_sleeve_ranks_fresh_coverage_above_stale():
+    """Identical evidence, different age: the fresher name ranks higher. That is the sleeve.
+
+    Every other sleeve reads through a trailing window or an EMA, inside which an event's
+    age is invisible — four identical insider buys land on the same insider rank whether
+    they are 5 or 20 bars old. `w_recency` is what makes the difference legible, and it is
+    the reason a name going stale can now leave through `q_out` instead of through the
+    `min_events` cliff.
+    """
+    p = _staggered_panel({"AAA": 50, "BBB": 45, "CCC": 40, "DDD": 35})
+    parts = _module()["_compose"](
+        p, **{**_PARAMS, "insider_window": 60,          # wide enough that all four stay eligible
+              "w_insider": 0.0, "w_rating": 0.0, "w_ptrev": 0.0, "w_dtc": 0.0,
+              "w_recency": 1.0})
+    assert parts["present"] == ["recency"]              # nothing else can be doing this
+    score = parts["score_pct"].loc[p.close.index[55]]
+    assert score["AAA"] > score["BBB"] > score["CCC"] > score["DDD"]
+    # An event day is 0 bars stale and the day after is -1: the sign convention that makes
+    # "higher is favourable" true here, like every other sleeve.
+    raw = parts["raw"]["recency"]
+    assert raw.iloc[50]["AAA"] == 0.0 and raw.iloc[51]["AAA"] == -1.0
+    assert np.isnan(raw.iloc[10]["AAA"])                # before its first event ever: no data
+
+
+def test_recency_sleeve_is_ablated_by_zero_weight():
+    """`w_recency: 0.0` removes it entirely — so the sweep's 0.0 column is a real ablation."""
+    p = _staggered_panel({"AAA": 50, "BBB": 45, "CCC": 40, "DDD": 35})
+    base = {**_PARAMS, "insider_window": 60, "w_insider": 1.0}
+    on = _module()["_compose"](p, **{**base, "w_recency": 1.0})
+    off = _module()["_compose"](p, **{**base, "w_recency": 0.0})
+    assert "recency" in on["present"] and "recency" not in off["present"]
+    assert not on["score_pct"].equals(off["score_pct"])  # so "off" is a meaningful state
+
+
+def test_recency_and_eligibility_share_one_event_definition():
+    """`_event_days` is the single source of truth for "someone acted".
+
+    If the filter and the sleeve disagreed about what an event is, a name could be dropped
+    from the universe for staleness the sleeve still scores as fresh — and the exit would
+    once again have no readable cause.
+    """
+    module = _module()
+    p = _panel()
+    p.features["insider"].iloc[30, 0] = 5_000_000.0
+    p.features["ratings"].iloc[30, 0] = 1.0            # SAME bar, both streams
+    p.features["ratings"].iloc[40, 1] = 1.0
+    days = module["_event_days"](p.features)
+    assert days.iloc[30]["AAA"] and days.iloc[40]["BBB"]
+    # A bar carrying both an insider filing AND a rating change is ONE event day...
+    counts = module["_eligibility"](p.features, 10)
+    assert counts.iloc[30]["AAA"] == 1.0
+    # ...and recency is measured off exactly those bars.
+    assert module["_recency"](days).iloc[35]["AAA"] == -5.0
+
+
+# --- exit-cause attribution (which rule is actually trading this strategy?) ---
+def test_exit_causes_names_the_rule_and_agrees_with_the_book():
+    """Every exit is attributed, and the attribution lines up with the traded weights.
+
+    The check that catches an undocumented mechanism doing the trading — which has
+    happened twice here (displacement on the v16 pick, the `min_events` cliff on v20).
+    Causes are recorded inside `_select` as decisions are made, so they cannot drift from
+    the book; this pins that they also line up with the execution-timed weight frame.
+    """
+    p = _band_panel()
+    p.features["ratings"].loc[p.close.index[40:], "EEE"] = 10.0
+    kw = {**_DISPLACE, "displace_margin": 0.0}
+    exits = _causes(p, **kw)
+    sig = _if(p, **kw)
+
+    assert len(exits) and set(exits["cause"]) <= {"q_out", "ineligible", "max_hold",
+                                                  "displaced"}
+    assert (exits["bars_held"] > 0).all()
+    # AAA is the weakest holding when EEE storms in, so it is DISPLACED — a cause no
+    # rank band can express, which is why it has to be recorded rather than inferred.
+    assert exits[exits["symbol"] == "AAA"]["cause"].iloc[0] == "displaced"
+    # Exits are on the signal clock; the fill is the next bar. Every attributed exit must
+    # therefore show up as a sell one bar later in the weight frame the engine received.
+    for _, row in exits.iterrows():
+        signal_bar = p.close.index.get_loc(row["exit"])
+        assert signal_bar + 1 in set(_sold(sig, row["symbol"]).tolist())
+
+
+def test_exit_causes_reports_the_time_stop_and_omits_open_positions():
+    """`max_hold` is attributable too, and a position still open has no cause yet."""
+    p = _band_panel()
+    kw = {"w_insider": 0.0, "w_rating": 1.0, "w_dtc": 0.0, "rating_halflife": 2,
+          "max_hold": 10}
+    assert _causes(p, **kw)[lambda d: d["symbol"] == "AAA"]["cause"].iloc[0] == "max_hold"
+    # BBB is never sold — it leads the pack to the last bar — so it must not be listed.
+    never_sold = _causes(p, w_insider=0.0, w_rating=1.0, w_dtc=0.0, max_hold=500)
+    assert "BBB" not in set(never_sold["symbol"])
 
 
 # --- the price-derived market-condition sleeves (MA-trend + Wilder RSI) ------
@@ -448,7 +615,7 @@ def test_peer_drift_moves_a_name_with_no_event():
     p = _panel(symbols=("AAA", "BBB"))
     p.features["insider"].iloc[30, 0] = 5_000_000.0
     p.features["insider"].iloc[35, 1] = 50_000_000.0
-    exp = _explain(p, "AAA", max_hold=200)
+    exp = _explain(p, "AAA", max_hold=200, w_recency=0.0)   # recency IS an own-value move
     bar = exp.index[35]
     assert exp.loc[bar, "d_score"] < 0                 # AAA's rank fell
     assert abs(exp.loc[bar, "own"]) < 1e-12            # its own value did not move

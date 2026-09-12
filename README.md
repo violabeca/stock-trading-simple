@@ -74,7 +74,7 @@ src/trading_simple/
   data.py                     DB → Panel (wide adjusted OHLCV matrices)
   features.py                 DB alt-data tables → Panel.features matrices
   backtest.py                 THE engine: run / sweep / metrics / helpers
-  optimize.py                 Optuna: journal storage, Pareto front, pick_best, boundary + stability checks
+  optimize.py                 Optuna: journal storage, Pareto front, one picking rule, boundary + stability checks
   plots.py                    every figure, one consistent plotly design
   strategies.py               loads a strategy folder by name
   jobs.py                     notebooks → CLI subprocess handoff
@@ -261,9 +261,23 @@ inside one strategy. So every return metric is annualized (`cagr`, `excess_cagr`
 *comparable*, never *trustworthy*.
 
 No single "best" exists — the result is the set of parameter sets where improving one
-objective must hurt the other (the Pareto front). `optimize.pick_best(study,
-weights=(1.0, 0.5))` reduces it to one trial under an explicit preference, and
-`optimize.boundary_report` flags picked parameters sitting on a search-space bound
+objective must hurt the other (the Pareto front). `optimize.pick_from_front(front)`
+reduces it to one row (and `optimize.pick_best(study)` does the same from a study),
+under `optimize.PICK_WEIGHTS` — **one balanced preference for the whole repo**, because
+this used to be a per-notebook literal and drifted into three different answers, one of
+them arguing from the pre-v5 objectives. Pass `weights=` explicitly if a strategy needs
+a different trade-off, and say why at the call site.
+
+Both first collapse the front with `optimize.distinct_front`, which keeps one row per
+distinct *objective pair*. This is not cosmetic: an **inert** parameter — one that cannot
+affect the book, like `informed_flow`'s `max_hold` at a low displacement margin — lets the
+sampler mint unlimited "distinct" front entries that are all the same strategy. v17's
+front was 35 rows and **one** outcome; v18's was 55 rows and 32. Any statistic taken over
+the front is otherwise multiplicity-weighted (`boundary_report`'s edge shares are plain
+means, and its `action` fires at 0.5, so clones can vote to widen a bound), and a pick
+made over clones is a tie-break wearing the costume of a choice. The picked row carries
+`n_tied` so that says so out loud. `optimize.boundary_report` flags picked parameters
+sitting on a search-space bound
 (log-aware) — evidence the optimum may lie outside the searched box, so widen that bound
 and re-run. Beware: more trials on the same data = more chances to overfit; judge winners
 on `pct_profitable` (breadth across symbols), on the Deflated Sharpe Ratio, and on

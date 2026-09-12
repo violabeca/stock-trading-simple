@@ -25,6 +25,13 @@ months, and combining their independent signals is more robust than any one.
    value-weighted effect is weak (Asquith-Pathak-Ritter). So we run **long-only**
    and treat *low* days-to-cover as a favourable tilt, never shorting crowded
    names.
+5. **How recently any of them acted** — the ``recency`` sleeve, ranked on bars
+   since this name's last insider or rating event. Not a fifth source of
+   information but a *decay* on the four above: an insider buy from three days ago
+   and one from three months ago are not the same evidence, and every sleeve above
+   scores them alike once the event sits inside its trailing window. See
+   :func:`_recency` for the measurement that made this an explicit sleeve rather
+   than an accident of the eligibility filter.
 
 Construction (all in this pure module; the feature layer only supplies daily
 aggregates): percentile-rank each present signal cross-sectionally, combine with
@@ -48,12 +55,14 @@ account *per symbol*, a strategy holding 40 of 100 names sat ~30% invested again
 100%-invested benchmark, forfeiting most of the market's return to buy a selection
 edge, and the ranking was diluted across four times as many names as the edge could
 survive (measured: top decile +5.8%/yr active, top 40% +0.6%/yr). Slots fix both.
-``displace`` decides what happens when a better name arrives and the book is full:
-wait for a vacancy (low turnover), or evict the weakest holding (chases the top of
-the ranking, pays for it in trading costs). ``displace_margin`` is the brake on that:
-a challenger must out-rank the weakest holding **by a clear gap**, not by an epsilon.
-It exists because the bare comparison turned out to drive essentially all the turnover
-and to carry no information — see :func:`_select`.
+``displace_margin`` decides what happens when a better name arrives and the book is
+full: a challenger takes the weakest holding's slot only if it out-ranks it by that
+much. It is a single continuous axis from "chase the ranking" to "never displace" —
+``0.0`` evicts on any epsilon of rank advantage, ``1.0`` can never be cleared (ranks
+live in ``(0, 1]``) and so means the challenger always waits for a vacancy. There is
+deliberately **no separate on/off flag**: one used to exist, and because
+``displace=False`` is exactly ``displace_margin >= 1.0``, the two were one axis wearing
+two hats — see :func:`_select`.
 
 The one exception to "left to drift" is the ``retrim_k`` concentration cap: a held name
 whose book weight reaches ``retrim_k ×`` its slot (double it, by default) is trimmed back
@@ -68,6 +77,25 @@ refusing to buy it would be the worst of both: it could never be held, yet it
 would still occupy rank space and push every other name's percentile around. So
 ``score_pct`` is NaN for such names, and a *held* name that falls out of
 eligibility is exited rather than carried on a score the model no longer computes.
+
+``min_events`` is therefore a **universe floor and nothing else** — "has the model
+seen anything at all about this name?" — and it is pinned at ``1``, deliberately
+unsearched. It used to be searched up to ``3``, and that quietly made it the
+strategy's dominant *exit* rule: the count is a rolling sum over ``insider_window``,
+so it steps **down** when an old event ages out of the window, on a bar where nothing
+happened. Measured on the v20 pick (``insider_window=31``, ``min_events=3``), **140 of
+196 train exits and 19 of 29 holdout exits** were eligibility losses; 95% of them were
+a single event ageing out (3 → 2), at a **median ``score_pct`` of 0.94**, with 92%
+still above ``q_in`` on the bar they were sold. The ``q_in``/``q_out`` band,
+``max_hold`` and ``displace_margin`` — the three brakes this module documents at
+length — governed under a third of exits between them; the filing calendar governed
+the rest. AMZN's 2-bar holdout position (bought 2025-11-06, sold 2025-11-10) was
+bracketed by two such steps 31 bars apart: PLTR's count fell 3 → 2 and freed the slot,
+AMZN's count rose 2 → 3 and took it, then AMZN's fell back and PLTR's recovered. Four
+legs of costs, and neither name's composite moved. The information in that cliff —
+recency of coverage — is now carried continuously by the ``recency`` sleeve, where the
+study can size it and §10b·ii can ablate it, and a name whose coverage goes stale
+drifts *down* the ranking and leaves through ``q_out`` on an ordering.
 
 A signal that is missing, or that covers too few names to rank meaningfully (see
 :data:`_MIN_COVERAGE`), is dropped from the composite and its weight renormalized
@@ -90,11 +118,12 @@ import pandas as pd
 from trading_simple import backtest as bt
 from trading_simple.data import Panel
 
-#: Feature name -> the weight parameter that scales it. The last two are the
-#: price-derived market-condition sleeves (trend + RSI); every other one is alt-data.
+#: Feature name -> the weight parameter that scales it. ``trend``/``rsi`` are the
+#: price-derived market-condition sleeves; ``recency`` is derived from the alt-data
+#: event stream rather than from a feature table of its own; the rest are alt-data.
 _WEIGHT_KEY = {"insider": "w_insider", "ratings": "w_rating",
                "price_target": "w_ptrev", "short_interest": "w_dtc",
-               "trend": "w_trend", "rsi": "w_rsi"}
+               "recency": "w_recency", "trend": "w_trend", "rsi": "w_rsi"}
 
 #: A sleeve must carry data for at least this fraction of the universe on its
 #: best-covered bar to count as live. Without this floor, a barely-ingested table
@@ -120,6 +149,7 @@ def signals(
     w_rating: float = 0.3,
     w_ptrev: float = 0.3,
     w_dtc: float = 0.3,
+    w_recency: float = 1.0,
     w_trend: float = 0.0,
     w_rsi: float = 0.0,
     q_in: float = 0.8,
@@ -127,8 +157,7 @@ def signals(
     max_hold: int = 126,
     min_events: int = 1,
     max_positions: int = 10,
-    displace: bool = False,
-    displace_margin: float = 0.0,
+    displace_margin: float = 1.0,
     retrim_k: float | None = 2.0,
 ) -> dict:
     """Build long-only target weights from the ranked informed-flow composite.
@@ -154,6 +183,10 @@ def signals(
         w_rating: Composite weight on the rating-change signal.
         w_ptrev: Composite weight on the price-target revision signal.
         w_dtc: Composite weight on the (negated) days-to-cover signal.
+        w_recency: Composite weight on the coverage-recency sleeve (bars since this
+            name's last insider/rating event, negated so fresher ranks higher). ``0``
+            ablates it. This is the sleeve that replaced the ``min_events`` cliff as
+            the way staleness leaves the book — see :func:`_recency`.
         w_trend: Composite weight on the MA-trend sleeve; ``0`` ablates it. Config ships
             ``1.0`` (on by default); the signature default is ``0.0``.
         w_rsi: Composite weight on the RSI sleeve; ``0`` ablates it. Config ships ``1.0``.
@@ -164,18 +197,20 @@ def signals(
             is the hysteresis band that damps turnover.
         max_hold: Time-stop backstop — see :func:`_select` for the one case it binds.
         min_events: Minimum insider+rating events in the trailing window for a
-            name to be eligible (drops never-covered names from the ranking).
+            name to be eligible (drops never-covered names from the ranking). A
+            universe floor only — pinned at ``1`` and unsearched, because a searched
+            threshold on a rolling count becomes an exit rule that fires when an old
+            event ages out of the window. See the module docstring.
         max_positions: Number of slots in the book. Each holds a fixed
             ``1 / max_positions`` of the capital, so the book is fully invested when all
             slots are filled and holds cash when fewer names qualify.
-        displace: What happens when a qualifying name arrives and the book is full.
-            ``False`` — it waits for a vacancy. ``True`` — it evicts the weakest current
-            holding if it outranks it by ``displace_margin``.
-        displace_margin: How much a challenger must out-rank the weakest holding by, in
-            composite-rank units, before it may evict it. ``0.0`` reproduces the bare
-            "any epsilon wins" comparison; one rank place in a 90-name cross-section is
-            ~0.011, so e.g. ``0.05`` means "about five places clear". Ignored when
-            ``displace`` is off. See :func:`_select` for why it exists.
+        displace_margin: What happens when a qualifying name arrives and the book is full,
+            on one continuous axis: the challenger evicts the weakest holding only if it
+            out-ranks it by this much, in composite-rank units. ``0.0`` evicts on any
+            epsilon (one rank place in a 90-name cross-section is ~0.011, so ``0.05`` is
+            "about five places clear"); ``1.0`` is unreachable, since ranks live in
+            ``(0, 1]``, and so means the challenger always waits for a vacancy.
+            See :func:`_select` for why this is one knob and not two.
         retrim_k: Single-name concentration cap. A held name drifts untouched until its
             book weight reaches ``retrim_k ×`` its ``1 / max_positions`` slot (``2.0`` =
             double), at which point the engine trims it back to the slot and the freed cash
@@ -192,7 +227,7 @@ def signals(
     """
     parts = _compose(panel, insider_window=insider_window, rating_halflife=rating_halflife,
                      ptrev_halflife=ptrev_halflife, w_insider=w_insider, w_rating=w_rating,
-                     w_ptrev=w_ptrev, w_dtc=w_dtc, min_events=min_events,
+                     w_ptrev=w_ptrev, w_dtc=w_dtc, w_recency=w_recency, min_events=min_events,
                      trend_fast=trend_fast, trend_slow=trend_slow, rsi_period=rsi_period,
                      w_trend=w_trend, w_rsi=w_rsi)
     if not parts["present"]:
@@ -200,7 +235,7 @@ def signals(
         return {"weights": flat, "retrim_k": retrim_k}
 
     held = _select(parts, q_in=q_in, q_out=q_out, max_hold=max_hold,
-                   max_positions=max_positions, displace=displace,
+                   max_positions=max_positions,
                    displace_margin=displace_margin)["held"]
     return {"weights": _weights(held, max_positions), "retrim_k": retrim_k}
 
@@ -267,6 +302,7 @@ def _compose(
     w_ptrev: float,
     w_dtc: float,
     min_events: int,
+    w_recency: float = 1.0,
     trend_fast: int = 21,
     trend_slow: int = 126,
     rsi_period: int = 14,
@@ -289,6 +325,7 @@ def _compose(
         w_ptrev: Weight on the price-target revision signal.
         w_dtc: Weight on the (negated) days-to-cover signal.
         min_events: Eligibility floor on trailing insider+rating events.
+        w_recency: Weight on the coverage-recency sleeve (``0`` ablates it).
         trend_fast: Fast-MA lookback (bars) for the price-derived MA-trend sleeve.
         trend_slow: Slow-MA lookback (bars) for the MA-trend sleeve (> trend_fast).
         rsi_period: Lookback (bars) for the price-derived Wilder-RSI sleeve.
@@ -322,6 +359,12 @@ def _compose(
     if "short_interest" in feats:
         raw["short_interest"] = -feats["short_interest"]  # low days-to-cover is favourable
 
+    # Derived from the same event stream `_eligibility` counts, but continuous and with no
+    # window of its own: it is what the `min_events` cliff used to express by accident.
+    events = _event_days(feats)
+    if events is not None:
+        raw["recency"] = _recency(events)
+
     # Price-derived "market-condition" sleeves. Unlike the alt-data sleeves above they need
     # no feature table — they read panel.close directly — so they are always available and
     # are ablated purely by a 0 weight in the `present` filter below. Higher = more
@@ -333,7 +376,7 @@ def _compose(
 
     weights = {"insider": w_insider, "ratings": w_rating,
                "price_target": w_ptrev, "short_interest": w_dtc,
-               "trend": w_trend, "rsi": w_rsi}
+               "recency": w_recency, "trend": w_trend, "rsi": w_rsi}
     present = [k for k in raw if weights[k] > 0 and _coverage(raw[k]) >= _MIN_COVERAGE]
     n_events = _eligibility(feats, insider_window)
     eligible = n_events >= min_events
@@ -381,7 +424,7 @@ def _score_from_raw(raw: dict, weights: dict, present: list, wsum: float,
 
 
 def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
-            max_positions: int, displace: bool, displace_margin: float = 0.0) -> dict:
+            max_positions: int, displace_margin: float = 1.0) -> dict:
     """Walk the bars and decide which names the book owns, subject to a slot limit.
 
     The single place the ``q_in``/``q_out`` bands, the time-stop and the capital
@@ -402,10 +445,13 @@ def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
        the cost of two fees and no change in the book.
     2. **Sell** anything that fell below ``q_out``, lost eligibility (its score is NaN —
        the model has stopped evaluating it, so holding it is holding an unscored
-       position), or ran out its ``max_hold`` clock. This is what frees a slot.
-    3. **Optionally displace.** With ``displace``, a qualifying challenger that outranks
-       the weakest holding **by ``displace_margin``** takes its place. Without it, the
-       challenger waits.
+       position), or ran out its ``max_hold`` clock. This is what frees a slot. Which of
+       the three fired is recorded per exit and surfaced by :func:`exit_causes`; read it
+       every run, because "the exit rule I documented is not the one doing the trading"
+       is a failure that shows up nowhere in the equity curve. It shipped twice — once as
+       displacement (see below), once as the ``min_events`` cliff (module docstring).
+    3. **Displace**, if a qualifying challenger out-ranks the weakest holding by
+       ``displace_margin``. At ``1.0`` this can never fire and the challenger waits.
     4. **Fill free slots** from the qualifying names, best-ranked first.
 
     **Why the margin exists.** Steps 1-2 gate a name's rank *level*; step 3 is an
@@ -422,6 +468,21 @@ def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
     +0.04% at 21, +1.84% at 63; win rate ~50%, p >= 0.67) — the swaps were a coin flip
     paying two legs of costs each. The margin is the missing hysteresis on the ordering.
 
+    **Why it is ONE knob and not two.** A separate ``displace`` boolean used to sit in
+    front of this loop, and it was the *same axis*: ``score_pct`` is a percentile in
+    ``(0, 1]``, so ``row[challenger] <= row[weakest] + 1.0`` holds identically and a
+    margin of ``1.0`` produces a **bit-identical** held mask to ``displace=False``. Two
+    spellings of one thing cost real damage in study v18: every trial that drew
+    ``displace=False`` carried a ``displace_margin`` that did nothing, so the value was
+    unidentifiable — 33 of the 55 Pareto-front trials were *the same strategy* recorded
+    under 14 different margins, all scoring 1.056178 / 0.097963 to the last digit, which
+    also skews the min-max scaling `pick_from_front` normalizes over. Worse, the flag
+    reached past the margin's own search ceiling: the objective was still climbing at the
+    ``0.15`` bound, so the only way to express "brake harder" was to flip a categorical
+    that jumped straight to infinity, leaving the whole ``0.15``-to-``1.0`` region
+    unexplorable. One continuous knob is strictly more expressive and one dimension
+    smaller.
+
     Args:
         parts: A :func:`_compose` result with a non-empty ``present``.
         q_in: Rank a name must reach to be *eligible to buy* (not to be bought — that
@@ -429,15 +490,21 @@ def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
         q_out: Rank a holding must stay at or above to be kept.
         max_hold: Time-stop horizon in bars.
         max_positions: Number of slots.
-        displace: Whether a better name may evict the weakest holding.
         displace_margin: Rank gap a challenger must clear the weakest holding by to evict
-            it. ``0.0`` is the bare comparison; ignored when ``displace`` is off.
+            it. ``0.0`` is the bare comparison; ``1.0`` is unreachable, so no name is ever
+            displaced and every challenger waits for a vacancy.
 
     Returns:
-        ``{"held", "qualified", "slot_blocked"}`` boolean frames on the *signal* clock
-        (not yet shifted for execution — :func:`_weights` does that). ``slot_blocked``
-        marks a name that qualified but got no slot: the direct, visible consequence of
-        the capital constraint, and a state that simply did not exist before it.
+        ``{"held", "qualified", "slot_blocked", "exits"}``. The first three are boolean
+        frames on the *signal* clock (not yet shifted for execution — :func:`_weights`
+        does that). ``slot_blocked`` marks a name that qualified but got no slot: the
+        direct, visible consequence of the capital constraint, and a state that simply
+        did not exist before it. ``exits`` is a list of
+        ``(symbol_ix, opened_bar, closed_bar, cause)`` tuples recorded **as the loop makes
+        each decision**, so :func:`exit_causes` reports the reason the book actually
+        acted on rather than one reconstructed afterwards from the frames (a
+        reconstruction cannot tell a ``max_hold`` eviction from a ``q_out`` one, and
+        cannot see a displacement at all).
     """
     score = parts["score_pct"]          # NaN for ineligible names (dropped from the ranking)
     values = score.to_numpy(dtype=float)
@@ -445,7 +512,9 @@ def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
 
     held = np.zeros((n_bars, n_symbols), dtype=bool)
     blocked = np.zeros((n_bars, n_symbols), dtype=bool)
-    entered = np.full(n_symbols, -1, dtype=int)     # bar the current holding was opened
+    entered = np.full(n_symbols, -1, dtype=int)     # bar the max_hold clock last reset
+    opened = np.full(n_symbols, -1, dtype=int)      # bar the position was actually opened
+    exits: list[tuple] = []
     current: list[int] = []
 
     for t in range(n_bars):
@@ -455,29 +524,46 @@ def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
         for j in current:
             if row[j] >= q_in:
                 entered[j] = t                      # fresh thesis -> the timer restarts
-        current = [j for j in current
-                   if row[j] >= q_out and t - entered[j] < max_hold]
+        kept = []
+        for j in current:
+            # Ordered most-specific first, and the order is load-bearing for the report:
+            # a name that is BOTH ineligible and below q_out is ineligible, because an
+            # ineligible name has no score to be below anything.
+            if np.isnan(row[j]):
+                cause = "ineligible"
+            elif row[j] < q_out:
+                cause = "q_out"
+            elif t - entered[j] >= max_hold:
+                cause = "max_hold"
+            else:
+                kept.append(j)
+                continue
+            exits.append((j, opened[j], t, cause))
+        current = kept
 
         # Challengers: qualified, not already held, best-ranked first. NaN sorts last and
         # fails `>= q_in`, so ineligible names never appear here.
         challengers = [j for j in np.argsort(-row, kind="stable")
                        if row[j] >= q_in and j not in current]
-        while displace and len(current) >= max_positions and challengers:
+        while len(current) >= max_positions and challengers:
             weakest = min(current, key=lambda j: row[j])
             # The margin is what makes this a real preference rather than a rank-noise
             # coin flip: a challenger inside the band is simply not better enough to be
-            # worth two legs of costs. At 0.0 this is the bare comparison.
+            # worth two legs of costs. At 0.0 this is the bare comparison; at 1.0 it can
+            # never be cleared (ranks are percentiles), so the loop always breaks here and
+            # nothing is ever displaced — which is what the old `displace=False` meant.
             if row[challengers[0]] <= row[weakest] + displace_margin:
                 break                               # no challenger beats the worst holding
             current.remove(weakest)
+            exits.append((weakest, opened[weakest], t, "displaced"))
             entered[weakest] = -1
             taken = challengers.pop(0)
             current.append(taken)
-            entered[taken] = t
+            entered[taken] = opened[taken] = t
         while challengers and len(current) < max_positions:
             taken = challengers.pop(0)              # buy into a free slot, best first
             current.append(taken)
-            entered[taken] = t
+            entered[taken] = opened[taken] = t
 
         held[t, current] = True
         blocked[t, challengers] = True              # qualified, but the book was full
@@ -486,7 +572,7 @@ def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
         return pd.DataFrame(data, index=score.index, columns=score.columns)
 
     return {"held": frame(held), "slot_blocked": frame(blocked),
-            "qualified": score >= q_in}
+            "qualified": score >= q_in, "exits": exits}
 
 
 def _coverage(frame: pd.DataFrame) -> float:
@@ -503,13 +589,85 @@ def _coverage(frame: pd.DataFrame) -> float:
     return float(frame.notna().mean(axis=1).max())
 
 
-def _eligibility(feats: dict[str, pd.DataFrame], window: int) -> pd.DataFrame:
-    """Count trailing insider+rating events per name (for the coverage mask).
+def _event_days(feats: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
+    """Bars on which *something* was filed about each name, as one boolean frame.
 
-    A day counts as an event when the underlying flow is non-zero; NaN warm-up
-    cells are treated as no-event. Both present flows contribute; an absent one
-    adds nothing. Price targets are deliberately *not* counted: they ride the same
-    Yahoo feed as ratings, so they would double-count the same coverage.
+    The single definition of "an informed participant acted", shared by
+    :func:`_eligibility` (which counts these over a trailing window) and
+    :func:`_recency` (which measures the time since the last one). They must not drift
+    apart: if the eligibility filter and the recency sleeve disagreed about what an event
+    is, a name could be dropped from the universe for staleness the sleeve considers
+    fresh, and the exit would once again have no readable cause.
+
+    A day counts when the underlying flow is non-zero; NaN warm-up cells are no-event.
+    Price targets are deliberately *not* counted: they ride the same Yahoo response as
+    ratings (``providers/yf.fetch_price_targets``), so they would double-count one feed's
+    coverage as two participants acting.
+
+    Args:
+        feats: The panel's feature matrices.
+
+    Returns:
+        A boolean ``(index x symbol)`` frame, or ``None`` when neither the insider nor
+        the ratings feature is attached (so there is no event stream at all).
+    """
+    days: pd.DataFrame | None = None
+    for name in ("insider", "ratings"):
+        if name in feats:
+            flags = feats[name].abs() > 0
+            days = flags if days is None else (days | flags)
+    return days
+
+
+def _recency(events: pd.DataFrame) -> pd.DataFrame:
+    """Bars since each name's last insider/rating event, negated so fresher ranks higher.
+
+    **Why this is a sleeve and not a filter.** Every alt-data sleeve above reads its
+    signal through a trailing window or an EMA, which makes an event's *age* invisible
+    inside that window: an insider buy from three days ago and one from three months ago
+    contribute the same trailing sum. The ``min_events`` threshold used to express age by
+    accident — a rolling count steps down when an old event leaves the window, which
+    dropped the name from the universe and force-sold it — and that made the SEC/Yahoo
+    filing calendar the strategy's dominant exit rule (see the module docstring for the
+    counts). An event study over those forced exits found the replacement beat the sold
+    name by +1.04% at 5 bars (p=0.052) and +1.57% at 10 (p=0.030), decaying to nothing by
+    63 — so coverage recency does carry a little information, and the honest way to use it
+    is a ranked sleeve the study can size and the walk-forward can ablate, not a cliff
+    that sells a top-decile name on a bar where nothing happened to it.
+
+    Any monotone transform of "bars since" gives identical cross-sectional ranks, so the
+    plain negated bar count is used. It has **no window of its own**, which is the point:
+    it decouples staleness from ``insider_window`` (already doing double duty as the
+    insider lookback and the dollar-volume normalizer).
+
+    A name that has never had an event is NaN here — genuinely no data, not "infinitely
+    stale" — so it lowers this sleeve's :func:`_coverage` rather than occupying the bottom
+    of the ranking. Such names are ineligible anyway and never reach the ranking; the
+    consequence that matters is that on a universe where few names are ever covered, the
+    sleeve drops out under :data:`_MIN_COVERAGE` like any other thin signal.
+
+    Args:
+        events: The boolean event-day frame from :func:`_event_days`.
+
+    Returns:
+        A ``(index x symbol)`` frame of ``-(bars since the last event)``: ``0`` on an
+        event day, ``-1`` the bar after, NaN before a name's first event ever.
+    """
+    bars = np.arange(len(events.index))
+    stamped = pd.DataFrame(np.where(events.to_numpy(), bars[:, None], np.nan),
+                           index=events.index, columns=events.columns).ffill()
+    return stamped.sub(pd.Series(bars, index=events.index), axis=0)
+
+
+def _eligibility(feats: dict[str, pd.DataFrame], window: int) -> pd.DataFrame:
+    """Count trailing event *days* per name (for the coverage mask).
+
+    Counts :func:`_event_days`, so a bar carrying both an insider filing and a rating
+    change counts **once**, where an earlier version summed the two streams and counted it
+    twice. At the shipped ``min_events: 1`` the two definitions are identical — both ask
+    "was there anything at all?" — and sharing one definition with :func:`_recency` is
+    worth more than the distinction, which only appears at a threshold that is no longer
+    searched precisely because thresholding this count is what broke.
 
     Args:
         feats: The panel's feature matrices.
@@ -518,15 +676,11 @@ def _eligibility(feats: dict[str, pd.DataFrame], window: int) -> pd.DataFrame:
     Returns:
         A ``(index x symbol)`` event-count frame (0 where no coverage).
     """
-    counts: pd.DataFrame | None = None
-    for name in ("insider", "ratings"):
-        if name in feats:
-            events = (feats[name].abs() > 0).rolling(window, min_periods=1).sum()
-            counts = events if counts is None else counts.add(events, fill_value=0.0)
-    if counts is None:  # neither present — nothing is eligible
+    events = _event_days(feats)
+    if events is None:  # neither stream present — nothing is eligible
         any_frame = next(iter(feats.values()))
         return pd.DataFrame(0.0, index=any_frame.index, columns=any_frame.columns)
-    return counts
+    return events.rolling(window, min_periods=1).sum()
 
 
 def valid(params: dict) -> bool:
@@ -586,6 +740,10 @@ def explain(panel: Panel, symbol: str, **params) -> pd.DataFrame:
       ``slot_blocked`` marks exactly that, and it is the reason "its rank is high, why do
       I not own it?" has an answer other than "a bug".
 
+    This is the per-name view. For the book-wide counterpart — which *rule* ended each
+    hold, across every name — see :func:`exit_causes`; it is the check that catches an
+    exit mechanism nobody documented doing most of the trading.
+
     Timing, honestly: features are already lagged one bar in
     :mod:`trading_simple.features`, and orders are next-bar-open executed. So an event
     known on day ``D`` appears in ``event_date == D``, lands on the feature bar ``D+1``
@@ -630,7 +788,7 @@ def explain(panel: Panel, symbol: str, **params) -> pd.DataFrame:
 
     composite, score = parts["composite"], parts["score_pct"]
     selected = _select(parts, q_in=p["q_in"], q_out=p["q_out"], max_hold=p["max_hold"],
-                       max_positions=p["max_positions"], displace=p["displace"],
+                       max_positions=p["max_positions"],
                        displace_margin=p["displace_margin"])
     target = _weights(selected["held"], p["max_positions"])
 
@@ -676,6 +834,69 @@ def explain(panel: Panel, symbol: str, **params) -> pd.DataFrame:
         [~out["eligible"], out["held"], out["slot_blocked"]],
         ["ineligible", "held", "slot_blocked"], default=out["zone"])
     return out
+
+
+def exit_causes(panel: Panel, **params) -> pd.DataFrame:
+    """Every completed hold in the book, with the rule that actually ended it.
+
+    :func:`explain` answers "why this name"; this answers "what is trading this
+    strategy". They are different questions and the second one has twice produced an
+    uncomfortable answer here: the exit rules the module documents at length were
+    dormant while an undocumented mechanism did the trading. First it was displacement
+    (122 of 127 exits on the v16 pick, an ordering comparison no rank band can see),
+    then it was the ``min_events`` eligibility cliff (140 of 196 train exits on the v20
+    pick, a rolling count stepping down as an old filing aged out). Neither is visible in
+    an equity curve, a Sharpe ratio or a trade list; both are one ``value_counts()`` away
+    from obvious. So this is not an occasional debugging aid — notebook §10g runs it on
+    every holdout, and a strategy whose exits are 70% one mechanism should be read as a
+    strategy about that mechanism.
+
+    Causes are recorded inside :func:`_select` as each decision is made, not inferred
+    afterwards, so they cannot disagree with the book that was traded — the same
+    guarantee :func:`explain` gets from sharing ``_compose``/``_select``.
+
+    Timing: bars are on the **signal** clock. A hold recorded as closing on bar ``t`` is
+    filled at the open of ``t+1``, like every other order here, so a one-bar hold in this
+    frame is a two-bar position in ``backtest.trade_records``.
+
+    Args:
+        panel: The same panel the backtest ran on, with ``panel.features`` attached.
+        **params: Any :func:`signals` parameters to override; the rest default to that
+            function's own signature.
+
+    Returns:
+        One row per completed hold, ordered by exit bar, with: ``symbol``, ``entry``
+        and ``exit`` timestamps, ``bars_held``, ``cause`` (``q_out`` / ``ineligible`` /
+        ``max_hold`` / ``displaced``), ``score_held`` (the rank on the last bar it was
+        owned — a high value here is the tell that the exit was mechanical, not a decayed
+        thesis), ``score_exit`` (the rank on the exit bar, NaN when ineligible), and
+        ``n_events_exit`` (the trailing event count that bar, so an eligibility exit shows
+        the step that caused it). Positions still open on the last bar are **not** listed:
+        they have no cause yet.
+
+    Raises:
+        ValueError: If no signal is usable, so there is nothing to attribute.
+    """
+    p = {**_DEFAULTS, **params}
+    parts = _compose(panel, **p)
+    if not parts["present"]:
+        raise ValueError(
+            "no usable signal: every sleeve is absent, zero-weighted, or below the "
+            f"{_MIN_COVERAGE:.0%} coverage floor — nothing to attribute"
+        )
+    selected = _select(parts, q_in=p["q_in"], q_out=p["q_out"], max_hold=p["max_hold"],
+                       max_positions=p["max_positions"],
+                       displace_margin=p["displace_margin"])
+    score, n_events = parts["score_pct"], parts["n_events"]
+    index, columns = score.index, score.columns
+    rows = [{"symbol": columns[j], "entry": index[opened], "exit": index[closed],
+             "bars_held": closed - opened, "cause": cause,
+             "score_held": score.iat[closed - 1, j],
+             "score_exit": score.iat[closed, j],
+             "n_events_exit": n_events.iat[closed, j]}
+            for j, opened, closed, cause in selected["exits"]]
+    return pd.DataFrame(rows, columns=["symbol", "entry", "exit", "bars_held", "cause",
+                                       "score_held", "score_exit", "n_events_exit"])
 
 
 def _own_vs_peer(parts: dict, symbol: str) -> tuple:

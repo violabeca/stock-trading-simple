@@ -30,10 +30,11 @@ data:
 # Study settings. The search SPACE is not here — each parameter declares its own
 # `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: informed-flow-1d-v18   # bump this whenever a `search:` bound changes: a journal
+  study: informed-flow-1d-v21   # bump this whenever a `search:` bound changes: a journal
                            # that mixes two spaces cannot be read (see README study history).
-                           # v17 gained the displace_margin dimension while its journal was
-                           # still EMPTY (zero trials), so no bump was owed for it.
+                           # v21 added the `recency` sleeve (w_recency) and PINNED
+                           # min_events at 1 — the searched threshold on a rolling count
+                           # had become the strategy's dominant exit rule.
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
   n_trials: 1000
@@ -53,10 +54,17 @@ params:
   insider_window:
     doc: >-
       Trailing bars for insider dollars, the dollar-volume normalizer and the eligibility
-      count (~1 quarter at 63). DOUBLE DUTY, and that confounds a high pick: it is the
-      insider lookback AND the eligibility window, so a longer value also makes more names
-      rankable — a pick at the ceiling may be buying BREADTH, not a longer insider horizon
-      (the literature puts insider drift at ~1-6 months, well below 378).
+      count (~1 quarter at 63). TRIPLE DUTY, and that confounds a high pick three ways: it
+      is the insider lookback, the dollar-volume normalizer's window, AND the eligibility
+      window, so a longer value also makes more names rankable — a pick at the ceiling may
+      be buying BREADTH, not a longer insider horizon (the literature puts insider drift at
+      ~1-6 months, well below 378). Until v21 it had a FOURTH job, the worst one: because
+      eligibility is a rolling count over this window, a short value made names churn in
+      and out of the universe and turned the count's step-down into the strategy's main
+      exit rule (140 of 196 train exits on the v20 pick, which drew insider_window=31).
+      The `recency` sleeve now carries staleness with no window of its own, and min_events
+      is pinned, so this knob no longer sets the exit rate — but three jobs is still three,
+      and a pick here is not a clean statement about the insider horizon.
     value: 63
     search: { type: int, low: 21, high: 378, log: true }   # high widened 189 -> 378 (~1.5y)
   rating_halflife:
@@ -102,6 +110,27 @@ params:
       and searching all four would waste a dimension. The grid can still ablate it.
     value: 1.0
     grid: [0.0, 1.0]
+  w_recency:
+    doc: >-
+      Composite weight on RECENCY of coverage — bars since this name's last insider or
+      rating event, negated so fresher ranks higher. Not a fifth data source but a decay on
+      the other four: each of them reads its signal through a trailing window or an EMA, so
+      inside that window an event's AGE is invisible and a three-day-old insider buy scores
+      like a three-month-old one. That information used to leak in through `min_events`
+      instead — a rolling count steps down when an old filing ages out of insider_window,
+      which dropped the name from the universe and force-sold it — making the SEC/Yahoo
+      filing calendar the de-facto exit rule (140 of 196 train exits, 19 of 29 holdout
+      exits, at a median score_pct of 0.94, 92% still above q_in when sold; AMZN's 2-bar
+      holdout position was two such steps 31 bars apart, four legs of costs, neither
+      composite moving). An event study over those forced exits says the information is
+      real but small — the replacement beat the sold name by +1.04% at 5 bars (p=0.052) and
+      +1.57% at 10 (p=0.030), gone by 63 — which is an argument for a sized, ablatable
+      sleeve and against a cliff. This sleeve has NO window of its own, so it also
+      decouples staleness from insider_window's other three jobs. 0.0 in the grid ablates
+      it, which is the honest out-of-sample test of whether it earns its weight.
+    value: 1.0
+    search: { type: float, low: 0.25, high: 3.0, step: 0.25 }
+    grid: [0.0, 1.0]
 
   # --- price-derived market-condition sleeves --------------------------------------
   # These read panel.close directly — no alt-data table — so they always cover the universe:
@@ -146,9 +175,10 @@ params:
   q_out:
     doc: >-
       Sell when the rank falls below this. The gap to q_in is the hysteresis band that damps
-      turnover. Measured caveat: under displace=true the band is nearly dormant — the queue
-      of waiting names evicts a holding long before its rank decays this far (4 of 368 exits
-      on the v15 pick), so this knob only bites when displace is false.
+      turnover. Measured caveat: at a LOW displace_margin the band is nearly dormant — the
+      queue of waiting names evicts a holding long before its rank decays this far (4 of 368
+      exits on the v15 pick; 5 of 127 on the v16 pick), so this knob only really bites as
+      the margin approaches 1.0.
     value: 0.45
     search: { type: float, low: 0.4, high: 0.9, step: 0.01 }
     grid: [0.45]
@@ -158,19 +188,28 @@ params:
       hysteresis band — too weak to re-qualify, not weak enough to trip q_out — quietly
       aging while the evidence that bought it decays out of the trailing windows. It cannot
       evict a name currently ranked >= q_in; that name has a fresh thesis and its clock
-      restarts. Same caveat as q_out: with displace=true the clock never runs out (measured
-      max 3 bars parked, against the 65 it needed).
+      restarts. Same caveat as q_out: at a low displace_margin the clock never runs out
+      (measured max 3 bars parked, against the 65 it needed) — it fired ZERO times across
+      the whole v16 holdout book.
     value: 126
     search: { type: int, low: 21, high: 252, log: true }
   min_events:
     doc: >-
-      Minimum insider+rating events in the trailing window for a name to be RANKABLE at all
-      (an ineligible name is dropped from the cross-section, not merely blocked from
-      entering). Both studies pinned this at 1 and the low bound is deliberately not
-      widened: 0 would mean ranking names the model has no evidence on, so the pin is a
-      finding — the filter wants to be loose — rather than a clipped bound.
+      Minimum trailing event DAYS for a name to be RANKABLE at all (an ineligible name is
+      dropped from the cross-section, not merely blocked from entering). A universe floor
+      and nothing else: "has the model seen anything about this name?". PINNED at 1 and NO
+      LONGER SEARCHED, which is the v21 change. It used to search [1, 3], and that made it
+      the strategy's dominant exit rule rather than a filter: the count is a rolling sum
+      over insider_window, so it steps DOWN when an old filing ages out, on a bar where
+      nothing happened to the name. The v20 pick drew 3 and paid for it — 140 of 196 train
+      exits and 19 of 29 holdout exits were eligibility losses, 95% of them a single event
+      ageing out (3 -> 2), at a median score_pct of 0.94, with 92% of the sold names still
+      ABOVE q_in. The three documented brakes (q_in/q_out, max_hold, displace_margin)
+      governed under a third of exits between them. Staleness is now expressed by
+      w_recency, continuously and inside the ranking, so a stale name drifts down and
+      leaves through q_out on an ordering. 0 stays unreachable for the original reason: it
+      would mean ranking names the model has no evidence on at all.
     value: 1
-    search: { type: int, low: 1, high: 3 }
 
   # --- the book (capital constraint) ------------------------------------------------
   max_positions:
@@ -186,36 +225,36 @@ params:
       study so far has pinned it at whatever the low bound was (30 -> 15 -> 8 -> 5), so
       treat a pick at the floor as a statement about concentration, not a converged value.
     value: 15
-    search: { type: int, low: 15, high: 30 }
+    search: { type: int, low: 3, high: 30 }
     grid: [15]             # pinned so the sweep's free dimensions are the sleeve ablations
-  displace:
-    doc: >-
-      What happens when a qualifying name arrives and every slot is full: false = it waits
-      for a vacancy (low turnover), true = it evicts the weakest holding if it outranks it
-      (chases the top of the ranking and pays for it in costs). Searched rather than
-      assumed, and decisive — all four walk-forward refits chose true, and it is what makes
-      q_out and max_hold dormant.
-    value: false
-    search: { type: categorical, choices: [true, false] }
   displace_margin:
     doc: >-
-      How far a challenger must out-rank the weakest holding before it may evict it, in
-      composite-rank units (one rank place in a ~91-name cross-section is ~0.011, so 0.05
-      is "about five places clear"). 0.0 is the bare "any epsilon wins" comparison. This
-      is the ONLY brake on displacement: q_in/q_out and max_hold gate a name's rank LEVEL,
-      while displacement is an ORDERING comparison none of them can see — and on the v16
-      pick's holdout book 122 of 127 exits were displacements, median winning margin ~2
-      rank places, 16% of them a single place. Because score_pct is a percentile, a name
-      can lose its slot on a bar where its own composite did not move at all (MRVL, 2025-
-      12-15, re-bought 7 bars later). An event study over all 121 of those evictions put
-      the challenger's forward return minus the evicted name's at zero to every horizon
-      (win rate ~50%, p >= 0.67), so the swaps were paying two legs of costs for no
-      information. SHIPS AT 0.0 ON PURPOSE: the counterfactual that favours a margin was
-      measured on the HOLDOUT, and picking the value off it would be peeking. The study
-      sizes it on train, and the grid tests its existence out of sample.
-    value: 0.0
-    search: { type: float, low: 0.0, high: 0.15, step: 0.01 }
-    grid: [0.0, 0.05]
+      What happens when a qualifying name arrives and every slot is full, on ONE continuous
+      axis: the challenger evicts the weakest holding only if it out-ranks it by this much,
+      in composite-rank units (one rank place in a ~91-name cross-section is ~0.011, so
+      0.05 is "about five places clear"). 0.0 = evict on any epsilon, chasing the top of
+      the ranking and paying for it in costs. 1.0 = unreachable, since score_pct is a
+      percentile in (0, 1], so nothing is ever displaced and a challenger waits for a
+      vacancy. THIS IS THE ONLY BRAKE ON DISPLACEMENT: q_in/q_out and max_hold gate a
+      name's rank LEVEL, while displacement is an ORDERING comparison none of them can see
+      — on the v16 pick's holdout book 122 of 127 exits were displacements, median winning
+      margin ~2 rank places, 16% of them a single place, and because score_pct is a
+      percentile a name can lose its slot on a bar where its own composite did not move at
+      all (MRVL, 2025-12-15, re-bought 7 bars later). An event study over all 121 of those
+      evictions put the challenger's forward return minus the evicted name's at zero to
+      every horizon (win rate ~50%, p >= 0.67): the swaps paid two legs of costs for no
+      information. There used to be a separate `displace:` boolean in front of this, which
+      v18 proved was the same axis wearing two hats — displace=false gives a BIT-IDENTICAL
+      held mask to margin >= 1.0. Keeping both cost real damage: every displace=false trial
+      carried a margin that did nothing, so 33 of v18's 55 Pareto-front trials were one
+      strategy recorded under 14 different margins, all scoring identically to the last
+      digit. And the flag reached past this knob's own ceiling — the objective was still
+      improving at the old 0.15 bound, so "brake harder" could only be said by flipping a
+      categorical that jumped to infinity, leaving 0.15-to-1.0 unexplorable. High bound is
+      1.0 for that reason, and it is a REACHED bound by construction, not a clipped one.
+    value: 1.0                 # == the old shipped `displace: false`, bit-for-bit
+    search: { type: float, low: 0.0, high: 1.0, step: 0.01 }
+    grid: [0.0, 1.0]           # the true ablation: chase the ranking vs pure hysteresis
   retrim_k:
     doc: >-
       Single-name concentration cap (engine _retrim_loop). A held slot drifts untouched

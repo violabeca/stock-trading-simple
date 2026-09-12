@@ -68,6 +68,29 @@ OBJECTIVES = ("info_ratio", "excess_cagr")
 EXTRA_METRICS = ("sharpe", "cagr", "total_return", "max_drawdown", "win_rate",
                  "pct_profitable", "n_trades", "trades_per_year", "years")
 
+#: The ONE preference used to reduce a Pareto front to a single strategy, in
+#: :data:`OBJECTIVES` order. Balanced on purpose: a Pareto front exists precisely because
+#: the two objectives trade off, and any lopsided weighting quietly discards that.
+#:
+#: It is a constant rather than a per-notebook literal because it used to be a
+#: per-notebook literal, and the repo drifted into **three** different answers —
+#: ``(1.0, 0.5)`` in informed_flow / conviction_flow / value_factor, ``(0.5, 1.0)`` in
+#: candle_scalp / gap_and_go / keltner_reversion, and ``(1.0, 0.5)`` in
+#: donchian_breakout / volume_momentum justified by the comment *"full weight on Sharpe,
+#: half on raw return"*, which describes the **pre-v5 objectives** that were replaced by
+#: the benchmark-relative pair. Three preferences, no shared reason, one of them arguing
+#: from metrics that no longer exist. If you want a different trade-off for one strategy,
+#: pass ``weights=`` explicitly at the call site and say why there — do not fork the
+#: default.
+#:
+#: Note what the weights do NOT mean. :func:`pick_from_front` min-max normalizes each
+#: objective across the front first, so a weight is in units of "fraction of the spread
+#: this particular front happens to have", not economic units. On a front spanning 0.09
+#: of info_ratio and 0.009 of excess_cagr, equal weights still say "the full info_ratio
+#: range matters as much as the full excess_cagr range" — a claim about the front, not
+#: about the strategy. Read the front before trusting the pick.
+PICK_WEIGHTS = (1.0, 1.0)
+
 
 def study_path(strategy: LoadedStrategy, study_name: str):
     """The journal file backing one study (``studies/<study_name>.log``).
@@ -338,16 +361,115 @@ def pareto_frame(study: optuna.Study) -> pd.DataFrame:
     return frame.sort_values(OBJECTIVES[0], ascending=False).reset_index(drop=True)
 
 
-def pick_best(study: optuna.Study, *, weights: tuple[float, float] = (1.0, 1.0)):
+def distinct_front(front: pd.DataFrame, *, decimals: int = 9) -> pd.DataFrame:
+    """One row per distinct **objective pair** — how many genuinely different outcomes.
+
+    :func:`pareto_frame` already drops rows that are duplicates in *every* column, which
+    catches NSGA-II re-sampling the same parameters. It cannot catch the more common and
+    far more misleading case: **different parameters, identical objectives**, which is
+    what an *inert* parameter produces. A knob that does nothing lets the sampler mint
+    unlimited "distinct" front entries that are all the same strategy.
+
+    Both of this repo's inert knobs shipped and both flooded a front:
+
+    * ``informed_flow`` v18 — 55 front rows, **32** distinct outcomes. 33 of them were one
+      strategy under 14 different ``displace_margin`` values, all scoring
+      ``info_ratio 1.056178 / excess_cagr 0.097963`` to the last digit, because those
+      trials also drew ``displace=False``, which made the margin unreachable.
+    * ``informed_flow`` v17 — 35 front rows, **one** distinct outcome. They differed only
+      in ``max_hold`` (28, 40, 54 … 239), which never fires at a low displacement margin,
+      so every row was the same book.
+
+    That is not cosmetic. Any statistic taken *over* the front is multiplicity-weighted:
+    :func:`boundary_report`'s ``front_at_low`` / ``front_at_high`` shares are plain means
+    over rows, and its ``action`` fires at 0.5, so 33 clones can vote 33 times to widen a
+    bound. And a pick made over clones is a tie-break wearing the costume of a choice.
+
+    What it does **not** fix, contrary to a claim made when this was proposed: min-max
+    normalization is unaffected by duplication, since min and max do not move when you
+    repeat an interior *or* an extreme point. Dedup buys honest front statistics and an
+    honest pick, not a rescaling.
+
+    Args:
+        front: A :func:`pareto_frame` result.
+        decimals: Rounding applied to the objectives before comparing, so two trials that
+            differ only in float noise count as one outcome.
+
+    Returns:
+        The subset of ``front`` with one row per distinct objective pair, keeping the
+        **earliest** trial of each tie (first discovery, so the choice is deterministic
+        and does not depend on row order), in ``front``'s original ordering.
+    """
+    if front.empty:
+        return front
+    keys = [c for c in OBJECTIVES if c in front.columns]
+    if not keys:
+        return front
+    rounded = front[keys].round(decimals)
+    order = front["trial"] if "trial" in front.columns else pd.Series(front.index)
+    keep = rounded.assign(_t=order.to_numpy()).sort_values("_t").index
+    first = front.loc[keep].drop_duplicates(subset=keys).index
+    return front.loc[front.index.isin(first)]
+
+
+def pick_from_front(front: pd.DataFrame, *, weights: tuple[float, float] = PICK_WEIGHTS
+                    ) -> pd.Series:
+    """Reduce an already-admissible Pareto front to the ONE row to trade.
+
+    The single implementation of the picking rule, so a strategy notebook and its
+    walk-forward folds cannot drift apart — when that logic sat inline in a notebook and
+    the folds re-picked from a coarse grid instead, four folds faithfully validated a
+    strategy nobody ran, twice. Callers apply their own admissibility filter (a trades-per
+    -year floor, typically) and hand in what survives.
+
+    Ties are collapsed by :func:`distinct_front` first, and the winning row carries
+    ``n_tied`` so a pick that was really a coin flip between identical-scoring strategies
+    says so out loud instead of looking considered.
+
+    Args:
+        front: Front rows to choose among — already filtered for admissibility.
+        weights: Preference over :data:`OBJECTIVES`, in that order. Defaults to
+            :data:`PICK_WEIGHTS`; pass something else only with a stated reason.
+
+    Returns:
+        The winning row, plus two added fields: ``n_tied`` (front rows sharing the
+        winner's objective pair — ``1`` means it won outright) and ``front_distinct``
+        (distinct outcomes the choice was actually made among).
+
+    Raises:
+        ValueError: If ``front`` is empty.
+    """
+    if front.empty:
+        raise ValueError("cannot pick from an empty front")
+    distinct = distinct_front(front)
+    values = distinct[list(OBJECTIVES)]
+    span = (values.max() - values.min()).replace(0, 1.0)
+    normalized = (values - values.min()) / span
+    score = normalized.mul(pd.Series(dict(zip(OBJECTIVES, weights, strict=True)))).sum(axis=1)
+    row = distinct.loc[score.idxmax()].copy()
+    # Per column, not frame-wide: a front row is a mix of dtypes, so `.round` on the
+    # picked Series would raise on the first object column it meets.
+    same = np.logical_and.reduce(
+        [front[k].to_numpy(dtype=float).round(9) == round(float(row[k]), 9)
+         for k in OBJECTIVES])
+    row["n_tied"] = int(same.sum())
+    row["front_distinct"] = len(distinct)
+    return row
+
+
+def pick_best(study: optuna.Study, *, weights: tuple[float, float] = PICK_WEIGHTS):
     """Reduce the Pareto front to ONE trial under an explicit preference.
 
-    Each objective is min-max normalized across the front, then the trial
-    with the highest weighted sum wins. ``weights=(1, 0)`` = pure ``info_ratio``,
-    ``(1, 1)`` = balanced, ``(0, 1)`` = pure ``excess_cagr``.
+    A thin wrapper over :func:`pick_from_front` — same normalization, same tie
+    collapsing, same default preference — for callers holding a study rather than a
+    frame. Applies **no** admissibility filter: a study with a handful of lucky trades
+    can post a huge ``info_ratio``, so filter the frame yourself and call
+    :func:`pick_from_front` when that matters.
 
     Args:
         study: An Optuna study with at least one completed trial.
         weights: Importance of each entry of :data:`OBJECTIVES`, in that order.
+            Defaults to :data:`PICK_WEIGHTS`.
 
     Returns:
         The chosen ``optuna.trial.FrozenTrial`` (its ``.params`` re-runs the
@@ -359,11 +481,10 @@ def pick_best(study: optuna.Study, *, weights: tuple[float, float] = (1.0, 1.0))
     front = study.best_trials
     if not front:
         raise ValueError("study has no completed trials yet")
-    values = pd.DataFrame([t.values for t in front], columns=list(OBJECTIVES))
-    span = values.max() - values.min()
-    normalized = (values - values.min()) / span.replace(0, 1.0)
-    score = normalized.mul(pd.Series(dict(zip(OBJECTIVES, weights, strict=True)))).sum(axis=1)
-    return front[int(score.idxmax())]
+    frame = pd.DataFrame([{"trial": t.number,
+                           **dict(zip(OBJECTIVES, t.values, strict=True))} for t in front])
+    number = int(pick_from_front(frame, weights=weights)["trial"])
+    return next(t for t in front if t.number == number)
 
 
 def _span_position(values, spec: dict) -> np.ndarray:
@@ -406,7 +527,11 @@ def boundary_report(best_params: dict, space: dict[str, dict], *,
         space: The strategy's ``optuna.space`` block.
         front: Optional Pareto front (:func:`pareto_frame`) — adds the share
             of front trials on each edge; a whole front piling onto one bound
-            is stronger evidence than a single trial.
+            is stronger evidence than a single trial. Collapsed by
+            :func:`distinct_front` first: these shares are plain means over rows and
+            ``action`` fires at 0.5, so without that an inert parameter's clones would
+            vote once each to widen whatever bound they happen to carry (v18's front
+            would have cast 33 of its 55 votes as one strategy).
         rel_tol: Edge-zone width as a fraction of the searched span.
 
     Returns:
@@ -416,6 +541,7 @@ def boundary_report(best_params: dict, space: dict[str, dict], *,
         (``"ok"``, or which bound to widen — flagged when the best value is
         at an edge or at least half the front is).
     """
+    front = None if front is None else distinct_front(front)
     rows = []
     for name, spec in space.items():
         if spec.get("type") == "categorical" or name not in best_params:
