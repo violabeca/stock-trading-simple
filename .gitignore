@@ -7,4 +7,5 @@ __pycache__/
 .ipynb_checkpoints/
 .env
 strategies/*/studies/*.log
+strategies/*/studies/*.candidates.yaml
 .DS_Store

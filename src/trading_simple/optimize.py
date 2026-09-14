@@ -1,7 +1,8 @@
 """Optuna optimization: multi-objective, resumable, one study file per run.
 
 Every study scores **two objectives at once** — the annualized excess return over
-buy-and-hold (maximized) and the tracking error against it (minimized) — so the result
+buy-and-hold (maximized) and the strategy's own annualized volatility, its annual risk
+rate (minimized) — so the result
 is a *Pareto front* of defensible trade-offs rather than a single (possibly degenerate)
 winner. :func:`pick_best` then reduces the front to one trial under an explicit
 preference weighting, choosing only among trials that beat the benchmark, and
@@ -36,25 +37,25 @@ log = logging.getLogger(__name__)
 
 #: The two study objectives, in this order, each optimized in its :data:`DIRECTIONS` entry.
 #:
-#: **Return against risk, both relative to the benchmark.** ``excess_cagr`` is how much more
-#: per year the strategy earns than an equal-weight buy-and-hold of the same panel;
-#: ``tracking_error`` is how far its daily path strays from that benchmark, annualized (the
-#: standard deviation of the *active* return). Earning more than the index requires owning
-#: something different from it, and owning something different is exactly what tracking
-#: error measures — so the two genuinely pull against each other, and the front is the
-#: active efficient frontier: one strategy per level of straying. ``info_ratio`` is their
-#: ratio, so the best-IR strategy sits at the front's knee; it is still recorded on every
-#: trial (:data:`EXTRA_METRICS`), just no longer scored.
+#: **Return against the annual risk rate.** ``excess_cagr`` is how much more per year the
+#: strategy earns than an equal-weight buy-and-hold of the same panel; ``volatility`` is the
+#: annualized standard deviation of the strategy's OWN per-bar returns — how bumpy the ride
+#: is (buy-and-hold of LiquidLeaders 2018-2024 runs ~21%). The front is therefore the classic
+#: return-against-risk frontier, with the return side still judged against the market: "beat
+#: buy-and-hold, as calmly as possible". A strategy that lowers its risk by sitting partly in
+#: cash or scaling down in turbulent markets (informed_flow's ``risk_method``) is credited
+#: for it here. ``tracking_error`` and ``info_ratio`` are still recorded on every trial
+#: (:data:`EXTRA_METRICS`), as the benchmark-relative risk view.
 #:
-#: **Why not the previous pair.** Until informed_flow v23 the study maximized ``info_ratio``
-#: and ``excess_cagr`` — one number in two costumes: Spearman 0.975 across v22's 2,351
-#: trials (0.994 in gap_and_go v2, 0.956 in support_bounce v3), so multi-thousand-trial
-#: NSGA-II runs collapsed to fronts of 1-2 distinct outcomes. Against ``tracking_error`` the
-#: correlation is −0.60 — a *conflict*, which is what a front is made of, not a redundancy
-#: — and a 252-trial re-run of v22 gave a 13-point front instead of 2. Tracking error also
-#: exposes the concentration dial (it rises as a book holds fewer names or leans on its top
-#: five winners), which the old pair could only express by pinning ``max_positions`` to its
-#: floor, six picks running.
+#: **Why not the earlier pairs.** Until informed_flow v23 the study maximized ``info_ratio``
+#: and ``excess_cagr`` — one number in two costumes (Spearman 0.975 across v22's 2,351
+#: trials, 0.994 in gap_and_go v2), so fronts collapsed to 1-2 distinct outcomes. v23 scored
+#: ``excess_cagr`` against ``tracking_error`` (a 25-point front), but tracking error is
+#: RELATIVE risk: it penalizes straying from the index, so it punishes exactly the moves that
+#: lower real risk — a book in cash during a falling market strays furthest of all. On a
+#: strategy with no such lever the two agree (volatility vs tracking error 0.88, vs beta 0.98,
+#: and the same pick, across 453 re-run v23 trials); once a strategy can de-risk, only
+#: volatility gives it credit.
 #:
 #: **Benchmark-relative, deliberately.** Optimizing an *absolute* Sharpe and return
 #: rewards market exposure rather than skill: a long-only strategy in a rising market
@@ -73,32 +74,34 @@ log = logging.getLogger(__name__)
 #: one, as this study did before, is incoherent on its own terms.
 #:
 #: Both are measured against an equal-weight buy-and-hold of the same panel
-#: (:func:`backtest.benchmark`): ``excess_cagr`` is above zero only by beating the market
-#: the strategy trades in, and ``tracking_error`` is zero only for the market itself.
-#: Absolute Sharpe and return are still recorded on every trial — as diagnostics, not as
-#: targets.
+#: (:func:`backtest.benchmark`) — the return side: ``excess_cagr`` is above zero only by
+#: beating the market the strategy trades in. The risk side is deliberately absolute, and
+#: buy-and-hold's own volatility is its natural yardstick. Absolute Sharpe and return are
+#: still recorded on every trial — as diagnostics, not as targets.
 #:
 #: What is deliberately NOT normalized away: **time in market**. Scaling a 30%-invested
 #: strategy's return up by 3x to "compare it fairly" inverts the truth — sitting in cash
 #: is a real cost paid against a fully-invested benchmark, and it is the very thing that
 #: has to be earned back. The benchmark-relative framing prices it correctly already.
-OBJECTIVES = ("excess_cagr", "tracking_error")
+OBJECTIVES = ("excess_cagr", "volatility")
 #: Optuna direction of each :data:`OBJECTIVES` entry, in the same order.
 DIRECTIONS = ("maximize", "minimize")
 #: Admissibility floor on ``excess_cagr`` inside :func:`pick_from_front`: only front rows that
-#: beat buy-and-hold may be picked. Minimizing tracking error makes the LOW end of the front
-#: a row of index-huggers — a book that barely strays from the benchmark is "optimal" on
-#: that axis while earning nothing (v22's re-run front reached down to −0.7%/yr) — and a
-#: balanced pick could land on one. The front keeps those rows, because they are the honest
-#: shape of the trade-off; the pick just never chooses one.
+#: beat buy-and-hold may be picked. Minimizing risk makes the LOW end of the front a row of
+#: timid books — mostly in cash, or holding the calmest names — that are "optimal" on that
+#: axis while earning less than simply owning the market (v23's re-run front reached down to
+#: −3%/yr), and a balanced pick could land on one. The front keeps those rows, because they
+#: are the honest shape of the trade-off; the pick just never chooses one.
 MIN_PICK_EXCESS = 0.0
 #: Secondary metrics attached to each trial as user attributes. ``years`` and
 #: ``trades_per_year`` are the sample size behind the objectives: annualizing makes a
 #: one-month backtest *comparable*, it does not make it *trustworthy*, so the evidence
-#: rides along with the claim. ``info_ratio`` rides here too: the front's knee, no longer
-#: an objective itself (the deflated-Sharpe check still reads it off every trial).
-EXTRA_METRICS = ("info_ratio", "sharpe", "cagr", "total_return", "max_drawdown", "win_rate",
-                 "pct_profitable", "n_trades", "trades_per_year", "years")
+#: rides along with the claim. ``info_ratio`` and ``tracking_error`` ride here too — the
+#: benchmark-relative risk view, no longer scored (the deflated-Sharpe check still reads
+#: ``info_ratio`` off every trial).
+EXTRA_METRICS = ("info_ratio", "tracking_error", "sharpe", "cagr", "total_return",
+                 "max_drawdown", "win_rate", "pct_profitable", "n_trades", "trades_per_year",
+                 "years")
 
 #: The ONE preference used to reduce a Pareto front to a single strategy, in
 #: :data:`OBJECTIVES` order. Balanced on purpose: a Pareto front exists precisely because
@@ -119,8 +122,8 @@ EXTRA_METRICS = ("info_ratio", "sharpe", "cagr", "total_return", "max_drawdown",
 #: objective across the front first — flipped for a minimized one, so 1 is always the best
 #: end — so a weight is in units of "fraction of the spread this particular front happens
 #: to have", not economic units. On a front spanning 12 points of excess_cagr and 4 points
-#: of tracking_error, equal weights still say "the whole excess range matters as much as
-#: the whole tracking-error range" — a claim about the front, not about the strategy. Read
+#: of volatility, equal weights still say "the whole excess range matters as much as the
+#: whole volatility range" — a claim about the front, not about the strategy. Read
 #: the front before trusting the pick.
 PICK_WEIGHTS = (1.0, 1.0)
 
@@ -236,7 +239,7 @@ def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
         settings: Global settings.
 
     Returns:
-        ``(excess_cagr, tracking_error)`` — see :data:`OBJECTIVES` for why these and not
+        ``(excess_cagr, volatility)`` — see :data:`OBJECTIVES` for why these and not
         the absolute Sharpe, and why per-year and not cumulative.
 
     Raises:
@@ -502,7 +505,8 @@ def pick_from_front(front: pd.DataFrame, *, weights: tuple[float, float] = PICK_
     -year floor, typically) and hand in what survives.
 
     Only rows that beat buy-and-hold (``excess_cagr >`` :data:`MIN_PICK_EXCESS`) are
-    eligible: the low-tracking-error end of the front is index-huggers that earn nothing.
+    eligible: the low-volatility end of the front holds timid books that earn less than the
+    index.
     When no row qualifies, the pick falls back to the whole front and says so
     (``beats_benchmark = False`` plus a logged warning) rather than raising — a losing study
     must still run top-to-bottom in its notebook, it just must not look like a winner.
@@ -766,8 +770,8 @@ def sensitivity(strategy: LoadedStrategy, panel: Panel, picked: dict, *, setting
 
     One :func:`backtest.sweep` call, so the whole neighborhood costs about what a
     coarse grid does. The metric to read is ``excess_cagr``: benchmark-relative and
-    per-year, i.e. one of the study's own :data:`OBJECTIVES`. (``tracking_error``, the
-    other one, needs a per-combo equity curve a column-stacked sweep does not keep.)
+    per-year, i.e. one of the study's own :data:`OBJECTIVES`. (``volatility``, the other
+    one, is on every sweep row too.)
 
     Args:
         strategy: A loaded strategy.

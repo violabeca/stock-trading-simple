@@ -31,8 +31,8 @@ optuna:
   # benchmark-relative pair separates stock selection from market exposure.
   study: turnover-momentum-1d-v2   # bump whenever a `search:` bound, the objective or the
                                    # execution model changes — a journal that mixes two
-                                   # spaces cannot be read. v2: engine objectives became
-                                   # excess_cagr ↑ / tracking_error ↓ (v1 is refused)
+                                   # spaces cannot be read. v2: engine objectives changed
+                                   # (now excess_cagr ↑ / volatility ↓; v1 is refused)
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
   n_trials: 400            # five searched knobs — a small space on purpose

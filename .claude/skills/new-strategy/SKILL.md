@@ -137,8 +137,11 @@ strategy-agnostic sections — do NOT drop them when adapting:
   not done. `notebooks/04_compare.ipynb` picks the new strategy up
   automatically for the cross-strategy scoreboard.
 - **Out-of-sample check** (§11 pattern): `config.yaml`'s `data.end` is the
-  train cutoff; load `end=None`, slice the untouched tail, replay the picked
-  params and verdict on holdout `excess_cagr` AND `info_ratio` > 0.
+  train cutoff; load `end=None` and replay the picked params WARM —
+  `bt.evaluate(strat, full_panel, picked, settings=settings, score_from=<holdout start>)`,
+  never a panel sliced to the tail (that restarts every indicator on its first bar) — and
+  verdict on holdout `excess_cagr` AND `info_ratio` > 0, reading `volatility` beside
+  buy-and-hold's (the study minimizes it).
 - **Cost stress test** (§12 pattern): re-run the picked params at stressed
   friction (e.g. 6/5 and 10/3 bps via `settings.costs.model_copy`) —
   `active_stats` recomputes the benchmark at the same costs, keeping the

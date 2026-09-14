@@ -226,6 +226,85 @@ def test_the_book_is_always_a_valid_portfolio():
         assert np.allclose(nonzero, slot)
 
 
+# --- the risk overlay -------------------------------------------------------------
+_RISK = {"risk_off_exposure": 0.3, "regime_window": 20, "regime_band": 0.02,
+         "target_vol": 0.20, "vol_window": 10, "exposure_step": 0.10}
+
+
+def _exposure(panel, method, **overrides):
+    """The overlay alone, on a book holding 1/4 of every name on every bar."""
+    weights = pd.DataFrame(0.25, index=panel.close.index, columns=panel.close.columns)
+    return _module()["_exposure"](panel, weights, risk_method=method, **{**_RISK, **overrides})
+
+
+def _path_panel(path):
+    """Four names all following ONE price path, so the equal-weight index is that path."""
+    p = _panel(n=len(path))
+    p.close = pd.DataFrame({s: np.asarray(path, dtype=float) for s in p.close.columns},
+                           index=p.close.index)
+    return p
+
+
+def test_cash_switch_derisks_the_bar_after_the_break_and_holds_inside_the_band():
+    """Below the average by more than the band -> risk off, traded the NEXT bar; the band
+    keeps a sideways market from flipping the book; a clear recovery restores it."""
+    up = np.linspace(100, 139, 40)
+    down = np.linspace(136, 110, 10)
+    chop = 110 * (1 + 0.005 * np.resize([1, -1], 40))       # sideways, inside the ±2% band
+    recover = np.linspace(112, 150, 30)
+    p = _path_panel(np.concatenate([up, down, chop, recover]))
+    exposure = _exposure(p, "cash_switch")
+
+    market = p.close.iloc[:, 0]
+    trend = market / market.rolling(20).mean() - 1
+    first_break = int(np.argmax((trend < -0.02).to_numpy()))
+    assert (exposure.iloc[:first_break + 1] == 1.0).all()     # no look-ahead: decided at close
+    assert exposure.iloc[first_break + 1] == pytest.approx(0.3)
+    chop_bars = slice(first_break + 1, 90)
+    assert np.allclose(exposure.iloc[chop_bars], 0.3)         # the band holds the state
+    assert exposure.iloc[-1] == 1.0                           # back in after the recovery
+
+
+def test_vol_target_scales_down_in_turbulence_in_steps_and_never_levers():
+    calm = np.cumprod(np.resize([1.002, 0.998], 40))
+    wild = calm[-1] * np.cumprod(np.resize([1.05, 0.95], 40))
+    p = _path_panel(100 * np.concatenate([calm, wild]))
+    exposure = _exposure(p, "vol_target")
+
+    assert (exposure.iloc[:40] == 1.0).all()                  # calm book: below target, full
+    assert exposure.iloc[40 + 10 + 2:].max() < 0.5            # ~80% vol vs a 20% target
+    assert ((exposure > 0) & (exposure <= 1.0)).all()         # never levered, never short
+    moves = exposure.diff().abs()
+    assert (moves[moves > 0] >= 0.10 - 1e-9).all()            # only in exposure_step moves
+
+    shocked = _path_panel(p.close.iloc[:, 0].to_numpy())
+    shocked.close.iloc[-1] *= 3.0                             # a huge move on the last bar...
+    assert _exposure(shocked, "vol_target").iloc[-1] == exposure.iloc[-1]   # ...unseen until t+1
+
+
+def test_signals_scale_the_book_by_the_overlay_and_none_changes_nothing():
+    p = _band_panel()
+    p.close = p.close.mul(np.linspace(1.0, 0.7, len(p.close)), axis=0)   # a steady bear market
+    kw = {"w_insider": 0.0, "w_rating": 1.0, "w_dtc": 0.0, "rating_halflife": 2}
+    base = _if(p, **kw)
+    assert (base["exposure"] == 1.0).all()                    # the default ships "none"
+    switched = _if(p, **kw, risk_method="cash_switch", **_RISK)
+    assert (switched["exposure"] < 1.0).any()
+    pd.testing.assert_frame_equal(switched["weights"],
+                                  base["weights"].mul(switched["exposure"], axis=0))
+
+
+def test_valid_rejects_an_incoherent_risk_overlay():
+    valid = strategies.load("informed_flow").valid
+    ok = {"w_rating": 1.0, "q_in": 0.8, "q_out": 0.6}
+    assert valid({**ok, "risk_method": "vol_target", "target_vol": 0.15})
+    assert not valid({**ok, "risk_method": "stop_loss"})
+    assert not valid({**ok, "risk_method": "cash_switch", "risk_off_exposure": 1.5})
+    assert not valid({**ok, "risk_method": "vol_target", "target_vol": 0.0})
+    with pytest.raises(ValueError, match="risk_method"):
+        _exposure(_panel(), "stop_loss")
+
+
 def test_missing_short_interest_degrades_gracefully():
     p = _panel()
     p.features["insider"].iloc[30, 0] = 5_000_000.0
@@ -430,7 +509,7 @@ def test_recency_sleeve_ranks_fresh_coverage_above_stale():
 
 
 def test_recency_sleeve_is_ablated_by_zero_weight():
-    """`w_recency: 0.0` removes it entirely — so the sweep's 0.0 column is a real ablation."""
+    """`w_recency: 0.0` removes it entirely — so 0.0 is a real ablation (diagnostics §4b)."""
     p = _staggered_panel({"AAA": 50, "BBB": 45, "CCC": 40, "DDD": 35})
     base = {**_PARAMS, "insider_window": 60, "w_insider": 1.0}
     on = _module()["_compose"](p, **{**base, "w_recency": 1.0})

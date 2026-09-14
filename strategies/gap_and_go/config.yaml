@@ -22,8 +22,8 @@ data:
 # Study settings. The search SPACE is not here — each parameter declares its own
 # `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: gap_and_go-1m-v3  # v3: the engine's objectives became excess_cagr ↑ / tracking_error ↓;
-                           # the v2 journal (info_ratio / excess_cagr) is refused by the engine.
+  study: gap_and_go-1m-v3  # v3: the engine's objectives changed (now excess_cagr ↑ / volatility
+                           # ↓); the v2 journal (info_ratio / excess_cagr) is refused by the engine.
                            # v1 is kept as the record of the diagnosis; its numbers are not
                            # comparable (different universe, benchmark, and parameterization)
   sampler: nsga2           # nsga2 | tpe | random

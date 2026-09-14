@@ -118,7 +118,8 @@ day *D* moves a position no earlier than the open of *D+2* — deliberately
 conservative, immaterial at these horizons.
 
 **Parameters** (the values are what `config.yaml` **ships** today; a study pick overwrites
-them there only when §7's "Promoting a pick" cell is run):
+them there only when `informed_flow_diagnostics.ipynb` §7 promotes a candidate that passed
+its verdict):
 
 | param | shipped | meaning |
 |---|---|---|
@@ -295,15 +296,16 @@ now audits breadth and depth, not just freshness.
 composite, the rank the bands actually compare against, each sleeve's weighted
 contribution, the raw point-in-time events, and the resulting book. `signals()` and
 `explain()` share one core (`_compose` / `_select`), so the diagnostic **cannot drift
-from what the backtest traded** — a test asserts they agree. §4 of the notebook renders
-it (rank + bands + real positions; the attribution stack; the triggering events), and
-§4b shows every name's state at once.
+from what the backtest traded** — a test asserts they agree.
+`informed_flow_diagnostics.ipynb` §2b renders it for the `FOCUS` candidate (rank + bands +
+real positions; the attribution stack; the triggering events), and §2c shows every name's
+state at once.
 
 **And the book-wide counterpart: which *rule* is trading this?** `strategy.exit_causes(
 panel, **params)` returns one row per completed hold with the rule that ended it —
 `q_out`, `ineligible`, `max_hold` or `displaced` — recorded inside `_select` as each
-decision is made, so it cannot disagree with the book that traded. §10g runs it on every
-holdout, and it is the cheapest check in the notebook: **both of this strategy's worst
+decision is made, so it cannot disagree with the book that traded. The diagnostics notebook
+runs it on every holdout (§5c), and it is the cheapest check there: **both of this strategy's worst
 bugs were one `value_counts()` away from obvious and invisible in every other statistic.**
 Displacement owned 122 of 127 exits on the v16 pick; the eligibility cliff owned 140 of
 196 on v20. Neither moves an equity curve in a way you would notice, and both mean the
@@ -372,8 +374,9 @@ Sharpe of 0.94 and still **lost to buy-and-hold on both train and holdout**.
 
 So the reference for everything here is an equal-weight buy-and-hold of the same names
 over the same window, paying the same costs (`backtest.benchmark`). The optimizer
-scores `excess_cagr` (maximized) against `tracking_error` (minimized), both *against
-that benchmark* (`optimize.OBJECTIVES`), and picks only among front trials that beat it;
+scores `excess_cagr` (maximized; the return *against that benchmark*) against the book's
+own `volatility` (minimized) (`optimize.OBJECTIVES`), and picks only among front trials that
+beat it;
 absolute Sharpe is still recorded, as a diagnostic, never as a target. Notebook §10a is the pass/fail gate.
 
 `excess_cagr` is **per year**, not cumulative, and that matters more than it sounds.
@@ -408,40 +411,59 @@ One honest caveat: with fractional shares the whole model is scale-invariant, so
 $1,000,000 give identical returns. What actually binds is the shared pot and the slot
 count.
 
-**And check the signal before the backtest.** §4c measures the ranking directly, with
+**And check the signal before the backtest.** The diagnostics notebook's §2a (train) and §5b
+(holdout) measure the ranking directly, with
 the engine out of the way: the rank information coefficient and the top-minus-bottom
 decile spread against *cross-sectionally demeaned* forward returns. Demeaning removes
 the market, so what is left is stock selection and nothing else. It runs in seconds,
 it is scored per sleeve, and a sleeve with a negative decile spread is not merely
 useless — it is dragging the composite the wrong way.
 
-**Backtest honestly.** `informed_flow.ipynb` trains on 2018–2024 (`data.start` /
-`data.end`) and keeps 2025–2026 as an untouched holdout, and carries a validation block: costs-on plus
-a cost-doubling stress and breakeven-bps; a 4-fold walk-forward; the Deflated
-Sharpe Ratio over the Optuna study; parameter-neighborhood stability; a
-sub-period table; a random-entry baseline; and a minimum-trades admissibility
-filter on the Pareto front. §9b re-scores the *tuned* ranking's IC on train **and**
-holdout. Report `n_trades` beside every Sharpe.
+**Backtest honestly — two notebooks, two jobs.** Training runs 2018–2024 (`data.start` /
+`data.end`) and 2025+ is an untouched holdout.
 
-**A validation instrument only works if it tests what you ship.** §10b walk-forward
-re-picks each fold from the `sweep` grid, so anything that grid cannot express is a
-strategy the walk-forward can never validate. That silently broke: the grid pinned
+- **`informed_flow.ipynb` optimizes, on the training panel only** (it never loads the
+  holdout). It runs the study, reads the Pareto front, checks the search bounds, shows the
+  pick against buy-and-hold, and saves every distinct admissible front row to
+  `studies/<study>.candidates.yaml`.
+- **`informed_flow_diagnostics.ipynb` decides what ships.** Set `CANDIDATES` (`"pick"`, any
+  trial numbers from that file, `"config"`) and it compares them side by side:
+  - rank IC per sleeve;
+  - costs and pessimistic fills;
+  - year by year;
+  - the deflated Sharpe over the study;
+  - parameter-neighbourhood stability;
+  - a random-entry baseline;
+  - a 4-period walk-forward that re-optimizes per period, with every candidate also scored on
+    each period;
+  - ablations of recency and the risk methods on each period's own pick;
+  - the warm holdout.
+
+  All of it ends in one **verdict scoreboard** of pass/fail gates. Only a candidate that
+  passes can be promoted into `config.yaml` without `FORCE`.
+
+Report `n_trades` beside every Sharpe.
+
+**A validation instrument only works if it tests what you ship.** An earlier walk-forward
+re-picked each fold from a coarse `sweep` grid, so anything the grid could not express was a
+strategy the walk-forward could never validate. That silently broke twice: the grid pinned
 `max_positions=10`, `q_in ∈ {0.8, 0.9}`, `q_out=0.6` while the study shipped
-`15 / 0.75 / 0.45` — **not one shipped value was reachable**, so two 3,000-trial studies
-could disagree about whether the insider sleeve belongs at all, with no instrument able
-to catch it. The `sweep` block's shape knobs are now pinned to the shipped values and
-`tests/test_informed_flow.py::test_sweep_grid_contains_shipped_shape` keeps them there.
-Its free dimensions are exactly the sleeve on/off columns, which makes §10b the
-**sleeve referee** — sleeve weights are set from its folds, never from the holdout
-(selecting on the holdout burns it as an honest test).
+`15 / 0.75 / 0.45` — **not one shipped value was reachable**. The coarse sweep is now gone.
 
-**A validation instrument also has to end in an action.** §10d asks whether the picked
+Instead, every walk-forward period re-runs the real study and picks with the same rule as the
+optimization notebook. The trade-rate floor of that rule is one config value,
+`optuna.pick_min_trades_per_year`, shared by both notebooks. Whether a sleeve earns its place
+is judged there out of sample, never on the holdout: selecting on the holdout burns it as an
+honest test.
+
+**A validation instrument also has to end in an action.** The diagnostics notebook's §3d asks whether the picked
 *values* are load-bearing: it perturbs one knob at a time by ±5% and ±10% of that knob's
 own searched span (`optimize.sensitivity`) and gives each one a verdict with the move it
 implies (`optimize.stability_report`) — `inert` (pin it, spend the trials elsewhere),
 `plateau` (ship it), `cliff` (step to the neighboring value, which the cell prints),
-`spike` (do not ship this pick), `off-center` (refer it to §10b). It replaced a cell that
-re-ran §5's *global* ablation grid, called it a neighborhood, and drew a heatmap of a
+`spike` (do not ship this pick), `off-center` (refer it to the walk-forward). It replaced a
+cell that re-ran the old coarse sweep's *global* ablation grid, called it a neighborhood, and
+drew a heatmap of a
 **pinned** parameter — it never scored a single point near the pick, and its plateau rule
 (`median > 0.5 × max`) inverted whenever the best neighbor was negative. On the v15 pick
 the answer is blunt: six knobs are locally inert, and `max_positions` is a cliff sitting
@@ -480,6 +502,41 @@ the hover — where the no-rebalance drift is visible), the **cumulative realize
 P&L** decomposed per name against the total and cumulative fees, and the shared
 book's **portfolio value**. Where `plot_equity` shows *how* the book did,
 this shows *which names* did it.
+
+**The risk overlay: how much of the book is invested at all.**
+
+The selection always wants a full book of `max_positions` names, so on its own the strategy is
+always fully invested. That made its risk the market's risk or more: across 453 re-run v23
+trials, annual volatility ran 18–28% against buy-and-hold's 21%, and only 1% of trials were
+both calmer than buy-and-hold and ahead of it. `risk_method` adds the one lever that can change
+that. Each bar, a single exposure number scales every target weight, and the rest sits in cash:
+
+| `risk_method` | What it does | Searched | Pinned |
+|---|---|---|---|
+| `none` | Always fully invested — the strategy as it was through v23 | — | — |
+| `cash_switch` | Trend filter on the panel's own equal-weight index (the benchmark). When the index closes more than `regime_band` **below** its `regime_window`-day average, keep only `risk_off_exposure` invested; once it closes `regime_band` **above** it, go back to fully invested. Inside the band the last state holds, so a sideways market cannot flip the book every few days. | `risk_off_exposure` 0.0–0.8 | `regime_window` 200, `regime_band` 0.02 |
+| `vol_target` | Aim the book at an annual risk rate of `target_vol`: exposure = min(1, `target_vol` / the book's realized volatility over `vol_window` days), never above 1. The exposure only moves in `exposure_step` increments, because every change re-trims every held name. | `target_vol` 0.10–0.30 | `vol_window` 21, `exposure_step` 0.10 |
+
+**How the study decides.** The study picks the method itself (a categorical), so "no overlay"
+competes on equal terms. Only one knob per method is searched: the other method's knobs are
+inert on any trial, and a small search keeps the deflated Sharpe meaningful.
+
+**When the decisions trade.** Both overlays decide on day t's close and trade at day t+1's
+open, like every other order. They differ in what they react to:
+- **`cash_switch` pays in a slow bear market** (2022, when this book lost 21%). A fast crash
+  (2020) is mostly over before a 200-day average reacts.
+- **`vol_target` reacts within days** of turbulence starting.
+
+**Two conditions make this measurable.**
+- **The objective must be absolute risk.** The overlay is only worth anything because the
+  optimizer scores the book's own `volatility`. Under `tracking_error`, sitting in cash counted
+  as straying from the index and was punished.
+- **Out-of-sample windows must be scored warm** (`score_from`, see the main README). A 200-day
+  average is undefined for most of a half-year test window that starts cold.
+
+`informed_flow_diagnostics.ipynb` §4b is the out-of-sample referee: it re-scores each
+walk-forward period's own pick under all three methods and reports whether an overlay is calmer
+without giving back the excess.
 
 **Caveats.**
 
@@ -535,7 +592,7 @@ only what runs today.)
 | v20 | `max_positions` low bound `15 → 3`. Both journals are populated (v19 5,005 trials, v20 2,500) and both fronts are a **single dominating trial**, so their picks are not tie-breaks — but v20's pick sits at `max_positions = 3`, the new floor, continuing the unbroken run of floor-pinned picks (30 → 15 → 8 → 5 → 3). Read it as a statement about concentration, not a converged value, and note `excess_cagr = 0.446` on a 3-name book is exactly where a concentration artifact would show up | v19 ↔ v20 **no** |
 | v22 | two changes at once: the `max_positions` low bound `3 → 10` (so the floor is a book, not a bet) **and** `max_symbols` `100 → 110` — a different panel and therefore a different benchmark. 1,936 trials run 2026-09-12; the pick again sits on the `max_positions` floor (see **Status** below) | v21 ↔ v22 **no** (space *and* panel differ) |
 | v23 | same space and panel as v22; the **engine's objectives** changed from `info_ratio` ↑ / `excess_cagr` ↑ (Spearman 0.975 across v22's trials — a 2-point front) to `excess_cagr` ↑ / `tracking_error` ↓, and the pick only chooses front rows beating buy-and-hold. The engine refuses to load the v22 journal under the new labels | **no** (different objectives) |
-| v24 | three v23 bounds that the front was pressing on: the alt-data sleeve weights (`w_insider`, `w_rating`, `w_ptrev`, `w_recency`) may reach **0.0** (were floored at 0.25, which forced the negative-IC insider sleeve and a floor-pinned `w_ptrev` into every pick), `rating_halflife` high `90 → 180` (52% of the front sat at 90), `max_hold` low `21 → 10` (44% sat at 21) | **no** (space differs) |
+| v24 | three v23 bounds that the front was pressing on: the alt-data sleeve weights (`w_insider`, `w_rating`, `w_ptrev`, `w_recency`) may reach **0.0** (were floored at 0.25, which forced the negative-IC insider sleeve and a floor-pinned `w_ptrev` into every pick), `rating_halflife` high `90 → 180` (52% of the front sat at 90), `max_hold` low `21 → 10` (44% sat at 21). **Plus, before v24 ever ran:** the **risk overlay** (`risk_method` none / cash_switch / vol_target, searched with `risk_off_exposure` and `target_vol`); the engine objectives `excess_cagr` ↑ / **`volatility`** ↓ (were `tracking_error` ↓); and warm-start (`score_from`) scoring for every holdout and walk-forward test window | **no** (space, objectives and OOS scoring differ) |
 
 **Resolved (v15).** `max_positions`'s low bound had been widened `8 → 5` without a study
 bump, so `informed-flow-1d-v15.log` held 4,457 trials that could only reach 8 and 412 that

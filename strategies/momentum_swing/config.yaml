@@ -23,9 +23,12 @@ data:
 # Study settings. The search SPACE is not here — each parameter declares its own
 # `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: momentum-swing-1d-v2   # bump whenever a `search:` bound, the objective, the fill
+  study: momentum-swing-1d-v3   # bump whenever a `search:` bound, the objective, the fill
                                 # model or the execution model changes — a journal that
-                                # mixes two spaces cannot be read. v2: v1 (450 trials, 3
+                                # mixes two spaces cannot be read. v3: the engine objectives
+                                # became excess_cagr ↑ / volatility ↓ (v2's 405 trials were
+                                # scored on tracking_error; the engine refuses that journal).
+                                # v2: v1 (450 trials, 3
                                 # seeded workers = 300 duplicates, 93% pruned on the trade
                                 # floor) narrowed adr_min/vol/gap bounds toward the region
                                 # that trades at all and widened vol_mult per its boundary

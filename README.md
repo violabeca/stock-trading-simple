@@ -86,7 +86,7 @@ strategies/
   donchian_breakout/          strategy 2: intraday breakouts + ATR trailing stops  (+ notebook)
   keltner_reversion/          strategy 3: intraday dip-buying at the lower Keltner band  (+ notebook)
   squeeze_breakout/           strategy 4: intraday breakouts gated by squeeze/volume/trend confluence  (+ notebook)
-  informed_flow/              strategy 5: DAILY alt-data composite (insider + ratings + price targets + short interest)  (+ notebook)
+  informed_flow/              strategy 5: DAILY alt-data composite (insider + ratings + price targets + short interest)  (+ optimize & diagnostics notebooks)
   candle_scalp/               strategy 6: intraday reversal candles at a stretched location, built to be falsified  (+ notebook)
   support_bounce/             strategy 7: intraday tested-support mean reversion  (+ notebook)
   value_factor/               strategy 8: DAILY cross-sectional value + quality on SEC XBRL fundamentals  (+ notebook)
@@ -177,6 +177,19 @@ adjusted into one consistent space. Signals computed on bar *t* execute at bar
 *t+1*'s open — never at the price that produced the signal. This "no
 look-ahead" rule is enforced by the engine, not by convention.
 
+**Out-of-sample windows start warm.** A holdout or walk-forward test window is scored
+with `backtest.evaluate(strat, long_panel, params, score_from=window_start)` (the same
+option exists on `run_strategy`).
+- **How it works:** `signals()` runs on the whole panel, so every rolling window, EMA and
+  moving average enters the test window with its history. The book is traded, and the
+  benchmark and every metric are measured, only from `score_from` on.
+- **Why:** backtesting a panel *sliced* to the window restarts all of those calculations at
+  its first bar, which live trading never does. informed_flow's 2025 holdout ranked 2 names
+  on its first day instead of 97, and its walk-forward test windows read +9.3%/yr cold
+  against +4.3%/yr warm.
+- **Worse for long indicators:** a 200-day moving average would stay undefined for most of a
+  half-year test window.
+
 **Fill pricing: `open` or `pessimistic`.** Each strategy picks its fill model in
 `config.yaml` (`backtest: {fill: ...}`, default `open`). `open` fills every order at
 the next bar's adjusted open, which is symmetric and neutral. `pessimistic` fills every
@@ -261,18 +274,25 @@ cannot *reverse* a position in one order, so an opposite-direction entry closes 
 open position instead (`upon_opposite_entry="close"` in the engine); the new direction
 opens on a later bar if its signal persists.
 
-**The objectives: benchmark-relative, and per year.** Optimization scores two numbers
-**together**, both measured against an equal-weight buy-and-hold of the same panel:
-`excess_cagr` — how much more per year the strategy earns than the benchmark
-(maximized) — and `tracking_error` — how far its daily path strays from the benchmark,
-annualized (minimized). Earning more than the index requires owning something
-different from it, and owning something different is exactly what tracking error
-measures, so the two pull against each other and the front is a real menu: one strategy
-per level of straying, with `info_ratio` (their ratio, still recorded on every trial) at
-the knee. The previous pair, `info_ratio` and `excess_cagr`, was one number in two
-costumes — Spearman 0.975 across informed_flow's v22 trials — and collapsed
-multi-thousand-trial studies to fronts of one or two points. Two traps are being avoided
-at once. *Absolute* Sharpe
+**The objectives: return over the benchmark, against the annual risk rate — both per
+year.** Optimization scores two numbers **together**:
+- `excess_cagr`: how much more per year the strategy earns than an equal-weight buy-and-hold
+  of the same panel (maximized).
+- `volatility`: the annualized standard deviation of the strategy's own returns, i.e. how
+  bumpy the ride is (minimized; buy-and-hold of LiquidLeaders ran ~21% over 2018–2024).
+
+In words: *beat the market, as calmly as possible*. The front is a real menu of return
+against risk. A strategy that de-risks, by sitting partly in cash in a downtrend or scaling
+down when markets turn wild (informed_flow's `risk_method`), gets credit for it.
+
+Two earlier pairs were retired:
+- `info_ratio` and `excess_cagr` were one number in two costumes (Spearman 0.975), so fronts
+  shrank to one or two points.
+- `tracking_error`, the distance from the index, punished exactly the moves that lower real
+  risk: a book in cash during a crash strays from the index furthest of all.
+
+`info_ratio` and `tracking_error` are still recorded on every trial. Two traps are being
+avoided at once. *Absolute* Sharpe
 rewards market exposure rather than skill — a long-only strategy in a rising market
 earns one just by being invested. And a *cumulative* excess return rewards a long
 backtest for being long: it can compare neither two strategies (windows here run from
@@ -289,8 +309,8 @@ this used to be a per-notebook literal and drifted into three different answers,
 them arguing from the pre-v5 objectives. Pass `weights=` explicitly if a strategy needs
 a different trade-off, and say why at the call site. The pick only ever chooses a front
 row that **beats buy-and-hold** (`excess_cagr > optimize.MIN_PICK_EXCESS`, i.e. > 0):
-minimizing tracking error puts index-huggers that earn nothing at the low end of the
-front, and they stay visible there but are never picked. If no row qualifies, the pick
+minimizing volatility puts timid books (mostly cash, or the calmest names) that lag the
+market at the low end of the front; they stay visible there but are never picked. If no row qualifies, the pick
 falls back to the whole front and flags it (`beats_benchmark = False`).
 
 Each study is **stamped with the objectives it was scored on**. A journal stores its

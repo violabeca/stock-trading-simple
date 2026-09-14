@@ -3,7 +3,8 @@
 # (insider buying + analyst rating changes + analyst price-target revisions +
 # short-interest avoidance).
 # Layout: data (what panel to load), optuna (study settings), params
-# (every knob: doc + shipped value + optional search space and sweep grid).
+# (every knob: doc + shipped value + optional search space). Two notebooks drive it:
+# informed_flow.ipynb optimizes, informed_flow_diagnostics.ipynb decides what ships.
 # The study-version history — and which journals may not be compared — lives in
 # README.md under "Study history"; this file describes what runs TODAY.
 # ===========================================================================
@@ -12,12 +13,12 @@ data:
   universe: LiquidLeaders  # ~100 liquid US names — breadth for cross-sectional ranking
   bar: 1d                  # daily bars (alt-data signals act over weeks–months)
   # We TRAIN from 2018 (see notebooks/03_altdata_update.ipynb for ingestion coverage): ~7y
-  # of train, minus up to ~1.5y of insider_window warm-up. That includes the 2020 COVID crash and reflation melt-up, a regime unlike
-  # today's — narrowing `start` to 2021 trades statistical power for regime relevance and
-  # needs no re-ingestion. Either way read the DSR, the §10b walk-forward and the §10e
-  # sub-period table before believing any result.
+  # of train, minus up to ~1.5y of insider_window warm-up. That includes the 2020 COVID
+  # crash and reflation melt-up, a regime unlike today's — narrowing `start` to 2021 trades
+  # statistical power for regime relevance and needs no re-ingestion. Either way read the
+  # diagnostics notebook's deflated Sharpe, walk-forward and year-by-year table first.
   start: "2018-01-01"
-  end: "2024-12-31"        # TRAIN cutoff — 2025+ is the notebook's untouched holdout
+  end: "2024-12-31"        # TRAIN cutoff — 2025+ is the diagnostics notebook's holdout
   session: regular         # daily bars are all regular-session
   max_symbols: 110         # cap at the best-covered names
   # Attached to Panel.features at load time. A sleeve that is missing, or that covers
@@ -33,7 +34,10 @@ optuna:
                            # that mixes two spaces cannot be read (see README study history).
                            # v24: the alt-data sleeve weights may now reach 0.0 (were floored
                            # at 0.25), rating_halflife high 90 -> 180, max_hold low 21 -> 10 —
-                           # all three were pressing on v23's bounds (see README study history).
+                           # all three were pressing on v23's bounds (see README study history)
+                           # — AND the risk overlay (risk_method: none | cash_switch |
+                           # vol_target) AND the engine objectives excess_cagr ↑ / volatility ↓
+                           # (were excess_cagr / tracking_error). v24 never ran before these.
                            # v23: same space and panel as v22; the ENGINE's objectives became
                            # excess_cagr ↑ / tracking_error ↓ (were info_ratio / excess_cagr,
                            # 0.975-correlated). The v22 journal is refused by the new engine.
@@ -49,6 +53,11 @@ optuna:
   min_trades_per_year: 15  # admissibility floor (PER YEAR, not absolute): daily,
                            # multi-position portfolio mode turns over far less than an
                            # intraday scanner — 15/yr ~= 75 trades over this 5y window
+  pick_min_trades_per_year: 20   # the PICKING floor, stricter than the pruning one above: a
+                           # front row trading less is inadmissible as a pick. ONE value for
+                           # both notebooks — the optimizer's pick and every walk-forward
+                           # period's re-pick in informed_flow_diagnostics.ipynb — so the
+                           # walk-forward always tests the rule that picked the candidate.
 
 # Execution rules the engine applies to this strategy AND its buy-and-hold benchmark.
 backtest:
@@ -59,12 +68,10 @@ backtest:
                            # changes every number: bump optuna.study, or a journal mixes two
                            # execution models that nothing can tell apart.
 
-# Every parameter declared ONCE: what it means, what ships (`value`), what the
-# study may explore (`search`), and what the coarse sweep varies (`grid`).
-# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
-# Two invariants are enforced at load time (strategies._unpack): `value` must be
-# reachable by its own `search`, and must appear in its own `grid` — so the sweep can
-# never explore a family that excludes the strategy this file ships.
+# Every parameter declared ONCE: what it means (`doc`), what ships (`value`) and what the
+# study may explore (`search`); a bare scalar means value-only. strategies._unpack refuses
+# a `value` its own `search` cannot reach. There are no `grid:` lists: informed_flow has no
+# coarse sweep — the full study and the diagnostics notebook's walk-forward replaced it.
 params:
 
   # --- signal construction --------------------------------------------------------
@@ -102,34 +109,30 @@ params:
   # Until v23 the floors were 0.25 ("the study sizes a sleeve, the grid decides whether it
   # exists"), but that forced sleeves the search wanted gone into every pick: v23's insider
   # sleeve had a NEGATIVE train rank-IC (−0.015 at 63d) and w_ptrev sat on its 0.25 floor for
-  # 64% of the front, so the shipped composite carried both by construction. The 0.0 columns
-  # of the grids below (§10b·ii) remain the out-of-sample referee on existence. w_dtc is the
-  # fixed 1.0 numeraire, so the weights can never all be zero. §8 will flag "widen low" on a
-  # pick at 0.0 — a weight cannot go negative, so that one flag is noise.
+  # 64% of the front, so the shipped composite carried both by construction. w_dtc is the
+  # fixed 1.0 numeraire, so the weights can never all be zero. The optimization notebook's
+  # boundary check flags "widen low" on a pick at 0.0 — a weight cannot go negative, so that
+  # one flag is noise.
   w_insider:
-    doc: Composite weight on insider buying. 0.0 in the grid ablates the sleeve.
+    doc: Composite weight on insider buying. 0.0 switches the sleeve off.
     value: 1.0
     search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
-    grid: [0.0, 1.0]
   w_rating:
-    doc: Composite weight on rating-change momentum. 0.0 in the grid ablates it.
+    doc: Composite weight on rating-change momentum. 0.0 switches it off.
     value: 1.0
     search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
-    grid: [0.0, 1.0]
   w_ptrev:
     doc: >-
       Composite weight on price-target REVISIONS (never the target-to-price level — Han-Kang
       2022 show price drifts against the level, worst in exactly this large-cap universe).
     value: 0.5
     search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
-    grid: [0.0, 0.5, 1.0]
   w_dtc:
     doc: >-
       Composite weight on (negated) days-to-cover — low short interest is the favourable
       tilt. The FIXED numeraire at 1.0: never searched, because only weight ratios matter
-      and searching all four would waste a dimension. The grid can still ablate it.
+      and searching all four would waste a dimension.
     value: 1.0
-    grid: [0.0, 1.0]
   w_recency:
     doc: >-
       Composite weight on RECENCY of coverage — bars since this name's last insider or
@@ -146,11 +149,11 @@ params:
       real but small — the replacement beat the sold name by +1.04% at 5 bars (p=0.052) and
       +1.57% at 10 (p=0.030), gone by 63 — which is an argument for a sized, ablatable
       sleeve and against a cliff. This sleeve has NO window of its own, so it also
-      decouples staleness from insider_window's other three jobs. 0.0 in the grid ablates
-      it, which is the honest out-of-sample test of whether it earns its weight.
+      decouples staleness from insider_window's other three jobs. 0.0 switches it off; the
+      diagnostics notebook (§4b) re-scores every walk-forward pick with it off and at 1.0,
+      the out-of-sample test of whether it earns its weight.
     value: 1.0
-    search: { type: float, low: 0.25, high: 3.0, step: 0.25 }
-    grid: [0.0, 1.0]
+    search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
 
   # --- price-derived market-condition sleeves --------------------------------------
   # These read panel.close directly — no alt-data table — so they always cover the universe:
@@ -158,16 +161,14 @@ params:
   # pushes it out of the limited slots. Ranked only WITHIN the alt-data-eligible
   # cross-section, so they confirm an already-rankable name and can never pull in a name the
   # model has no evidence on. Currently OFF (value 0.0) and NOT searched — v13-vs-v14's
-  # controlled holdout ablation put their effect at ~zero (holdout IR 2.02 -> 2.02). The grid
-  # keeps testing them out of sample; re-add a `search:` here to let the study size them.
+  # controlled holdout ablation put their effect at ~zero (holdout IR 2.02 -> 2.02). Re-add a
+  # `search:` here to let the study size them.
   w_trend:
     doc: Composite weight on the MA-trend sleeve, SMA(trend_fast)/SMA(trend_slow) - 1.
     value: 0.0
-    grid: [0.0, 1.0]
   w_rsi:
     doc: Composite weight on the Wilder-RSI(rsi_period) sleeve.
     value: 0.0
-    grid: [0.0, 1.0]
   trend_fast:
     doc: >-
       MA-trend fast leg (bars, ~1mo). The crossover reads the trend's slope, which is
@@ -184,14 +185,11 @@ params:
   # NOT arbitrary defaults: v13 and v14 searched q_in over [0.6, 0.95] and q_out over
   # [0.4, 0.9] and BOTH converged on exactly 0.75/0.45, from opposite sleeve mixes. Two
   # independent fits agreeing on the band is the most robust single result either produced.
-  # The grids pin both to the shipped value so §10b·ii's folds re-pick inside the family
-  # that actually ships — the drift that made a whole walk-forward meaningless twice.
   q_in:
     doc: Buy when the composite rank reaches this quantile (0.75 = top 25%). Qualifying is
          necessary, not sufficient — it still needs a free slot.
     value: 0.75
     search: { type: float, low: 0.6, high: 0.95, step: 0.01 }
-    grid: [0.75]
   q_out:
     doc: >-
       Sell when the rank falls below this. The gap to q_in is the hysteresis band that damps
@@ -201,7 +199,6 @@ params:
       the margin approaches 1.0.
     value: 0.45
     search: { type: float, low: 0.4, high: 0.9, step: 0.01 }
-    grid: [0.45]
   max_hold:
     doc: >-
       Time-stop backstop in bars (~6 months). It exists for ONE case: a name parked in the
@@ -246,7 +243,6 @@ params:
       treat a pick at the floor as a statement about concentration, not a converged value.
     value: 15
     search: { type: int, low: 10, high: 30 }
-    grid: [15]             # pinned so the sweep's free dimensions are the sleeve ablations
   displace_margin:
     doc: >-
       What happens when a qualifying name arrives and every slot is full, on ONE continuous
@@ -274,7 +270,6 @@ params:
       1.0 for that reason, and it is a REACHED bound by construction, not a clipped one.
     value: 1.0                 # == the old shipped `displace: false`, bit-for-bit
     search: { type: float, low: 0.0, high: 1.0, step: 0.01 }
-    grid: [0.0, 1.0]           # the true ablation: chase the ranking vs pure hysteresis
   retrim_k:
     doc: >-
       Single-name concentration cap (engine _retrim_loop). A held slot drifts untouched
@@ -284,3 +279,60 @@ params:
       and crown a parameter set. Deliberately a FIXED policy with no `search:` — optimizing
       it would just tune the cap to whatever flattered the in-sample winner. null disables.
     value: 2.0
+
+  # --- the risk overlay: how much of the book is invested at all ---------------------
+  # One exposure number per bar scales every target weight; the rest sits in cash
+  # (strategy._exposure). The study CHOOSES the method, so "no overlay" competes on equal
+  # terms. Only the `volatility` objective can reward an overlay: cash lowers the book's own
+  # risk, which a benchmark-relative risk measure (tracking error) punished as straying.
+  # Each method's knobs are inert under the other two methods — the front collapses those
+  # clones (optimize.distinct_front) — so only ONE knob per method is searched and the
+  # conventional values are pinned, keeping the search small enough for the deflated Sharpe
+  # to mean something. The out-of-sample referee is informed_flow_diagnostics.ipynb §4b,
+  # which re-scores each walk-forward period's own pick under every method.
+  risk_method:
+    doc: >-
+      none: always fully invested. cash_switch: a trend filter on the panel's equal-weight
+      index — keep only risk_off_exposure invested while the index closes more than
+      regime_band below its regime_window-bar average, back to fully invested once it closes
+      regime_band above it. vol_target: exposure = min(1, target_vol / the unscaled book's
+      realized volatility over vol_window bars), moved in exposure_step increments. Both are
+      decided at bar t's close and traded at t+1's open.
+    value: "none"
+    search: { type: categorical, choices: ["none", "cash_switch", "vol_target"] }
+  risk_off_exposure:
+    doc: >-
+      cash_switch only — share of the book kept invested in a downtrend (0.0 = all cash,
+      0.5 = half). The search stops at 0.8, because 1.0 is exactly risk_method none.
+    value: 0.0
+    search: { type: float, low: 0.0, high: 0.8, step: 0.1 }
+  regime_window:
+    doc: >-
+      cash_switch only — moving-average length of the index in bars (~10 months). PINNED at
+      the textbook 200 (Faber 2007), not searched: the window is the knob a trend filter is
+      easiest to curve-fit on. Add a `search:` to let the study move it.
+    value: 200
+  regime_band:
+    doc: >-
+      cash_switch only — hysteresis around the average. At 0.02 the index must close 2%
+      below it to go to cash and 2% above it to come back; without the band a sideways market
+      flips the whole book (two legs of costs on every slot) every few days. Pinned.
+    value: 0.02
+  target_vol:
+    doc: >-
+      vol_target only — the annual risk rate to aim for. Buy-and-hold of this panel ran ~21%
+      (2018-2024) and the unscaled v23 book ~23%, so 0.30 rarely binds and 0.10 keeps the book
+      roughly half in cash.
+    value: 0.20
+    search: { type: float, low: 0.10, high: 0.30, step: 0.01 }
+  vol_window:
+    doc: >-
+      vol_target only — trailing bars of realized volatility (~1 month): short enough to
+      react within weeks of turbulence starting. Pinned.
+    value: 21
+  exposure_step:
+    doc: >-
+      vol_target only — the exposure moves only once its target has drifted this far (0.10 =
+      ten percentage points). Every change re-trims every held name, so an un-banded overlay
+      would trade the whole book daily. Pinned.
+    value: 0.10

@@ -114,8 +114,9 @@ front's `n_trades` and time-in-market fall while `excess_cagr` does not.
 
 - **Why does the optimiser prefer `regime: none`?** In v1 every one of the six best scored
   trials had no gate. The benchmark-relative objective charges time out of the market
-  against a +15%/yr equal-weight hurdle, and the gate's job is to cut drawdown (which the
-  objectives do not score directly). Read `max_drawdown` and `tracking_error` on the gated
+  against a +15%/yr equal-weight hurdle, and the gate's job is to cut drawdown (v1/v2 scored
+  `tracking_error`, which charged it for straying; v3 scores `volatility`, which credits a
+  calmer book). Read `max_drawdown` and `volatility` on the gated
   vs ungated front rows before concluding the gate is useless; the literature says its
   value is in the tail, not the mean.
 - **Is the shortfall time-in-market or selection?** The v1 event study says the strict

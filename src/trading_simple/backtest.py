@@ -11,6 +11,12 @@ engine-enforced and identical for every strategy:
   ``backtest.fill: pessimistic`` (:func:`fill_prices`) — never at the signal bar's close.
 * **Costs always on**: :func:`leg_costs` converts the configured friction into
   vectorbt ``fees``/``slippage`` fractions.
+* **Out-of-sample windows start warm**: :func:`run_strategy` and :func:`evaluate` take
+  ``score_from=``. The strategy's ``signals()`` still sees the whole panel, so every rolling
+  window, EMA and moving average carries its history into the scored window, while the book
+  is traded — and every metric measured — only from that bar on. Backtesting a panel sliced
+  to the window instead restarts all of them at its first bar, which live trading never
+  does (informed_flow's holdout ranked 2 names on its first day instead of 97).
 
 Two execution models, chosen by what a strategy's ``signals()`` returns:
 
@@ -50,6 +56,7 @@ calls.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from itertools import product
 from typing import TYPE_CHECKING
 
@@ -97,6 +104,7 @@ FILLS = ("open", "pessimistic")
 METRIC_COLS = frozenset({
     "total_return", "cagr", "sharpe", "max_drawdown", "win_rate", "pct_profitable",
     "n_trades", "trades_per_year", "years", "excess_cagr", "info_ratio", "tracking_error",
+    "volatility",
 })
 
 _configured = False
@@ -616,8 +624,61 @@ def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, price: pd.DataFrame, 
     return _retrim_loop(build, targets, weights, retrim_k * weights)
 
 
+def _score_window(panel: Panel, signals: dict, start) -> tuple[Panel, dict]:
+    """Cut a panel, and the signals already computed on it, to the bars from ``start`` on.
+
+    The warm-start half of :func:`run_strategy`: the signals were built on the whole panel,
+    so their rolling windows are already warm at ``start``; only the book and the metrics are
+    restricted. A portfolio-mode book buys its targets on the window's first bar. A signal
+    strategy starts flat and waits for its next entry, because an entry fired before
+    ``start`` is outside the window.
+
+    Args:
+        panel: The full panel the signals were computed on.
+        signals: The strategy's signal dict; every frame or series on the panel's index is
+            cut, scalars (``cash_frac``, ``retrim_k``, stop distances) pass through.
+        start: First scored bar (date string or timestamp; naive means the panel's tz).
+
+    Returns:
+        ``(window_panel, window_signals)``.
+
+    Raises:
+        ValueError: If fewer than two bars remain from ``start`` on.
+    """
+    index = panel.close.index
+    ts = pd.Timestamp(start)
+    if ts.tzinfo is None and index.tz is not None:
+        ts = ts.tz_localize(index.tz)
+    if int((index >= ts).sum()) < 2:
+        raise ValueError(f"score_from={start!r} leaves fewer than 2 bars of the panel")
+
+    def cut(value):
+        if (isinstance(value, pd.DataFrame | pd.Series)
+                and isinstance(value.index, pd.DatetimeIndex)):
+            return value.loc[value.index >= ts]
+        return value
+
+    window = replace(panel, close=cut(panel.close), open_=cut(panel.open_), high=cut(panel.high),
+                     low=cut(panel.low), volume=cut(panel.volume), rth=cut(panel.rth),
+                     features=None if panel.features is None
+                     else {k: cut(v) for k, v in panel.features.items()})
+    return window, {k: cut(v) for k, v in signals.items()}
+
+
+def _run_scored(strategy: LoadedStrategy, panel: Panel, params: dict | None,
+                settings: Settings, score_from):
+    """Signals on the whole panel, book on ``[score_from, end]`` — see :func:`run_strategy`."""
+    signals = strategy.signals(panel, **{**strategy.params, **(params or {})})
+    if score_from is not None:
+        panel, signals = _score_window(panel, signals, score_from)
+    fees, slippage = panel_costs(settings.costs, panel)
+    pf = run(panel, signals, fees=fees, slippage=slippage,
+             init_cash=settings.backtest.init_cash, fill=strategy.fill)
+    return pf, panel, fees, slippage
+
+
 def run_strategy(strategy: LoadedStrategy, panel: Panel, params: dict | None = None,
-                 *, settings: Settings):
+                 *, settings: Settings, score_from=None):
     """Run one backtest of a strategy with its config defaults (plus overrides).
 
     Args:
@@ -625,14 +686,18 @@ def run_strategy(strategy: LoadedStrategy, panel: Panel, params: dict | None = N
         panel: Price panel matching the strategy's ``data:`` block.
         params: Overrides merged over ``strategy.params``.
         settings: Global settings (costs, init_cash).
+        score_from: **Warm start** for an out-of-sample window. ``None`` backtests the whole
+            panel. A date runs ``signals()`` on the whole panel — so rolling windows, EMAs
+            and moving averages enter the window with their history, as they would live —
+            and trades the book only from that bar on (:func:`_score_window`). Pass the
+            long panel plus the window's first date; never a panel pre-sliced to the window,
+            which restarts every indicator on the window's first bar.
 
     Returns:
-        A ``vectorbt.Portfolio``, filled under the strategy's ``backtest.fill`` model.
+        A ``vectorbt.Portfolio`` on the scored bars, filled under the strategy's
+        ``backtest.fill`` model.
     """
-    merged = {**strategy.params, **(params or {})}
-    fees, slippage = panel_costs(settings.costs, panel)
-    return run(panel, strategy.signals(panel, **merged), fees=fees, slippage=slippage,
-               init_cash=settings.backtest.init_cash, fill=strategy.fill)
+    return _run_scored(strategy, panel, params, settings, score_from)[0]
 
 
 #: Cached ``(total_return, per-bar returns)`` of the equal-weight benchmark, keyed by
@@ -738,7 +803,8 @@ def active_stats(pf, panel: Panel, *, fees: float, slippage: float,
     }
 
 
-def evaluate(strategy: LoadedStrategy, panel: Panel, params: dict, *, settings: Settings) -> dict:
+def evaluate(strategy: LoadedStrategy, panel: Panel, params: dict, *, settings: Settings,
+             score_from=None) -> dict:
     """Backtest one parameter set and reduce it to plain metric floats.
 
     The single entry point shared by notebooks, tests, and the Optuna
@@ -749,18 +815,20 @@ def evaluate(strategy: LoadedStrategy, panel: Panel, params: dict, *, settings: 
         panel: Price panel.
         params: Full parameter dict for this run.
         settings: Global settings.
+        score_from: Warm start (see :func:`run_strategy`): signals on the whole panel,
+            book, benchmark and every metric on the bars from this date on. Use it for every
+            holdout and walk-forward test window.
 
     Returns:
-        ``{total_return, cagr, sharpe, max_drawdown, win_rate, pct_profitable, n_trades,
-        trades_per_year, years, excess_cagr, info_ratio, tracking_error}`` — the last three
-        are measured against an equal-weight buy-and-hold of the same panel (see
-        :func:`benchmark`); :mod:`trading_simple.optimize` scores ``excess_cagr`` against
-        ``tracking_error``: an absolute Sharpe rewards market exposure, not stock selection.
+        ``{total_return, cagr, sharpe, volatility, max_drawdown, win_rate, pct_profitable,
+        n_trades, trades_per_year, years, excess_cagr, info_ratio, tracking_error}`` — the
+        last three are measured against an equal-weight buy-and-hold of the same (scored)
+        panel (see :func:`benchmark`). :mod:`trading_simple.optimize` scores ``excess_cagr``
+        against ``volatility``: the return must beat the market, the risk is the book's own.
     """
-    pf = run_strategy(strategy, panel, params, settings=settings)
+    pf, window, fees, slippage = _run_scored(strategy, panel, params, settings, score_from)
     stats = portfolio_stats(pf)
-    fees, slippage = panel_costs(settings.costs, panel)
-    stats.update(active_stats(pf, panel, fees=fees, slippage=slippage,
+    stats.update(active_stats(pf, window, fees=fees, slippage=slippage,
                               total_return=stats["total_return"], fill=strategy.fill))
     return stats
 
@@ -902,8 +970,9 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
                      for cid in ids]
             continue
         per_combo = _metric_frame(pf, cols).groupby(level="combo").agg({
-            "total_return": "mean", "sharpe": "mean", "max_drawdown": "mean",
-            "win_rate": "mean", "profitable": "mean", "n_trades": "sum",
+            "total_return": "mean", "sharpe": "mean", "volatility": "mean",
+            "max_drawdown": "mean", "win_rate": "mean", "profitable": "mean",
+            "n_trades": "sum",
         }).rename(columns={"profitable": "pct_profitable"})
         rows += [{**grid[cid], **per_combo.loc[cid].to_dict()} for cid in ids]
 
@@ -949,6 +1018,11 @@ def portfolio_stats(pf) -> dict:
     return (it shares the book's cash), so it becomes the share of **traded** symbols
     whose realized profit is positive. Same question, same spirit.
 
+    ``volatility`` is the annual risk rate: the standard deviation of the book's per-bar
+    returns, annualized on the same bars-per-calendar-year clock as ``sharpe`` (the
+    per-symbol mean in per-symbol mode). It is one of the study objectives
+    (:data:`trading_simple.optimize.OBJECTIVES`).
+
     Args:
         pf: A ``vectorbt.Portfolio``.
 
@@ -964,6 +1038,7 @@ def portfolio_stats(pf) -> dict:
         stats = {
             "total_return": float(m["total_return"].mean()),
             "sharpe": float(m["sharpe"].mean()),
+            "volatility": float(m["volatility"].mean()),
             "max_drawdown": float(m["max_drawdown"].mean()),
             "win_rate": float(m["win_rate"].mean()),
             "pct_profitable": float(m["profitable"].mean()),
@@ -998,6 +1073,19 @@ def _bar_sharpe(returns, index):
         return returns.mean() / returns.std() * ann
 
 
+def _bar_volatility(returns, index):
+    """Annualized volatility of per-bar returns, on :func:`_bar_sharpe`'s clock.
+
+    Args:
+        returns: Per-bar returns — a Series (one book) or DataFrame (per column).
+        index: The panel/backtest index the returns live on.
+
+    Returns:
+        Float for a Series, per-column Series for a DataFrame.
+    """
+    return returns.std() * np.sqrt(len(index) / _years(index))
+
+
 def _grouped_stats(pf) -> dict:
     """The shared book's metrics, read as the scalars vectorbt returns when grouped."""
     def scalar(fn) -> float:
@@ -1012,6 +1100,7 @@ def _grouped_stats(pf) -> dict:
     return {
         "total_return": scalar(pf.total_return),
         "sharpe": scalar(lambda: _bar_sharpe(pf.returns(), pf.wrapper.index)),
+        "volatility": scalar(lambda: _bar_volatility(pf.returns(), pf.wrapper.index)),
         "max_drawdown": scalar(pf.max_drawdown),
         "win_rate": scalar(pf.trades.win_rate),
         # No symbol has a standalone return here — they share one pot — so ask the
@@ -1038,7 +1127,7 @@ def symbol_stats(pf) -> pd.DataFrame:
         pf: A ``vectorbt.Portfolio``.
 
     Returns:
-        One row per symbol (``total_return, sharpe, max_drawdown, win_rate,
+        One row per symbol (``total_return, sharpe, volatility, max_drawdown, win_rate,
         n_trades``), sorted by total return descending.
     """
     m = _metric_frame(pf, pf.wrapper.get_columns(group_by=False)).drop(columns="profitable")
@@ -1067,6 +1156,8 @@ def _metric_frame(pf, cols: pd.Index) -> pd.DataFrame:
         "total_return": total_return,
         "sharpe": safe(lambda group_by: _bar_sharpe(pf.returns(group_by=group_by),
                                                     pf.wrapper.index)),
+        "volatility": safe(lambda group_by: _bar_volatility(pf.returns(group_by=group_by),
+                                                            pf.wrapper.index)),
         "max_drawdown": safe(pf.max_drawdown),
         "win_rate": safe(pf.trades.win_rate),
         "profitable": (total_return > 0).astype(float),

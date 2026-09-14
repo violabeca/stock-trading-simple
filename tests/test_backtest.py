@@ -252,11 +252,61 @@ def test_run_with_trailing_stop_caps_loss(panel):
 def test_portfolio_stats_and_equity(panel):
     pf = bt.run(panel, _one_spike_signals(panel), fees=0.0, slippage=0.0, init_cash=10_000)
     stats = bt.portfolio_stats(pf)
-    assert set(stats) == {"total_return", "cagr", "sharpe", "max_drawdown", "win_rate",
-                          "pct_profitable", "n_trades", "trades_per_year", "years"}
+    assert set(stats) == {"total_return", "cagr", "sharpe", "volatility", "max_drawdown",
+                          "win_rate", "pct_profitable", "n_trades", "trades_per_year", "years"}
     assert stats["n_trades"] == 1
     curve = bt.equity_curve(pf, init_cash=10_000)
     assert curve["value"].iloc[0] == pytest.approx(20_000)  # 2 symbols x 10k
+
+
+def test_volatility_is_the_books_own_annualized_risk(panel):
+    """The annual risk rate: std of the book's per-bar returns on the bars-per-year clock."""
+    idx = panel.close.index
+    half = pd.DataFrame(0.5, index=idx, columns=panel.close.columns)
+    pf = bt.run(panel, {"weights": half}, fees=0.0, slippage=0.0)
+    expected = pf.returns().std() * np.sqrt(len(idx) / bt._years(idx))
+    assert bt.portfolio_stats(pf)["volatility"] == pytest.approx(expected)
+    cash = bt.run(panel, {"weights": half * 0.0}, fees=0.0, slippage=0.0)
+    assert bt.portfolio_stats(cash)["volatility"] == pytest.approx(0.0)   # cash does not move
+
+
+def _slow_starter(p, **_):
+    """A book that needs 30 bars of history before it holds anything."""
+    ready = p.close.rolling(30).mean().notna()
+    return {"weights": bt.next_bar(ready).astype(float) / len(p.symbols)}
+
+
+def test_score_from_warm_starts_the_signals_and_scores_only_the_window(panel):
+    """An out-of-sample window must inherit its indicators' history, not restart them.
+
+    Slicing the panel to the window restarts every rolling window at its first bar, so a
+    30-bar indicator never warms up inside a 20-bar window and the book sits in cash for
+    the whole test. `score_from` computes the signals on the whole panel and trades only the
+    window: the book is invested from the window's first bar, and every metric (years,
+    benchmark, excess) belongs to the window alone.
+    """
+    from trading_simple import strategies
+
+    strat = replace(strategies.load("informed_flow"), signals=_slow_starter, params={})
+    start = panel.close.index[40]
+    warm = bt.run_strategy(strat, panel, settings=_settings(), score_from=start)
+    assert warm.wrapper.index[0] == start
+    assert warm.asset_value(group_by=False).iloc[0].sum() > 0          # invested on bar one
+
+    window, _ = bt._score_window(panel, {}, start)
+    cold = bt.run_strategy(strat, window, settings=_settings())         # the old, sliced way
+    assert cold.asset_value(group_by=False).sum().sum() == 0            # never warms up
+
+    stats = bt.evaluate(strat, panel, {}, settings=_settings(), score_from=start)
+    assert stats["years"] == pytest.approx(bt._years(window.close.index))
+    fees, slip = bt.panel_costs(_settings().costs, window)
+    manual = bt.run(window, {"weights": _slow_starter(panel)["weights"].loc[start:]},
+                    fees=fees, slippage=slip)
+    by_hand = bt.active_stats(manual, window, fees=fees, slippage=slip,
+                              total_return=bt.portfolio_stats(manual)["total_return"])
+    assert stats["excess_cagr"] == pytest.approx(by_hand["excess_cagr"], rel=1e-9)
+    with pytest.raises(ValueError, match="score_from"):
+        bt.run_strategy(strat, panel, settings=_settings(), score_from=panel.close.index[-1])
 
 
 def test_symbol_stats_per_symbol_breakdown(panel):

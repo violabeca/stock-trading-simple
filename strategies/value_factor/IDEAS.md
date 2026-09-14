@@ -54,3 +54,34 @@ rank** for a quarter), CCL ×1,000. The `fundamentals` table holds 124 rows with
 non-positive share count across 87 symbols. A plausibility filter in the feature layer is
 the fix (engine proposal in `../turnover_momentum/IDEAS.md`); until then read a sudden
 top-decile value rank as a possible unit error.
+
+### Frozen fundamentals series — and gp's coverage sits on the floor (measured 2026-09-14)
+
+The SEC provider locks each concept onto the first XBRL tag that ever had data, so a series
+freezes when a filer stops using that tag. On this strategy's LiquidLeaders panel that freezes
+the share count of V, MA, ACN and CCZ since 2010 (multi-class issuers stop filing a
+non-dimensional cover-page count), and gross profit for AMZN, COST, BMY, PH, SCCO, CVS, ORCL,
+VZ, BKNG, C, PBR and TM (the `GrossProfit` tag was abandoned; revenue − COGS is only synthesized
+when the tag never existed at all).
+
+It matters because `gp`'s best-bar coverage is 0.52 against the 0.50 `min_coverage` floor.
+Config defaults, train 2021–2024, with fundamentals values older than 800 days masked:
+
+| variant | factors present | eligible/day | excess_cagr | info_ratio |
+|---|---|---|---|---|
+| today | bp, ey, gp | 48 | +4.4% | 0.45 |
+| stale values masked | bp, ey | 70 | −3.4% | −0.36 |
+| masked, floor lowered to 0.40 so gp stays | bp, ey, gp | 35 | +4.9% | 0.53 |
+| today, `w_gp: 0` | bp, ey | 84 | 0.0% | 0.02 |
+
+So gp is the entire result, its breadth leans on stale rows, and masking them without a
+per-period fallback silently ablates it. The fallback (revenue − COGS where `GrossProfit`
+stops) restores current gross profit for AMZN, COST, BMY, PH and SCCO; VZ, ORCL, BKNG and C
+report no gross-profit line and should stay NaN. The proposal is in
+`../turnover_momentum/IDEAS.md`.
+
+Separately, ADR market caps are wrong by the ADS ratio, because the cover-page count is
+ordinary shares while the stored price is per ADS: stored price × shares at 2024-12-31 gives
+TSM ~$5.0T (5× too high), TM ~$2.6T (10×), HSBC ~$0.87T (5×) and MFG ~$12B (5× too low).
+BTI, SAP, ASML and the Canadian 40-F banks are 1:1 and fine.
+

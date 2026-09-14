@@ -73,7 +73,7 @@ def test_study_path_matches_storage_location():
 
 
 def test_pick_best_weights_change_the_winner():
-    """Each objective alone picks its own champion — tracking error by its LOWEST value."""
+    """Each objective alone picks its own champion — volatility by its LOWEST value."""
     study = optuna.create_study(directions=list(opt.DIRECTIONS))
     for excess, te in [(0.20, 0.14), (0.05, 0.05), (0.12, 0.08)]:
         study.add_trial(optuna.trial.create_trial(
@@ -85,13 +85,13 @@ def test_pick_best_weights_change_the_winner():
 
 
 def test_the_pick_never_lands_on_a_row_that_loses_to_buy_and_hold(caplog):
-    """Minimizing tracking error puts index-huggers on the front; they must never be picked.
+    """Minimizing volatility puts timid, cash-heavy books on the front; never pick a loser.
 
     If NO row beats the benchmark the pick still returns — a losing study has to run
     top-to-bottom in its notebook — but flagged, and with a warning, never as a winner.
     """
     front = pd.DataFrame({"trial": [0, 1, 2], "excess_cagr": [-0.01, 0.04, 0.15],
-                          "tracking_error": [0.01, 0.05, 0.12]})
+                          "volatility": [0.01, 0.05, 0.12]})
     pick = opt.pick_from_front(front, weights=(0.0, 1.0))    # all weight on low straying...
     assert pick["trial"] == 1 and pick["beats_benchmark"]    # ...still not the −1%/yr hugger
     assert pick["front_distinct"] == 2                       # chosen among the admissible rows
@@ -105,7 +105,7 @@ def test_a_journal_scored_on_other_objectives_is_refused():
     """A journal stores values by position: read under new labels, it would silently lie.
 
     A pre-change journal holds (info_ratio, excess_cagr), both maximized. Loaded under
-    today's (excess_cagr, tracking_error) every IR would pose as an excess return and the
+    today's (excess_cagr, volatility) every IR would pose as an excess return and the
     front would be computed in the wrong directions — so it is refused, and a new study is
     stamped with the names it was scored on.
     """
@@ -167,7 +167,7 @@ def _clone_front():
         "inert":          [10,   20,   30,   40,   10,   10],
         "w":              [1,    1,    1,    1,    50,   60],
         "excess_cagr":    [0.10, 0.10, 0.10, 0.10, 0.05, 0.30],
-        "tracking_error": [0.08, 0.08, 0.08, 0.08, 0.04, 0.20],
+        "volatility": [0.08, 0.08, 0.08, 0.08, 0.04, 0.20],
     })
 
 
@@ -180,7 +180,7 @@ def test_distinct_front_collapses_clones_and_keeps_the_earliest_trial():
     assert sorted(distinct["trial"]) == [1, 2, 9]
     # Genuinely distinct outcomes are never merged, even at identical params.
     same_params = pd.DataFrame({"trial": [0, 1], "w": [5, 5],
-                                "excess_cagr": [0.1, 0.2], "tracking_error": [0.05, 0.09]})
+                                "excess_cagr": [0.1, 0.2], "volatility": [0.05, 0.09]})
     assert len(opt.distinct_front(same_params)) == 2
     assert opt.distinct_front(pd.DataFrame()).empty          # degenerate inputs survive
 
@@ -209,7 +209,7 @@ def test_pick_from_front_defaults_to_the_one_shared_preference():
             == opt.pick_from_front(front, weights=opt.PICK_WEIGHTS)["trial"])
     # ...and the preference still steers: each objective alone picks its own champion.
     assert opt.pick_from_front(front, weights=(1.0, 0.0))["excess_cagr"] == 0.30
-    assert opt.pick_from_front(front, weights=(0.0, 1.0))["tracking_error"] == 0.04
+    assert opt.pick_from_front(front, weights=(0.0, 1.0))["volatility"] == 0.04
 
 
 def test_boundary_report_shares_are_not_multiplicity_weighted():
@@ -373,7 +373,7 @@ def test_objective_prunes_below_min_trades_per_year():
 
 
 def test_pareto_and_trials_frames():
-    first, second = opt.OBJECTIVES          # (excess_cagr, tracking_error) — benchmark-relative
+    first, second = opt.OBJECTIVES          # (excess_cagr, volatility) — benchmark-relative
     study = optuna.create_study(directions=list(opt.DIRECTIONS))
     for a, b in [(0.2, 0.10), (0.1, 0.05), (0.05, 0.12),  # third: less excess AND more straying
                  (0.2, 0.10)]:                                         # fourth duplicates first

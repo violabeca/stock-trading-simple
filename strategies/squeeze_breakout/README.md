@@ -71,8 +71,8 @@ cycles need volatility, 1-minute fills need liquidity. `data.end` is the
 notebook replays the picked parameters once on the untouched ~2-month tail.
 
 **Reading the optimization honestly.** The objectives are now
-benchmark-relative and annualized (`excess_cagr` ↑ against `tracking_error` ↓ vs
-equal-weight buy-and-hold; the older studies predate that change and the engine
+annualized (`excess_cagr` ↑ over equal-weight buy-and-hold, against the book's own
+`volatility` ↓; the older studies predate that change and the engine
 refuses their journals — re-run before trusting a front). A four-gate strategy
 owns a selectivity dial, so the front's ratio end attracts few-trade artifacts.
 The notebook therefore **filters the front to ≥ 300 train trades** before

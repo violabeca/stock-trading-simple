@@ -95,12 +95,17 @@ git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook out
   *(a) Absolute vs relative.* A long-only strategy in a rising market earns a positive
   Sharpe *just by being invested*, so an absolute Sharpe cannot separate skill from
   market exposure, and optimizing it actively rewards exposure. `optimize.OBJECTIVES`
-  therefore scores `excess_cagr` (maximized) against `tracking_error` (minimized), both
-  relative to an equal-weight buy-and-hold of the same panel (`backtest.benchmark`), and
-  `pick_from_front` only picks front rows with `excess_cagr > 0` (`MIN_PICK_EXCESS`);
-  absolute Sharpe/return are diagnostics only. (The old `info_ratio`/`excess_cagr` pair
-  correlated 0.975 and collapsed fronts to 1–2 points. Studies are stamped with their
-  objective names, and a journal scored on other objectives is refused — bump the study.)
+  therefore scores `excess_cagr` (maximized) against `volatility` (minimized):
+  - `excess_cagr` is the return over an equal-weight buy-and-hold of the same panel
+    (`backtest.benchmark`).
+  - `volatility` is the book's own annualized risk, the "annual risk rate".
+  - `pick_from_front` only picks front rows with `excess_cagr > 0` (`MIN_PICK_EXCESS`).
+  - Absolute Sharpe and return are diagnostics only.
+  - Retired pairs: `info_ratio`/`excess_cagr` correlated 0.975 and collapsed fronts to 1–2
+    points; `tracking_error` punished de-risking (cash, volatility targeting) as straying
+    from the index.
+  - Studies are stamped with their objective names, and a journal scored on other objectives
+    is refused — bump the study.
   (`informed_flow` learned this the hard way: maximizing Sharpe produced a "0.94 holdout
   Sharpe" strategy that lost to buy-and-hold on both train and holdout.)
   *(b) Per-year vs cumulative.* Every return metric is **annualized** (`cagr`,
@@ -139,6 +144,13 @@ git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook out
   diffs clean.
 - **No look-ahead.** Signals must be execution-timed via `backtest.next_bar` /
   `backtest.exit_after`; fills happen at next-bar adjusted open, engine-enforced.
+- **Score out-of-sample windows warm.** Every holdout or walk-forward test backtest passes
+  the LONG panel plus `score_from=<window start>` to `bt.evaluate` / `bt.run_strategy`.
+  - Never pass a panel sliced to the window: that restarts every rolling indicator on its
+    first bar.
+  - Measured on informed_flow: 2 names ranked on holdout day one instead of 97; the
+    walk-forward test windows read +9.3%/yr cold against +4.3%/yr warm.
+  - A 200-bar filter is simply undefined inside a half-year window.
 - **IBKR is never parallelized** — the historical-request cap is per account.
   One `fetch_batch` connection, paced. yfinance daily may fan out freely.
 - **The database is shared** with the sibling `stock-trading` repo (TimescaleDB,
@@ -182,6 +194,17 @@ test, adapt a strategy notebook, then pass:
 `uv run pytest -q && uv run ruff check . && uv run tsim optimize --strategy <name> --n-trials 5`.
 
 ## Gotchas
+
+- **informed_flow has TWO notebooks.**
+  - `informed_flow.ipynb` optimizes on the training panel only and saves every distinct
+    admissible front row to `studies/<study>.candidates.yaml` (git-ignored).
+  - `informed_flow_diagnostics.ipynb` compares any `CANDIDATES` from that file (or `"config"`)
+    on the deep checks, the walk-forward and the warm holdout. It ends in a pass/fail verdict
+    and an opt-in `config.yaml` promotion.
+  - Both pick with `opt.pick_from_front` above `optuna.pick_min_trades_per_year`, one config
+    value, so the walk-forward tests the rule that picked the candidate.
+  - informed_flow has no `grid:` lists and no coarse sweep. The other strategies still have
+    one notebook each.
 
 - mypy is not part of the gates here; rely on pytest + ruff.
 - Env vars beat YAML config: `TRADING_<SECTION>__<KEY>` (e.g.

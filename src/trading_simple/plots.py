@@ -39,7 +39,7 @@ _METRIC_COLS = backtest.METRIC_COLS | {"trial"}
 #: Metrics measured against the buy-and-hold benchmark, so zero is a meaningful line.
 _RELATIVE = {"excess_cagr", "info_ratio"}
 #: Rate metrics that read as percentages (besides every ``*return`` column).
-_PERCENT = {"cagr", "excess_cagr", "tracking_error", "max_drawdown"}
+_PERCENT = {"cagr", "excess_cagr", "tracking_error", "volatility", "max_drawdown"}
 
 
 def _base(fig: go.Figure, *, title: str, height: int = 420) -> go.Figure:
@@ -510,8 +510,8 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
                 *, picked: int | None = None, axes: tuple[str, str] | None = None) -> go.Figure:
     """The Pareto front of an optimization study, on the study's own two objectives.
 
-    By default tracking error runs across and excess return up — the usual picture of an
-    efficient frontier: up is more return, left is less straying from the benchmark.
+    By default volatility (the annual risk rate) runs across and excess return up — the
+    usual picture of an efficient frontier: up is more return, left is a calmer ride.
     Completed trials draw as a recessive gray cloud; the front as a blue
     staircase (the exact boundary of the dominated region — a diagonal would
     claim unattained trade-offs — stepped the right way for each objective's

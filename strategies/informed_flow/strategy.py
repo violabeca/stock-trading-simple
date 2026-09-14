@@ -70,6 +70,30 @@ to the slot on the next bar, and the freed cash rotates into the next pick — s
 lucky pop cannot come to dominate the book. It is risk control, not signal, and a fixed
 policy rather than a searched one (see :func:`trading_simple.backtest._retrim_loop`).
 
+**The risk overlay decides how much of the book is invested at all** (``risk_method``, see
+:func:`_exposure`). The selection always wants a full book of ``max_positions`` names; the
+overlay scales every target weight by one exposure number per bar, and the rest sits in cash.
+
+* ``none`` — always fully invested (the strategy as it was through study v23).
+* ``cash_switch`` — a trend filter on the panel's own equal-weight index (the benchmark).
+  When the index closes more than ``regime_band`` below its ``regime_window``-bar average,
+  only ``risk_off_exposure`` stays invested. Once it closes ``regime_band`` above, the book
+  is fully invested again. Inside the band the last state holds, so a sideways market cannot
+  flip the whole book every few days. It pays in a slow bear market (2022); a fast crash
+  (2020) is mostly over before a 200-bar average reacts.
+* ``vol_target`` — aim the book at an annual risk rate of ``target_vol``: exposure =
+  ``min(1, target_vol / realized volatility)``, measured over ``vol_window`` bars on the
+  unscaled book's own returns, never levered above 1. It reacts within days of turbulence
+  starting. Every exposure change re-trims every held name, so it only moves once the
+  target has drifted ``exposure_step`` away.
+
+Both are decided on bar t's close and traded at t+1's open, like every other order. The
+method is a searched categorical, so the study decides whether any overlay earns its keep.
+It can only do that because the objective scores the book's own ``volatility``, not its
+distance from the index (:data:`trading_simple.optimize.OBJECTIVES`). A 200-bar average also
+needs 200 bars of history, so holdout and walk-forward windows must be scored warm
+(``backtest.evaluate(..., score_from=...)``).
+
 **The ranked universe is only the eligible names.** A name with fewer than
 ``min_events`` insider/rating events in the trailing window is dropped from the
 cross-section entirely — not merely blocked from entering. Ranking it and then
@@ -94,7 +118,8 @@ bracketed by two such steps 31 bars apart: PLTR's count fell 3 → 2 and freed t
 AMZN's count rose 2 → 3 and took it, then AMZN's fell back and PLTR's recovered. Four
 legs of costs, and neither name's composite moved. The information in that cliff —
 recency of coverage — is now carried continuously by the ``recency`` sleeve, where the
-study can size it and §10b·ii can ablate it, and a name whose coverage goes stale
+study can size it (down to 0.0) and the diagnostics notebook ablates it out of sample, and
+a name whose coverage goes stale
 drifts *down* the ranking and leaves through ``q_out`` on an ordering.
 
 A signal that is missing, or that covers too few names to rank meaningfully (see
@@ -135,6 +160,10 @@ _WEIGHT_KEY = {"insider": "w_insider", "ratings": "w_rating",
 #: honest move is to drop the sleeve and renormalize.
 _MIN_COVERAGE = 0.5
 
+#: The risk overlay's choices (``risk_method``): always fully invested, a trend-filter cash
+#: switch on the panel's equal-weight index, or volatility targeting. See :func:`_exposure`.
+RISK_METHODS = ("none", "cash_switch", "vol_target")
+
 
 def signals(
     panel: Panel,
@@ -159,6 +188,13 @@ def signals(
     max_positions: int = 10,
     displace_margin: float = 1.0,
     retrim_k: float | None = 2.0,
+    risk_method: str = "none",
+    risk_off_exposure: float = 0.0,
+    regime_window: int = 200,
+    regime_band: float = 0.02,
+    target_vol: float = 0.20,
+    vol_window: int = 21,
+    exposure_step: float = 0.10,
 ) -> dict:
     """Build long-only target weights from the ranked informed-flow composite.
 
@@ -218,12 +254,25 @@ def signals(
             dominate the book (and flatter a parameter set). ``None`` disables the cap.
             Enforced in :func:`trading_simple.backtest._retrim_loop`; a fixed policy, not a
             search dimension (kept out of the Optuna space on purpose).
+        risk_method: The risk overlay, one of :data:`RISK_METHODS` — ``"none"`` (always
+            fully invested), ``"cash_switch"`` or ``"vol_target"``. See :func:`_exposure`.
+        risk_off_exposure: ``cash_switch`` only — share of the book kept invested while the
+            market index is in a downtrend (``0.0`` = all cash).
+        regime_window: ``cash_switch`` only — moving-average length (bars) of the index.
+        regime_band: ``cash_switch`` only — hysteresis around that average: the index must
+            close this fraction below it to de-risk and this fraction above it to return.
+        target_vol: ``vol_target`` only — the annualized volatility the book aims for.
+        vol_window: ``vol_target`` only — trailing bars of realized volatility.
+        exposure_step: ``vol_target`` only — the exposure moves only once its target has
+            drifted this far, so the whole book is not re-trimmed on every small change.
 
     Returns:
-        ``{"weights", "retrim_k"}`` — a target-weight frame plus the concentration-cap
-        scalar, next-bar-open executed, which puts the run in the engine's **portfolio
-        mode**: one shared cash account, so buying is funded by selling. Long only; no
-        stops (the rank-exit band is the exit thesis).
+        ``{"weights", "retrim_k", "exposure"}`` — a target-weight frame (already scaled by
+        the risk overlay) plus the concentration-cap scalar, next-bar-open executed, which
+        puts the run in the engine's **portfolio mode**: one shared cash account, so buying
+        is funded by selling. ``exposure`` is the per-bar invested fraction the overlay
+        applied (all 1.0 under ``"none"``), for diagnostics; the engine ignores it. Long
+        only; no stops (the rank-exit band is the exit thesis).
     """
     parts = _compose(panel, insider_window=insider_window, rating_halflife=rating_halflife,
                      ptrev_halflife=ptrev_halflife, w_insider=w_insider, w_rating=w_rating,
@@ -232,12 +281,19 @@ def signals(
                      w_trend=w_trend, w_rsi=w_rsi)
     if not parts["present"]:
         flat = pd.DataFrame(0.0, index=panel.close.index, columns=panel.close.columns)
-        return {"weights": flat, "retrim_k": retrim_k}
+        return {"weights": flat, "retrim_k": retrim_k,
+                "exposure": pd.Series(1.0, index=panel.close.index)}
 
     held = _select(parts, q_in=q_in, q_out=q_out, max_hold=max_hold,
                    max_positions=max_positions,
                    displace_margin=displace_margin)["held"]
-    return {"weights": _weights(held, max_positions), "retrim_k": retrim_k}
+    weights = _weights(held, max_positions)
+    exposure = _exposure(panel, weights, risk_method=risk_method,
+                         risk_off_exposure=risk_off_exposure, regime_window=regime_window,
+                         regime_band=regime_band, target_vol=target_vol,
+                         vol_window=vol_window, exposure_step=exposure_step)
+    return {"weights": weights.mul(exposure, axis=0), "retrim_k": retrim_k,
+            "exposure": exposure}
 
 
 def _weights(held: pd.DataFrame, max_positions: int) -> pd.DataFrame:
@@ -263,6 +319,84 @@ def _weights(held: pd.DataFrame, max_positions: int) -> pd.DataFrame:
         Target fraction of the book per symbol, per bar. Rows sum to at most 1.0.
     """
     return bt.next_bar(held).astype(float) / max_positions
+
+
+def _exposure(panel: Panel, weights: pd.DataFrame, *, risk_method: str,
+              risk_off_exposure: float, regime_window: int, regime_band: float,
+              target_vol: float, vol_window: int, exposure_step: float, **_) -> pd.Series:
+    """How much of the book stays invested on each bar — the risk overlay (1.0 = all of it).
+
+    * ``none``: 1.0 on every bar.
+    * ``cash_switch``: a trend filter on the panel's equal-weight index — the benchmark
+      itself, so no extra data. ``risk_off_exposure`` while the index closes more than
+      ``regime_band`` below its ``regime_window``-bar average, 1.0 once it closes
+      ``regime_band`` above it; inside the band the previous state holds, and 1.0 during the
+      average's warm-up.
+    * ``vol_target``: ``min(1, target_vol / σ)``, where σ is the annualized volatility of the
+      UNSCALED book's own returns over ``vol_window`` bars. Measuring the unscaled book avoids
+      a feedback loop in which de-risking lowers σ and so re-risks. Changes pass through
+      :func:`_stepped`, because every change re-trims every held name.
+
+    Decided on bar t's close and shifted one bar, so it is traded at t+1's open.
+
+    Args:
+        panel: Price panel (close only).
+        weights: The execution-timed unscaled target weights (:func:`_weights`).
+        risk_method: One of :data:`RISK_METHODS`.
+        risk_off_exposure: ``cash_switch`` — invested share in a downtrend.
+        regime_window: ``cash_switch`` — moving-average length in bars.
+        regime_band: ``cash_switch`` — hysteresis fraction around the average.
+        target_vol: ``vol_target`` — annualized volatility to aim for.
+        vol_window: ``vol_target`` — trailing bars of realized volatility.
+        exposure_step: ``vol_target`` — minimum move before the exposure changes.
+
+    Returns:
+        Per-bar exposure in ``[0, 1]`` on the panel's index.
+
+    Raises:
+        ValueError: On an unknown ``risk_method``.
+    """
+    index = panel.close.index
+    if risk_method == "none":
+        return pd.Series(1.0, index=index)
+    returns = panel.close.pct_change(fill_method=None)
+    if risk_method == "cash_switch":
+        market = (1.0 + returns.mean(axis=1).fillna(0.0)).cumprod()
+        trend = market / bt.sma(market, regime_window) - 1.0
+        state = pd.Series(np.nan, index=index)
+        state[trend < -regime_band] = 0.0           # clearly below the average: risk off
+        state[trend > regime_band] = 1.0            # clearly above it: risk on
+        risk_on = state.ffill().fillna(1.0)         # inside the band: keep the last state
+        wanted = risk_on + (1.0 - risk_on) * risk_off_exposure
+    elif risk_method == "vol_target":
+        book = (weights * returns).sum(axis=1)
+        bars_per_year = len(index) / (max((index[-1] - index[0]).days, 1) / 365.25)
+        vol = book.rolling(vol_window, min_periods=vol_window).std() * np.sqrt(bars_per_year)
+        wanted = _stepped((target_vol / vol).clip(upper=1.0).fillna(1.0), exposure_step)
+    else:
+        raise ValueError(f"risk_method must be one of {RISK_METHODS}, got {risk_method!r}")
+    return wanted.shift(1, fill_value=1.0)
+
+
+def _stepped(wanted: pd.Series, step: float) -> pd.Series:
+    """Hold each exposure level until the target moves at least ``step`` away from it.
+
+    A return to full exposure (1.0) is always taken, so a book is never left stranded a
+    fraction below fully invested once the turbulence is over.
+
+    Args:
+        wanted: The raw per-bar exposure target.
+        step: Minimum absolute move that changes the level.
+
+    Returns:
+        The stepped exposure, starting from 1.0.
+    """
+    level, out = 1.0, np.empty(len(wanted))
+    for i, x in enumerate(wanted.to_numpy()):
+        if abs(x - level) >= step - 1e-12 or (x >= 1.0 > level):
+            level = x
+        out[i] = level
+    return pd.Series(out, index=wanted.index)
 
 
 def _rsi(close: pd.DataFrame, period: int) -> pd.DataFrame:
@@ -692,15 +826,19 @@ def valid(params: dict) -> bool:
     Returns:
         True when the exit band sits below the entry band (``q_out < q_in``, the
         hysteresis requirement), at least one composite weight is positive, the MA-trend
-        crossover is ordered (``trend_fast < trend_slow``) whenever both are given, and the
-        book has at least one slot.
+        crossover is ordered (``trend_fast < trend_slow``) whenever both are given, the
+        book has at least one slot, and the risk overlay is coherent (a known
+        ``risk_method``, ``risk_off_exposure`` in ``[0, 1]``, a positive ``target_vol``).
     """
     q_in = params.get("q_in", 0.8)
     q_out = params.get("q_out", 0.6)
     weights = sum(params.get(key, 0.0) for key in _WEIGHT_KEY.values())
     fast, slow = params.get("trend_fast"), params.get("trend_slow")
     trend_ok = fast is None or slow is None or fast < slow
-    return (q_out < q_in and weights > 0 and trend_ok
+    risk_ok = (params.get("risk_method", "none") in RISK_METHODS
+               and 0.0 <= params.get("risk_off_exposure", 0.0) <= 1.0
+               and params.get("target_vol", 0.2) > 0.0)
+    return (q_out < q_in and weights > 0 and trend_ok and risk_ok
             and params.get("max_positions", 10) >= 1)
 
 
@@ -847,8 +985,8 @@ def exit_causes(panel: Panel, **params) -> pd.DataFrame:
     then it was the ``min_events`` eligibility cliff (140 of 196 train exits on the v20
     pick, a rolling count stepping down as an old filing aged out). Neither is visible in
     an equity curve, a Sharpe ratio or a trade list; both are one ``value_counts()`` away
-    from obvious. So this is not an occasional debugging aid — notebook §10g runs it on
-    every holdout, and a strategy whose exits are 70% one mechanism should be read as a
+    from obvious. So this is not an occasional debugging aid — the diagnostics notebook runs
+    it on every holdout (§5c), and a strategy whose exits are 70% one mechanism should be read as a
     strategy about that mechanism.
 
     Causes are recorded inside :func:`_select` as each decision is made, not inferred

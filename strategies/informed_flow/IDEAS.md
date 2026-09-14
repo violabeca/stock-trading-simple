@@ -19,6 +19,12 @@ not live inside the open-to-open assumption. Flip the switch together with an
 
 ## Validation & study design
 
+> **Section numbers in this file** (§4c, §9b, §10a–§10g) refer to the single notebook as it was
+> before the **2026-09-14 split**. Those checks now live in `informed_flow_diagnostics.ipynb`
+> (§2 understand, §3 stress in-sample, §4 walk-forward, §5 holdout, §6 verdict). The
+> optimization itself lives in `informed_flow.ipynb`. The coarse sweep and its grid
+> walk-forward (§5, §10b·ii) were removed.
+
 ### The two study objectives were ~the same number — IMPLEMENTED 2026-09-13 (study v23)
 
 `info_ratio` and `excess_cagr` correlated at 0.98 in v13/v14 and **0.975** across v22's
@@ -79,7 +85,7 @@ The completed notebook run (§10b–§10g, v23 pick) added:
 - **§10g holdout:** Sharpe 1.52, max drawdown −21%. 100% of exits go through `q_out`, and
   30/178 holds last ≤ 5 bars.
 
-### Out-of-sample windows start COLD — ENGINE PROPOSAL (2026-09-13)
+### Out-of-sample windows started COLD — IMPLEMENTED 2026-09-14 (`score_from`)
 
 The holdout, every walk-forward test window, §10b·iii, the hurdle's year slices and §10e all
 backtest a SLICED panel. `signals()` therefore restarts every rolling window at the slice's
@@ -104,11 +110,34 @@ Proposed fix: `bt.evaluate(..., score_from=...)` (or a `warmup=` history panel) 
 `signals()` on the long panel and backtests/scores only the window. Portfolio mode can already
 express this (slice the `weights` frame, `bt.run` on the window panel); signal mode would slice
 `entries`/`exits` the same way. Every notebook's OOS and holdout cells would switch to it.
-**Engine change, proposal-only.**
 
-Next step: approve or reject the warm-start fix, then run v24 (widened bounds, sleeves that
-may switch off). Judge its pick on WARM walk-forward/holdout excess, alpha after beta, and the
-fill-timing bound before promoting anything.
+**Shipped 2026-09-14** as `bt.run_strategy` / `bt.evaluate(..., score_from=...)`. It is used by
+every holdout, walk-forward, year-slice and ablation cell in this notebook and in
+conviction_flow, value_factor and turnover_momentum. (The 1m scanner notebooks and
+momentum_swing already sliced the signals of a full-history run by hand.)
+
+### "High CAGR, low risk": objective + risk overlay — IMPLEMENTED 2026-09-14 (study v24)
+
+1. **Objectives.** `optimize.OBJECTIVES` is now `excess_cagr` ↑ / `volatility` ↓: the book's own
+   annual risk rate replaces tracking error. Across 453 re-run v23 trials, volatility tracked
+   beta (0.98) and tracking error (0.88), and picked the same trial. The reason to switch
+   anyway is that tracking error charges cash as straying, so it would have punished any risk
+   lever.
+2. **Lever.** The strategy had no risk lever (always fully invested, 3% of trials calmer than
+   buy-and-hold), so a volatility objective alone could change nothing.
+3. **Overlay.** `risk_method` (none / cash_switch / vol_target) is a searched categorical. See
+   the README's risk-overlay section and `strategy._exposure`.
+4. **Referee.** `informed_flow_diagnostics.ipynb` §4b judges it out of sample, period by
+   period.
+
+Open until v24 has run:
+- Does the study pick an overlay at all?
+- Does diagnostics §4b show it calmer out of sample without handing back most of the excess?
+- Is `regime_window` (pinned at 200) worth searching? Only if `cash_switch` wins and its
+  folds disagree.
+
+Next step: run v24, then judge its pick on the WARM walk-forward/holdout excess, volatility
+against buy-and-hold, alpha after beta, and the fill-timing bound, before promoting anything.
 
 ### Stability-penalized picking — ENGINE PROPOSAL
 
@@ -161,7 +190,8 @@ From the fixed §10b, how often each sleeve was chosen out of sample:
 
 Consistent with a controlled holdout ablation (removing both price sleeves moved holdout
 info ratio 2.02 → 2.02, i.e. not at all). The price sleeves stay at weight 0 and out of the
-Optuna space; §4c cell 15 still scores them so the decision stays falsifiable.
+Optuna space. (The pre-optimization trend/RSI IC check was dropped in the 2026-09-14 notebook
+split; to re-test them, give `w_trend`/`w_rsi` a `search:` and let the study size them.)
 
 ## Signal construction
 

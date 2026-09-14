@@ -115,7 +115,7 @@ Four momentum names selected by the same screen are one factor bet. Lou & Polk's
 "comomentum" (pairwise abnormal-return correlation inside the momentum book) *predicts* the
 severity of the next momentum crash; Daniel & Moskowitz (JFE 2016) document the crashes —
 14 of the 15 worst months came after a negative two-year market return, during the rebound,
-which is exactly when a 10/20 SMA gate flips back to green. `tracking_error` (the second
+which is exactly when a 10/20 SMA gate flips back to green. `volatility` (the second
 objective) rises with concentration, so the front makes the dial visible; the `retrim`
 concentration cap of portfolio mode does not exist in wallet mode, so a runaway name simply
 grows its share of the book until the trail sells it.
@@ -127,8 +127,9 @@ Cooper, Gutierrez & Hameed (2004): momentum earns 0.93%/month after up-markets a
 premium at all* after bear markets or high-volatility states. Kullamägi's own ~$60M
 give-back was Nov 2021–mid 2022. The regime gate is therefore the best-supported component of
 the whole design — and the literature (Faber 2007; Zakamulin 2014, 2018) says it *halves
-drawdowns and adds little or no return*, so expect it to lower `tracking_error` rather than
-raise `excess_cagr`. §10c in the notebook scores each calendar year separately; 2022 is the
+drawdowns and adds little or no return*, so expect it to lower `volatility` rather than
+raise `excess_cagr` — which the objective now credits (v1/v2 scored `tracking_error`,
+which charged the gate for time out of the market). §10c in the notebook scores each calendar year separately; 2022 is the
 year to read.
 
 ### 2f · The high-ADR screen buys the lottery decile
