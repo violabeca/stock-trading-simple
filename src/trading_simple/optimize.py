@@ -1,9 +1,10 @@
 """Optuna optimization: multi-objective, resumable, one study file per run.
 
-Every study maximizes **two objectives at once** — Sharpe ratio and total
-return — so the result is a *Pareto front* of defensible trade-offs rather
-than a single (possibly degenerate) winner. :func:`pick_best` then reduces the
-front to one trial under an explicit preference weighting, and
+Every study scores **two objectives at once** — the annualized excess return over
+buy-and-hold (maximized) and the tracking error against it (minimized) — so the result
+is a *Pareto front* of defensible trade-offs rather than a single (possibly degenerate)
+winner. :func:`pick_best` then reduces the front to one trial under an explicit
+preference weighting, choosing only among trials that beat the benchmark, and
 :func:`boundary_report` checks whether the winner is pressing against the
 searched ranges (a hint to widen ``optuna.space`` and re-run).
 
@@ -33,7 +34,27 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-#: The two study objectives, both maximized, in this order.
+#: The two study objectives, in this order, each optimized in its :data:`DIRECTIONS` entry.
+#:
+#: **Return against risk, both relative to the benchmark.** ``excess_cagr`` is how much more
+#: per year the strategy earns than an equal-weight buy-and-hold of the same panel;
+#: ``tracking_error`` is how far its daily path strays from that benchmark, annualized (the
+#: standard deviation of the *active* return). Earning more than the index requires owning
+#: something different from it, and owning something different is exactly what tracking
+#: error measures — so the two genuinely pull against each other, and the front is the
+#: active efficient frontier: one strategy per level of straying. ``info_ratio`` is their
+#: ratio, so the best-IR strategy sits at the front's knee; it is still recorded on every
+#: trial (:data:`EXTRA_METRICS`), just no longer scored.
+#:
+#: **Why not the previous pair.** Until informed_flow v23 the study maximized ``info_ratio``
+#: and ``excess_cagr`` — one number in two costumes: Spearman 0.975 across v22's 2,351
+#: trials (0.994 in gap_and_go v2, 0.956 in support_bounce v3), so multi-thousand-trial
+#: NSGA-II runs collapsed to fronts of 1-2 distinct outcomes. Against ``tracking_error`` the
+#: correlation is −0.60 — a *conflict*, which is what a front is made of, not a redundancy
+#: — and a 252-trial re-run of v22 gave a 13-point front instead of 2. Tracking error also
+#: exposes the concentration dial (it rises as a book holds fewer names or leans on its top
+#: five winners), which the old pair could only express by pinning ``max_positions`` to its
+#: floor, six picks running.
 #:
 #: **Benchmark-relative, deliberately.** Optimizing an *absolute* Sharpe and return
 #: rewards market exposure rather than skill: a long-only strategy in a rising market
@@ -52,20 +73,31 @@ log = logging.getLogger(__name__)
 #: one, as this study did before, is incoherent on its own terms.
 #:
 #: Both are measured against an equal-weight buy-and-hold of the same panel
-#: (:func:`backtest.benchmark`), so a strategy scores above zero only by beating the
-#: market it trades in. Absolute Sharpe and return are still recorded on every trial —
-#: as diagnostics, not as targets.
+#: (:func:`backtest.benchmark`): ``excess_cagr`` is above zero only by beating the market
+#: the strategy trades in, and ``tracking_error`` is zero only for the market itself.
+#: Absolute Sharpe and return are still recorded on every trial — as diagnostics, not as
+#: targets.
 #:
 #: What is deliberately NOT normalized away: **time in market**. Scaling a 30%-invested
 #: strategy's return up by 3x to "compare it fairly" inverts the truth — sitting in cash
 #: is a real cost paid against a fully-invested benchmark, and it is the very thing that
 #: has to be earned back. The benchmark-relative framing prices it correctly already.
-OBJECTIVES = ("info_ratio", "excess_cagr")
+OBJECTIVES = ("excess_cagr", "tracking_error")
+#: Optuna direction of each :data:`OBJECTIVES` entry, in the same order.
+DIRECTIONS = ("maximize", "minimize")
+#: Admissibility floor on ``excess_cagr`` inside :func:`pick_from_front`: only front rows that
+#: beat buy-and-hold may be picked. Minimizing tracking error makes the LOW end of the front
+#: a row of index-huggers — a book that barely strays from the benchmark is "optimal" on
+#: that axis while earning nothing (v22's re-run front reached down to −0.7%/yr) — and a
+#: balanced pick could land on one. The front keeps those rows, because they are the honest
+#: shape of the trade-off; the pick just never chooses one.
+MIN_PICK_EXCESS = 0.0
 #: Secondary metrics attached to each trial as user attributes. ``years`` and
 #: ``trades_per_year`` are the sample size behind the objectives: annualizing makes a
 #: one-month backtest *comparable*, it does not make it *trustworthy*, so the evidence
-#: rides along with the claim.
-EXTRA_METRICS = ("sharpe", "cagr", "total_return", "max_drawdown", "win_rate",
+#: rides along with the claim. ``info_ratio`` rides here too: the front's knee, no longer
+#: an objective itself (the deflated-Sharpe check still reads it off every trial).
+EXTRA_METRICS = ("info_ratio", "sharpe", "cagr", "total_return", "max_drawdown", "win_rate",
                  "pct_profitable", "n_trades", "trades_per_year", "years")
 
 #: The ONE preference used to reduce a Pareto front to a single strategy, in
@@ -84,11 +116,12 @@ EXTRA_METRICS = ("sharpe", "cagr", "total_return", "max_drawdown", "win_rate",
 #: default.
 #:
 #: Note what the weights do NOT mean. :func:`pick_from_front` min-max normalizes each
-#: objective across the front first, so a weight is in units of "fraction of the spread
-#: this particular front happens to have", not economic units. On a front spanning 0.09
-#: of info_ratio and 0.009 of excess_cagr, equal weights still say "the full info_ratio
-#: range matters as much as the full excess_cagr range" — a claim about the front, not
-#: about the strategy. Read the front before trusting the pick.
+#: objective across the front first — flipped for a minimized one, so 1 is always the best
+#: end — so a weight is in units of "fraction of the spread this particular front happens
+#: to have", not economic units. On a front spanning 12 points of excess_cagr and 4 points
+#: of tracking_error, equal weights still say "the whole excess range matters as much as
+#: the whole tracking-error range" — a claim about the front, not about the strategy. Read
+#: the front before trusting the pick.
 PICK_WEIGHTS = (1.0, 1.0)
 
 
@@ -191,7 +224,7 @@ def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
     zero trades) are pruned rather than scored, so they never pollute the
     Pareto front. So are trials trading below the strategy's optional
     ``optuna.min_trades_per_year`` rate — a few lucky fills can post a huge
-    info_ratio, and this admissibility floor keeps such artifacts off the
+    excess_cagr, and this admissibility floor keeps such artifacts off the
     front. Per YEAR, not an absolute trade count: an absolute floor is
     implicitly far stricter on a short backtest window than a long one for
     the identical trading style. Secondary metrics land in ``trial.user_attrs``.
@@ -203,7 +236,7 @@ def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
         settings: Global settings.
 
     Returns:
-        ``(info_ratio, excess_cagr)`` — see :data:`OBJECTIVES` for why these and not
+        ``(excess_cagr, tracking_error)`` — see :data:`OBJECTIVES` for why these and not
         the absolute Sharpe, and why per-year and not cumulative.
 
     Raises:
@@ -219,7 +252,7 @@ def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
         raise optuna.TrialPruned("degenerate result (no trades?)")
     min_rate = strategy.optuna.get("min_trades_per_year", 0)
     if stats["trades_per_year"] < min_rate:
-        # A handful of lucky trades can post a huge info_ratio and crown the front;
+        # A handful of lucky trades can post a huge excess_cagr and crown the front;
         # the floor keeps such artifacts out of the Pareto set entirely. Per-YEAR,
         # not an absolute count: an absolute floor is implicitly far stricter on a
         # short backtest window than a long one, for the exact same trading style.
@@ -257,6 +290,43 @@ def progress_callback():
     return report
 
 
+def _check_objectives(study: optuna.Study) -> optuna.Study:
+    """Stamp a new study with :data:`OBJECTIVES`; refuse one scored on anything else.
+
+    A journal stores objective *values* only by position. Read under different labels, a
+    v22 journal — scored ``(info_ratio, excess_cagr)``, both maximized — would silently
+    present every information ratio as an excess return and compute its Pareto front in
+    the wrong directions, and nothing downstream could notice. So a fresh study is stamped
+    with its objective names (Optuna's ``metric_names``) and directions on first use, and a
+    study carrying other names, other directions, or no names at all while holding trials
+    (i.e. one that predates the stamp) is refused.
+
+    Args:
+        study: A just-created or just-loaded study.
+
+    Returns:
+        The same study, stamped.
+
+    Raises:
+        ValueError: If the study was scored on other objectives or directions.
+    """
+    import warnings
+
+    import optuna
+
+    names, directions = list(OBJECTIVES), [d.name.lower() for d in study.directions]
+    if study.metric_names is None and not study.trials and directions == list(DIRECTIONS):
+        with warnings.catch_warnings():   # "experimental" since Optuna 3.2 — stable in practice
+            warnings.simplefilter("ignore", optuna.exceptions.ExperimentalWarning)
+            study.set_metric_names(names)
+    if study.metric_names != names or directions != list(DIRECTIONS):
+        raise ValueError(
+            f"study {study.study_name!r} was scored on {study.metric_names or 'unnamed'} "
+            f"{directions}, but the engine scores {names} {list(DIRECTIONS)} — its trials "
+            "cannot be read under these labels. Bump `optuna.study` to start a fresh journal.")
+    return study
+
+
 def run_study(strategy: LoadedStrategy, panel: Panel, *, settings: Settings,
               study_name: str | None = None, n_trials: int | None = None,
               timeout_s: float | None = None, verbose: bool = False) -> optuna.Study:
@@ -276,19 +346,23 @@ def run_study(strategy: LoadedStrategy, panel: Panel, *, settings: Settings,
 
     Returns:
         The (re)loaded study, including all previous trials.
+
+    Raises:
+        ValueError: If the named journal was scored on other objectives
+            (see :func:`_check_objectives`).
     """
     import optuna
 
     cfg = strategy.optuna
     name = study_name or cfg.get("study", f"{strategy.name}-v1")
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(
+    study = _check_objectives(optuna.create_study(
         study_name=name,
         storage=storage_for(strategy, name),
-        directions=["maximize"] * len(OBJECTIVES),
+        directions=list(DIRECTIONS),
         sampler=make_sampler(cfg),
         load_if_exists=True,
-    )
+    ))
     done = len(study.trials)
     if done:
         log.info("study %s: resuming with %d existing trials", name, done)
@@ -311,11 +385,16 @@ def load_study(strategy: LoadedStrategy, study_name: str | None = None) -> optun
 
     Returns:
         The study with all persisted trials.
+
+    Raises:
+        ValueError: If the journal was scored on other objectives
+            (see :func:`_check_objectives`).
     """
     import optuna
 
     name = study_name or strategy.optuna.get("study", f"{strategy.name}-v1")
-    return optuna.load_study(study_name=name, storage=storage_for(strategy, name))
+    return _check_objectives(optuna.load_study(study_name=name,
+                                               storage=storage_for(strategy, name)))
 
 
 def trials_frame(study: optuna.Study) -> pd.DataFrame:
@@ -422,6 +501,12 @@ def pick_from_front(front: pd.DataFrame, *, weights: tuple[float, float] = PICK_
     strategy nobody ran, twice. Callers apply their own admissibility filter (a trades-per
     -year floor, typically) and hand in what survives.
 
+    Only rows that beat buy-and-hold (``excess_cagr >`` :data:`MIN_PICK_EXCESS`) are
+    eligible: the low-tracking-error end of the front is index-huggers that earn nothing.
+    When no row qualifies, the pick falls back to the whole front and says so
+    (``beats_benchmark = False`` plus a logged warning) rather than raising — a losing study
+    must still run top-to-bottom in its notebook, it just must not look like a winner.
+
     Ties are collapsed by :func:`distinct_front` first, and the winning row carries
     ``n_tied`` so a pick that was really a coin flip between identical-scoring strategies
     says so out loud instead of looking considered.
@@ -432,28 +517,38 @@ def pick_from_front(front: pd.DataFrame, *, weights: tuple[float, float] = PICK_
             :data:`PICK_WEIGHTS`; pass something else only with a stated reason.
 
     Returns:
-        The winning row, plus two added fields: ``n_tied`` (front rows sharing the
-        winner's objective pair — ``1`` means it won outright) and ``front_distinct``
-        (distinct outcomes the choice was actually made among).
+        The winning row, plus three added fields: ``n_tied`` (eligible rows sharing the
+        winner's objective pair — ``1`` means it won outright), ``front_distinct``
+        (distinct outcomes the choice was actually made among) and ``beats_benchmark``
+        (False only when the fallback above was taken).
 
     Raises:
         ValueError: If ``front`` is empty.
     """
     if front.empty:
         raise ValueError("cannot pick from an empty front")
-    distinct = distinct_front(front)
+    beats = front[front["excess_cagr"] > MIN_PICK_EXCESS]
+    if beats.empty:
+        log.warning("no front row beats buy-and-hold (excess_cagr > %s): picking from the "
+                    "whole front, flagged beats_benchmark=False", MIN_PICK_EXCESS)
+    pool = front if beats.empty else beats
+    distinct = distinct_front(pool)
     values = distinct[list(OBJECTIVES)]
     span = (values.max() - values.min()).replace(0, 1.0)
     normalized = (values - values.min()) / span
+    for name, direction in zip(OBJECTIVES, DIRECTIONS, strict=True):
+        if direction == "minimize":           # flip, so 1 is the best end of every column
+            normalized[name] = 1.0 - normalized[name]
     score = normalized.mul(pd.Series(dict(zip(OBJECTIVES, weights, strict=True)))).sum(axis=1)
     row = distinct.loc[score.idxmax()].copy()
     # Per column, not frame-wide: a front row is a mix of dtypes, so `.round` on the
     # picked Series would raise on the first object column it meets.
     same = np.logical_and.reduce(
-        [front[k].to_numpy(dtype=float).round(9) == round(float(row[k]), 9)
+        [pool[k].to_numpy(dtype=float).round(9) == round(float(row[k]), 9)
          for k in OBJECTIVES])
     row["n_tied"] = int(same.sum())
     row["front_distinct"] = len(distinct)
+    row["beats_benchmark"] = not beats.empty
     return row
 
 
@@ -461,10 +556,10 @@ def pick_best(study: optuna.Study, *, weights: tuple[float, float] = PICK_WEIGHT
     """Reduce the Pareto front to ONE trial under an explicit preference.
 
     A thin wrapper over :func:`pick_from_front` — same normalization, same tie
-    collapsing, same default preference — for callers holding a study rather than a
-    frame. Applies **no** admissibility filter: a study with a handful of lucky trades
-    can post a huge ``info_ratio``, so filter the frame yourself and call
-    :func:`pick_from_front` when that matters.
+    collapsing, same beat-the-benchmark floor, same default preference — for callers
+    holding a study rather than a frame. Applies **no** trades-per-year filter: a study
+    with a handful of lucky trades can post a huge ``excess_cagr``, so filter the frame
+    yourself and call :func:`pick_from_front` when that matters.
 
     Args:
         study: An Optuna study with at least one completed trial.
@@ -671,8 +766,8 @@ def sensitivity(strategy: LoadedStrategy, panel: Panel, picked: dict, *, setting
 
     One :func:`backtest.sweep` call, so the whole neighborhood costs about what a
     coarse grid does. The metric to read is ``excess_cagr``: benchmark-relative and
-    per-year, i.e. one of the study's own :data:`OBJECTIVES`. (``info_ratio``, the
-    other one, needs per-combo equity curves a column-stacked sweep does not keep.)
+    per-year, i.e. one of the study's own :data:`OBJECTIVES`. (``tracking_error``, the
+    other one, needs a per-combo equity curve a column-stacked sweep does not keep.)
 
     Args:
         strategy: A loaded strategy.

@@ -38,6 +38,8 @@ MAX_POINTS: int | None = 10_000
 _METRIC_COLS = backtest.METRIC_COLS | {"trial"}
 #: Metrics measured against the buy-and-hold benchmark, so zero is a meaningful line.
 _RELATIVE = {"excess_cagr", "info_ratio"}
+#: Rate metrics that read as percentages (besides every ``*return`` column).
+_PERCENT = {"cagr", "excess_cagr", "tracking_error", "max_drawdown"}
 
 
 def _base(fig: go.Figure, *, title: str, height: int = 420) -> go.Figure:
@@ -508,32 +510,38 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
                 *, picked: int | None = None, axes: tuple[str, str] | None = None) -> go.Figure:
     """The Pareto front of an optimization study, on the study's own two objectives.
 
+    By default tracking error runs across and excess return up — the usual picture of an
+    efficient frontier: up is more return, left is less straying from the benchmark.
     Completed trials draw as a recessive gray cloud; the front as a blue
     staircase (the exact boundary of the dominated region — a diagonal would
-    claim unattained trade-offs), each front trial direct-labeled with its
-    number; the picked trial as an orange star. Hovers carry the full
-    parameter set, so promising trials can be read straight off the figure.
+    claim unattained trade-offs — stepped the right way for each objective's
+    direction), each front trial direct-labeled with its number; the picked trial
+    as an orange star. Hovers carry the full parameter set, so promising trials
+    can be read straight off the figure.
 
-    A dashed zero cross-hair marks the benchmark: with the default
-    benchmark-relative objectives, anything left of or below it **loses to simply
-    owning the universe**, however healthy its absolute Sharpe looks.
+    A dashed zero line marks the benchmark on a benchmark-relative axis: anything below
+    (or left of) it **loses to simply owning the universe**, however healthy its absolute
+    Sharpe looks — and the pick never lands there (``optimize.MIN_PICK_EXCESS``).
 
     Args:
         front: ``optimize.pareto_frame`` output (needs the two ``axes`` columns
             plus ``trial``).
         all_trials: Optional frame of every completed trial (context cloud).
         picked: Trial number to highlight (from ``optimize.pick_best``).
-        axes: ``(x, y)`` metric columns; defaults to ``optimize.OBJECTIVES``.
+        axes: ``(x, y)`` metric columns; defaults to the objectives, second one across.
 
     Returns:
         The figure.
     """
-    from trading_simple.optimize import OBJECTIVES
+    from trading_simple.optimize import DIRECTIONS, OBJECTIVES
 
-    x, y = axes or OBJECTIVES
-    pct = y.endswith("return")
-    hover = (f"<b>trial %{{customdata[0]}}</b><br>{x} %{{x:.2f}} | {y} "
-             f"%{{y:{'.1%' if pct else '.2f'}}}<br>%{{customdata[1]}}<extra></extra>")
+    x, y = axes or (OBJECTIVES[1], OBJECTIVES[0])
+    pct = {m: m.endswith("return") or m in _PERCENT for m in (x, y)}
+    hover = (f"<b>trial %{{customdata[0]}}</b><br>{x} %{{x:{'.1%' if pct[x] else '.2f'}}} | "
+             f"{y} %{{y:{'.1%' if pct[y] else '.2f'}}}<br>%{{customdata[1]}}<extra></extra>")
+    # The dominated region hugs the front from the side its x-axis is worse on: step
+    # vertically first when larger x is better, horizontally first when smaller x is.
+    shape = "vh" if dict(zip(OBJECTIVES, DIRECTIONS, strict=True)).get(x) != "minimize" else "hv"
     fig = go.Figure()
     if all_trials is not None and len(all_trials):
         fig.add_trace(go.Scatter(
@@ -549,7 +557,7 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
                                    for a, b in zip(ys, ys[1:], strict=False)]
     fig.add_trace(go.Scatter(
         x=front[x], y=front[y], mode="lines+markers+text",
-        name="Pareto front", line={"color": SERIES[0], "width": 2, "shape": "vh"},
+        name="Pareto front", line={"color": SERIES[0], "width": 2, "shape": shape},
         marker={"size": 10, "color": SERIES[0], "line": {"color": "white", "width": 1}},
         text=[f"trial {t} " for t in front["trial"]], textposition=positions,
         textfont={"size": 11, "color": _INK},
@@ -568,9 +576,10 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
             fig.add_vline(x=0, line=line, annotation_text="loses to buy & hold →",
                           annotation_position="top left")
         if y in _RELATIVE:
-            fig.add_hline(y=0, line=line)
-    fig.update_xaxes(title=x.replace("_", " "), tickformat=".0%" if x.endswith("return") else None)
-    fig.update_yaxes(title=y.replace("_", " "), tickformat=".0%" if pct else None)
+            fig.add_hline(y=0, line=line, annotation_text="loses to buy & hold ↓",
+                          annotation_position="bottom right")
+    fig.update_xaxes(title=x.replace("_", " "), tickformat=".0%" if pct[x] else None)
+    fig.update_yaxes(title=y.replace("_", " "), tickformat=".0%" if pct[y] else None)
     return _base(fig, title=f"Optimization Pareto front — {x} vs {y}")
 
 

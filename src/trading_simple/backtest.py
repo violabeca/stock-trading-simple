@@ -6,8 +6,9 @@ efficiently, and reduces portfolios to comparable metrics. Execution rules are
 engine-enforced and identical for every strategy:
 
 * **No look-ahead**: strategies time their own signals with :func:`next_bar` /
-  :func:`exit_after`, and fills happen at the **next bar's adjusted open**
-  (``panel.open_``), never at the signal bar's close.
+  :func:`exit_after`, and fills happen on the **next bar** — at its adjusted open
+  (``panel.open_``) by default, or at its worst side under a strategy's
+  ``backtest.fill: pessimistic`` (:func:`fill_prices`) — never at the signal bar's close.
 * **Costs always on**: :func:`leg_costs` converts the configured friction into
   vectorbt ``fees``/``slippage`` fractions.
 
@@ -83,13 +84,19 @@ CASH_FRAC_KEY = "cash_frac"
 #: strategy that does not set it keep the pure buy-and-once-hold behavior. See
 #: :func:`_run_portfolio` and :func:`_retrim_loop`.
 RETRIM_K_KEY = "retrim_k"
+#: Fill models a strategy's ``backtest.fill`` may select (see :func:`fill_prices`).
+#: ``open`` (the default) fills every order at the bar's adjusted open — symmetric and
+#: neutral. ``pessimistic`` fills every buy at the bar's high and every sell at its low: the
+#: worst plausible intrabar execution, a bound on how much of an edge lives inside the
+#: open-fill assumption.
+FILLS = ("open", "pessimistic")
 #: Every metric a sweep/trial frame may carry; anything else in such a frame is a
 #: strategy parameter. One definition, so a new metric cannot be mistaken for a knob.
 #: ``years``/``trades_per_year`` are sample-size columns and belong here for exactly
 #: that reason — they describe the run, they are not knobs to turn.
 METRIC_COLS = frozenset({
     "total_return", "cagr", "sharpe", "max_drawdown", "win_rate", "pct_profitable",
-    "n_trades", "trades_per_year", "years", "excess_cagr", "info_ratio",
+    "n_trades", "trades_per_year", "years", "excess_cagr", "info_ratio", "tracking_error",
 })
 
 _configured = False
@@ -335,6 +342,40 @@ def panel_costs(costs: CostSettings, panel: Panel, *,
     return leg_costs(costs, price=price, notional=notional)
 
 
+def fill_prices(panel: Panel, slippage: float, fill: str = "open"):
+    """The ``price`` and ``slippage`` vectorbt fills orders at, under a fill model.
+
+    ``open`` fills every order at the bar's adjusted open. ``pessimistic`` fills every buy
+    at the bar's high and every sell at its low — whichever way the order turns out to go,
+    which a target-percent rebalance, a retrim or a short cover only reveals inside the
+    simulation. vectorbt buys at ``price × (1 + slippage)`` and sells at
+    ``price × (1 − slippage)``, so pricing at the bar's midpoint with a half-range slippage
+    lands exactly on the extremes: ``mid × (1 ± (H − L)/(H + L))`` is ``H`` for a buy and
+    ``L`` for a sell. The configured slippage is added on top, so costs stay charged.
+    Orders are still *sized* at the midpoint, so a buy spends its slot plus the half-range
+    and the last buy of a fully-invested bar is trimmed to the cash left.
+
+    Args:
+        panel: Price panel.
+        slippage: The configured per-leg slippage fraction.
+        fill: One of :data:`FILLS`.
+
+    Returns:
+        ``(price, slippage)`` — ``(panel.open_, slippage)`` under ``open``; a midpoint frame
+        and a per-bar slippage frame under ``pessimistic``.
+
+    Raises:
+        ValueError: On a fill model not in :data:`FILLS`.
+    """
+    if fill == "open":
+        return panel.open_, slippage
+    if fill != "pessimistic":
+        raise ValueError(f"unknown fill {fill!r}; choose one of {FILLS}")
+    span = panel.high + panel.low
+    half_range = ((panel.high - panel.low) / span).clip(lower=0.0).fillna(0.0)
+    return span / 2.0, half_range + slippage
+
+
 def grid_from_config(sweep_cfg: dict[str, list], valid=lambda p: True) -> list[dict]:
     """Expand per-parameter value lists into a filtered cartesian grid.
 
@@ -358,14 +399,15 @@ def grid_from_config(sweep_cfg: dict[str, list], valid=lambda p: True) -> list[d
 # Running portfolios.
 # ---------------------------------------------------------------------------
 def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
-        init_cash: float = 10_000.0):
+        init_cash: float = 10_000.0, fill: str = "open"):
     """Build one vectorbt Portfolio from a strategy's signal dict.
 
     Dispatches on what the strategy returned. A ``weights`` frame selects
     **portfolio mode** (:func:`_run_portfolio`); a :data:`CASH_FRAC_KEY` scalar
     runs the signals against **one cash-shared wallet**; otherwise the classic
-    per-symbol ``from_signals`` path runs. Either way fills happen at the adjusted
-    next-bar open and equity is valued on the adjusted close.
+    per-symbol ``from_signals`` path runs. Either way fills happen on the next bar
+    at the ``fill`` model's price (:func:`fill_prices`) and equity is valued on the
+    adjusted close.
 
     Args:
         panel: Price panel.
@@ -379,6 +421,7 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
         slippage: Per-leg slippage fraction.
         init_cash: Starting cash — **per symbol** in per-symbol mode, the **whole
             book** in portfolio mode and in cash-shared signal mode.
+        fill: Fill model, one of :data:`FILLS` (a strategy's ``backtest.fill``).
 
     Returns:
         A ``vectorbt.Portfolio`` (grouped and cash-sharing in portfolio and
@@ -386,25 +429,28 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
 
     Raises:
         ValueError: If the signals set both ``weights`` and ``cash_frac`` — the
-            two capital models are mutually exclusive.
+            two capital models are mutually exclusive — or on an unknown ``fill``.
     """
     configure()
     import vectorbt as vbt
 
     if WEIGHTS_KEY in signals and CASH_FRAC_KEY in signals:
         raise ValueError("signals may set 'weights' OR 'cash_frac', not both")
+    price, slippage = fill_prices(panel, slippage, fill)
     if WEIGHTS_KEY in signals:
-        return _run_portfolio(panel, signals[WEIGHTS_KEY], fees=fees, slippage=slippage,
-                              init_cash=init_cash, retrim_k=signals.get(RETRIM_K_KEY))
+        return _run_portfolio(panel, signals[WEIGHTS_KEY], price=price, fees=fees,
+                              slippage=slippage, init_cash=init_cash,
+                              retrim_k=signals.get(RETRIM_K_KEY))
     kwargs = {k: signals[k] for k in (*SIGNAL_KEYS, *STOP_KEYS) if k in signals}
     if any(k in signals for k in STOP_KEYS):
         # open= lets a bar that GAPS through a stop fill at its (worse) true open
         # instead of at the stop level, and "stopmarket" makes stop legs pay
         # slippage like any market order — without these, vectorbt's defaults
         # ("stoplimit", close substituted for open) are optimistic on exactly the
-        # bars where stops matter most.
+        # bars where stops matter most. A pessimistic fill prices a stop leg like
+        # every other order ("price": the bar's low for a sell, high for a buy).
         kwargs |= {"open": panel.open_, "high": panel.high, "low": panel.low,
-                   "stop_exit_price": "stopmarket"}
+                   "stop_exit_price": "stopmarket" if fill == "open" else "price"}
     if CASH_FRAC_KEY in signals:
         # One shared wallet of init_cash TOTAL: each entry deploys `cash_frac` of the
         # free cash, so the book can never be more than 100% invested. call_seq="auto"
@@ -415,7 +461,7 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
                        group_by=True, cash_sharing=True, call_seq="auto",
                        upon_opposite_entry="close")
     return vbt.Portfolio.from_signals(
-        panel.close, price=panel.open_, fees=fees, slippage=slippage,
+        panel.close, price=price, fees=fees, slippage=slippage,
         init_cash=init_cash, freq=panel.freq,
         # The EXIT wins when an entry and an exit signal land on the same bar.
         # vectorbt's default ("ignore") cancels BOTH: a time stop coinciding with a
@@ -526,8 +572,8 @@ def _retrim_loop(build, targets: pd.DataFrame, weights: pd.DataFrame,
     return pf
 
 
-def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, fees: float, slippage: float,
-                   init_cash: float, retrim_k: float | None = None):
+def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, price: pd.DataFrame, fees: float,
+                   slippage, init_cash: float, retrim_k: float | None = None):
     """One shared cash account rebalanced to target weights — buying requires selling.
 
     The ``from_orders`` call site. ``from_signals`` cannot do this: it rejects
@@ -538,8 +584,9 @@ def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, fees: float, slippage
         panel: Price panel.
         weights: Target fraction of the book per symbol, per bar (rows summing to <= 1;
             the remainder is held as cash). Already execution-timed by the strategy.
+        price: Fill price frame (from :func:`fill_prices`).
         fees: Per-leg fee fraction.
-        slippage: Per-leg slippage fraction.
+        slippage: Per-leg slippage fraction, or per-bar frame (from :func:`fill_prices`).
         init_cash: The whole book's starting cash.
         retrim_k: Concentration cap. ``None`` (default) leaves held names to drift
             untouched — one ``from_orders`` pass, identical to the original behavior and
@@ -554,7 +601,7 @@ def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, fees: float, slippage
     def build(targets):
         return vbt.Portfolio.from_orders(
             panel.close, size=targets, size_type="targetpercent",
-            price=panel.open_, fees=fees, slippage=slippage, init_cash=init_cash,
+            price=price, fees=fees, slippage=slippage, init_cash=init_cash,
             group_by=True, cash_sharing=True,
             # MANDATORY, not cosmetic: sorts sells before buys within a bar. Without it a
             # buy gets partially rejected because the sell funding it has not executed yet,
@@ -580,12 +627,12 @@ def run_strategy(strategy: LoadedStrategy, panel: Panel, params: dict | None = N
         settings: Global settings (costs, init_cash).
 
     Returns:
-        A ``vectorbt.Portfolio``.
+        A ``vectorbt.Portfolio``, filled under the strategy's ``backtest.fill`` model.
     """
     merged = {**strategy.params, **(params or {})}
     fees, slippage = panel_costs(settings.costs, panel)
     return run(panel, strategy.signals(panel, **merged), fees=fees, slippage=slippage,
-               init_cash=settings.backtest.init_cash)
+               init_cash=settings.backtest.init_cash, fill=strategy.fill)
 
 
 #: Cached ``(total_return, per-bar returns)`` of the equal-weight benchmark, keyed by
@@ -594,7 +641,8 @@ def run_strategy(strategy: LoadedStrategy, panel: Panel, params: dict | None = N
 _BENCHMARK: dict[tuple, tuple[float, pd.Series]] = {}
 
 
-def benchmark(panel: Panel, *, fees: float, slippage: float) -> tuple[float, pd.Series]:
+def benchmark(panel: Panel, *, fees: float, slippage: float,
+              fill: str = "open") -> tuple[float, pd.Series]:
     """Equal-weight buy-and-hold of every symbol in the panel — the hurdle to clear.
 
     A long-only strategy in a rising market earns a positive Sharpe simply by being
@@ -611,19 +659,24 @@ def benchmark(panel: Panel, *, fees: float, slippage: float) -> tuple[float, pd.
     unchanged: an equal-weight fixed-pot buy-and-hold return is *identically* the mean
     of the per-symbol returns, which is what :func:`portfolio_stats` reports there.)
 
-    Cached per (panel, costs) — the benchmark is identical across optimizer trials, and
-    recomputing it every trial would roughly double the optimization's runtime.
+    It fills under the **same fill model** as the strategy it is the hurdle for, exactly as
+    it pays the same costs: under ``pessimistic`` its one buy per name prints at that bar's
+    high, so the comparison stays about selection, not about who got the kinder fills.
+
+    Cached per (panel, costs, fill) — the benchmark is identical across optimizer trials,
+    and recomputing it every trial would roughly double the optimization's runtime.
 
     Args:
         panel: The price panel to benchmark over.
         fees: Per-leg fee fraction (see :func:`leg_costs`).
         slippage: Per-leg slippage fraction.
+        fill: Fill model, one of :data:`FILLS` — must match the strategy's.
 
     Returns:
         ``(total_return, per_bar_returns)``.
     """
     key = (panel.close.index[0], panel.close.index[-1], panel.close.shape,
-           tuple(panel.symbols), fees, slippage,
+           tuple(panel.symbols), fees, slippage, fill,
            # Listing pattern: the weights below depend on WHERE each name's prices
            # start, so two panels sharing window/shape/symbols but not listing dates
            # (e.g. one refreshed with a newly backfilled IPO) must not share a cache row.
@@ -638,7 +691,8 @@ def benchmark(panel: Panel, *, fees: float, slippage: float) -> tuple[float, pd.
         # buys the name at its listing, which is what buy-and-hold actually means.
         weights = weights.where(panel.close.notna())
         pf = run(panel, {WEIGHTS_KEY: weights},   # constant weights -> a name's listing
-                 fees=fees, slippage=slippage)    # bar is its only rotation: buy + hold
+                 fees=fees, slippage=slippage,    # bar is its only rotation: buy + hold
+                 fill=fill)
         curve = equity_curve(pf)["value"].pct_change().fillna(0.0)
         if len(_BENCHMARK) > 16:                    # bounded: walk-forward makes many panels
             _BENCHMARK.clear()
@@ -647,7 +701,7 @@ def benchmark(panel: Panel, *, fees: float, slippage: float) -> tuple[float, pd.
 
 
 def active_stats(pf, panel: Panel, *, fees: float, slippage: float,
-                 total_return: float) -> dict:
+                 total_return: float, fill: str = "open") -> dict:
     """Benchmark-relative metrics: does this beat simply owning the universe?
 
     Both are **per year**, so they are comparable across strategies with different
@@ -660,15 +714,18 @@ def active_stats(pf, panel: Panel, *, fees: float, slippage: float,
         fees: Per-leg fee fraction (must match the run).
         slippage: Per-leg slippage fraction (must match the run).
         total_return: The strategy's ``portfolio_stats`` total return.
+        fill: Fill model (must match the run — pass ``strategy.fill``).
 
     Returns:
-        ``{"excess_cagr", "info_ratio"}``. ``excess_cagr`` is the strategy's annualized
-        return minus the benchmark's — the alpha you would have earned per year.
-        ``info_ratio`` is the annualized mean of the *active* per-bar return (strategy
-        minus benchmark) over its standard deviation: the Sharpe ratio of the value the
-        strategy adds, with the market removed.
+        ``{"excess_cagr", "info_ratio", "tracking_error"}``. ``excess_cagr`` is the
+        strategy's annualized return minus the benchmark's — the alpha you would have
+        earned per year. ``tracking_error`` is the annualized standard deviation of the
+        *active* per-bar return (strategy minus benchmark): how far the strategy's path
+        strays from simply owning the universe (0 = it IS the benchmark). ``info_ratio``
+        is the annualized mean active return over that same deviation — excess per unit
+        of straying, the Sharpe ratio of the value the strategy adds.
     """
-    bench_return, bench_curve = benchmark(panel, fees=fees, slippage=slippage)
+    bench_return, bench_curve = benchmark(panel, fees=fees, slippage=slippage, fill=fill)
     active = equity_curve(pf)["value"].pct_change().fillna(0.0) - bench_curve
     sd = float(active.std())
     index = panel.close.index
@@ -677,6 +734,7 @@ def active_stats(pf, panel: Panel, *, fees: float, slippage: float,
     return {
         "excess_cagr": _cagr(total_return, years) - _cagr(bench_return, years),
         "info_ratio": float(active.mean() / sd * ann) if sd else 0.0,
+        "tracking_error": sd * ann,
     }
 
 
@@ -694,16 +752,16 @@ def evaluate(strategy: LoadedStrategy, panel: Panel, params: dict, *, settings: 
 
     Returns:
         ``{total_return, cagr, sharpe, max_drawdown, win_rate, pct_profitable, n_trades,
-        trades_per_year, years, excess_cagr, info_ratio}`` — ``excess_cagr`` and
-        ``info_ratio`` are measured against an equal-weight buy-and-hold of the same
-        panel (see :func:`benchmark`), and are what :mod:`trading_simple.optimize`
-        maximizes: an absolute Sharpe rewards market exposure, not stock selection.
+        trades_per_year, years, excess_cagr, info_ratio, tracking_error}`` — the last three
+        are measured against an equal-weight buy-and-hold of the same panel (see
+        :func:`benchmark`); :mod:`trading_simple.optimize` scores ``excess_cagr`` against
+        ``tracking_error``: an absolute Sharpe rewards market exposure, not stock selection.
     """
     pf = run_strategy(strategy, panel, params, settings=settings)
     stats = portfolio_stats(pf)
     fees, slippage = panel_costs(settings.costs, panel)
     stats.update(active_stats(pf, panel, fees=fees, slippage=slippage,
-                              total_return=stats["total_return"]))
+                              total_return=stats["total_return"], fill=strategy.fill))
     return stats
 
 
@@ -725,14 +783,16 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
 
     Returns:
         DataFrame with the grid's parameter columns plus every metric in
-        :data:`METRIC_COLS` except ``info_ratio`` (which needs a per-combo equity
-        curve the column-stacked sweep does not keep — use :func:`evaluate` for that).
+        :data:`METRIC_COLS` except ``info_ratio`` and ``tracking_error`` (which need a
+        per-combo equity curve the column-stacked sweep does not keep — use
+        :func:`evaluate` for those).
     """
     configure(settings)
     import vectorbt as vbt
 
     chunk_size = chunk_size or settings.backtest.chunk_size
     fees, slippage = panel_costs(settings.costs, panel)
+    price, fill_slip = fill_prices(panel, slippage, strategy.fill)   # same fills as run()
     init_cash = settings.backtest.init_cash
     index, columns = panel.close.index, panel.close.columns
     years = _years(index)
@@ -765,16 +825,20 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
             """Repeat one panel-wide frame once per combo."""
             return stack([frame] * len(ids), cols)
 
+        # A pessimistic fill's slippage is a per-bar frame; the default stays a scalar, so
+        # an open-fill sweep allocates nothing extra.
+        slip = tile(fill_slip) if isinstance(fill_slip, pd.DataFrame) else fill_slip
+
         if WEIGHTS_KEY in combo_signals[0]:
             # Portfolio mode: group by the combo level, so each combo is its own shared
             # cash account of `init_cash` — not one giant book pooling every combo.
             weights_stacked = stack([s[WEIGHTS_KEY] for s in combo_signals])
             targets = stack([rotation_targets(s[WEIGHTS_KEY]) for s in combo_signals])
 
-            def build(t):
+            def build(t, slip=slip):
                 return vbt.Portfolio.from_orders(
                     tile(panel.close), size=t, size_type="targetpercent",
-                    price=tile(panel.open_), fees=fees, slippage=slippage,
+                    price=tile(price), fees=fees, slippage=slip,
                     init_cash=init_cash, group_by="combo", cash_sharing=True,
                     call_seq="auto", freq=panel.freq,
                 )
@@ -809,7 +873,8 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
             # Same pessimistic stop-fill semantics as run() — sweep numbers must
             # match what evaluate() reports for the same combo.
             kwargs |= {"open": tile(panel.open_), "high": tile(panel.high),
-                       "low": tile(panel.low), "stop_exit_price": "stopmarket"}
+                       "low": tile(panel.low),
+                       "stop_exit_price": "stopmarket" if strategy.fill == "open" else "price"}
 
         grouped = CASH_FRAC_KEY in combo_signals[0]
         if grouped:
@@ -825,8 +890,8 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
             )
 
         pf = vbt.Portfolio.from_signals(
-            tile(panel.close), price=tile(panel.open_),
-            fees=fees, slippage=slippage, init_cash=init_cash, freq=panel.freq,
+            tile(panel.close), price=tile(price),
+            fees=fees, slippage=slip, init_cash=init_cash, freq=panel.freq,
             # Exit-wins conflict resolution, same as run() — sweep numbers must
             # match what evaluate() reports for the same combo.
             upon_long_conflict="exit", upon_short_conflict="exit", **kwargs,
@@ -848,7 +913,7 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
     # sweep in a rising market posts a positive return everywhere, so the absolute number
     # cannot rank combos on skill; this can. Per-year, so folds of unequal length stay
     # comparable. (info_ratio needs per-combo equity curves the sweep does not keep.)
-    bench_return, _ = benchmark(panel, fees=fees, slippage=slippage)
+    bench_return, _ = benchmark(panel, fees=fees, slippage=slippage, fill=strategy.fill)
     bench_cagr = _cagr(bench_return, years)
     stats["cagr"] = [_cagr(r, years) for r in stats["total_return"]]
     stats["excess_cagr"] = stats["cagr"] - bench_cagr

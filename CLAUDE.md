@@ -32,7 +32,10 @@ git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook out
 
 - **The strategy contract is sacred.** A strategy = `strategies/<name>/` with a
   pure `signals(panel, **params) -> dict` (+ optional `valid`, `indicators`)
-  and a `config.yaml` with `data / optuna / params` blocks. Adding a
+  and a `config.yaml` with `data / optuna / params` blocks (+ optional `backtest:
+  {fill: open | pessimistic}` — `pessimistic` buys at the bar's high and sells at its
+  low, benchmark included; notebooks pass `fill=strat.fill` to every direct
+  `bt.run` / `bt.benchmark` / `bt.active_stats` call). Adding a
   strategy must never require touching `src/trading_simple/` — if it seems to,
   the design is wrong; stop and reconsider.
 - **One parameter, one declaration.** `params:` is the whole knob surface: each
@@ -92,8 +95,12 @@ git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook out
   *(a) Absolute vs relative.* A long-only strategy in a rising market earns a positive
   Sharpe *just by being invested*, so an absolute Sharpe cannot separate skill from
   market exposure, and optimizing it actively rewards exposure. `optimize.OBJECTIVES`
-  therefore maximizes `info_ratio` / `excess_cagr` against an equal-weight buy-and-hold
-  of the same panel (`backtest.benchmark`); absolute Sharpe/return are diagnostics only.
+  therefore scores `excess_cagr` (maximized) against `tracking_error` (minimized), both
+  relative to an equal-weight buy-and-hold of the same panel (`backtest.benchmark`), and
+  `pick_from_front` only picks front rows with `excess_cagr > 0` (`MIN_PICK_EXCESS`);
+  absolute Sharpe/return are diagnostics only. (The old `info_ratio`/`excess_cagr` pair
+  correlated 0.975 and collapsed fronts to 1–2 points. Studies are stamped with their
+  objective names, and a journal scored on other objectives is refused — bump the study.)
   (`informed_flow` learned this the hard way: maximizing Sharpe produced a "0.94 holdout
   Sharpe" strategy that lost to buy-and-hold on both train and holdout.)
   *(b) Per-year vs cumulative.* Every return metric is **annualized** (`cagr`,

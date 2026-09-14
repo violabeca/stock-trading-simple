@@ -56,7 +56,7 @@ def test_progress_callback_prints_one_line_per_trial(capsys):
     objectives every streamed line labelled an information ratio as a Sharpe — a wrong
     number in front of you for as long as the run lasts.
     """
-    study = optuna.create_study(directions=["maximize", "maximize"],
+    study = optuna.create_study(directions=list(opt.DIRECTIONS),
                                 sampler=optuna.samplers.RandomSampler(seed=3))
     study.optimize(lambda t: (t.suggest_float("w", 0, 1), 0.2), n_trials=2,
                    callbacks=[opt.progress_callback()])
@@ -73,14 +73,58 @@ def test_study_path_matches_storage_location():
 
 
 def test_pick_best_weights_change_the_winner():
-    study = optuna.create_study(directions=["maximize", "maximize"])
-    for sharpe, ret in [(2.0, 0.10), (0.5, 0.90), (1.5, 0.50)]:
+    """Each objective alone picks its own champion — tracking error by its LOWEST value."""
+    study = optuna.create_study(directions=list(opt.DIRECTIONS))
+    for excess, te in [(0.20, 0.14), (0.05, 0.05), (0.12, 0.08)]:
         study.add_trial(optuna.trial.create_trial(
-            params={}, distributions={}, values=[sharpe, ret]))
-    assert opt.pick_best(study, weights=(1.0, 0.0)).values[0] == 2.0   # pure Sharpe
-    assert opt.pick_best(study, weights=(0.0, 1.0)).values[1] == 0.90  # pure return
+            params={}, distributions={}, values=[excess, te]))
+    assert opt.pick_best(study, weights=(1.0, 0.0)).values[0] == 0.20  # most excess return
+    assert opt.pick_best(study, weights=(0.0, 1.0)).values[1] == 0.05  # least straying
     balanced = opt.pick_best(study, weights=(1.0, 1.0))
-    assert balanced.values == [1.5, 0.5]                               # the compromise
+    assert balanced.values == [0.12, 0.08]                             # the compromise
+
+
+def test_the_pick_never_lands_on_a_row_that_loses_to_buy_and_hold(caplog):
+    """Minimizing tracking error puts index-huggers on the front; they must never be picked.
+
+    If NO row beats the benchmark the pick still returns — a losing study has to run
+    top-to-bottom in its notebook — but flagged, and with a warning, never as a winner.
+    """
+    front = pd.DataFrame({"trial": [0, 1, 2], "excess_cagr": [-0.01, 0.04, 0.15],
+                          "tracking_error": [0.01, 0.05, 0.12]})
+    pick = opt.pick_from_front(front, weights=(0.0, 1.0))    # all weight on low straying...
+    assert pick["trial"] == 1 and pick["beats_benchmark"]    # ...still not the −1%/yr hugger
+    assert pick["front_distinct"] == 2                       # chosen among the admissible rows
+    with caplog.at_level("WARNING"):
+        fallback = opt.pick_from_front(front.assign(excess_cagr=[-0.03, -0.02, -0.01]))
+    assert not fallback["beats_benchmark"]
+    assert "beats buy-and-hold" in caplog.text
+
+
+def test_a_journal_scored_on_other_objectives_is_refused():
+    """A journal stores values by position: read under new labels, it would silently lie.
+
+    A pre-change journal holds (info_ratio, excess_cagr), both maximized. Loaded under
+    today's (excess_cagr, tracking_error) every IR would pose as an excess return and the
+    front would be computed in the wrong directions — so it is refused, and a new study is
+    stamped with the names it was scored on.
+    """
+    strat = strategies.load("volume_momentum")
+    legacy, fresh = "unit-test-legacy-objectives", "unit-test-fresh-objectives"
+    try:
+        old = optuna.create_study(study_name=legacy, storage=opt.storage_for(strat, legacy),
+                                  directions=["maximize", "maximize"])
+        old.add_trial(optuna.trial.create_trial(params={}, distributions={}, values=[1.2, 0.1]))
+        with pytest.raises(ValueError, match="Bump `optuna.study`"):
+            opt.load_study(strat, legacy)
+        with pytest.raises(ValueError, match="Bump `optuna.study`"):
+            opt.run_study(strat, None, settings=None, study_name=legacy, n_trials=0)
+        new = opt.run_study(strat, None, settings=None, study_name=fresh, n_trials=0)
+        assert new.metric_names == list(opt.OBJECTIVES)
+        assert opt.load_study(strat, fresh).metric_names == list(opt.OBJECTIVES)
+    finally:
+        for name in (legacy, fresh):
+            opt.study_path(strat, name).unlink(missing_ok=True)
 
 
 def test_boundary_report_flags_edges_log_aware():
@@ -119,11 +163,11 @@ def _clone_front():
     low displacement margin, and its `displace_margin` under `displace=False`).
     """
     return pd.DataFrame({
-        "trial":       [3,   1,   7,   5,   2,    9],
-        "inert":       [10,  20,  30,  40,  10,   10],
-        "w":           [1,   1,   1,   1,   50,   60],
-        "info_ratio":  [1.0, 1.0, 1.0, 1.0, 1.20, 0.80],
-        "excess_cagr": [0.1, 0.1, 0.1, 0.1, 0.05, 0.30],
+        "trial":          [3,    1,    7,    5,    2,    9],
+        "inert":          [10,   20,   30,   40,   10,   10],
+        "w":              [1,    1,    1,    1,    50,   60],
+        "excess_cagr":    [0.10, 0.10, 0.10, 0.10, 0.05, 0.30],
+        "tracking_error": [0.08, 0.08, 0.08, 0.08, 0.04, 0.20],
     })
 
 
@@ -136,7 +180,7 @@ def test_distinct_front_collapses_clones_and_keeps_the_earliest_trial():
     assert sorted(distinct["trial"]) == [1, 2, 9]
     # Genuinely distinct outcomes are never merged, even at identical params.
     same_params = pd.DataFrame({"trial": [0, 1], "w": [5, 5],
-                                "info_ratio": [1.0, 2.0], "excess_cagr": [0.1, 0.2]})
+                                "excess_cagr": [0.1, 0.2], "tracking_error": [0.05, 0.09]})
     assert len(opt.distinct_front(same_params)) == 2
     assert opt.distinct_front(pd.DataFrame()).empty          # degenerate inputs survive
 
@@ -144,9 +188,9 @@ def test_distinct_front_collapses_clones_and_keeps_the_earliest_trial():
 def test_pick_from_front_says_out_loud_when_the_pick_was_a_tie():
     """A coin flip between identical-scoring strategies must not look like a decision."""
     front = _clone_front()
-    # Weight only the first objective: the 4 clones at info_ratio 1.0 lose to trial 2.
+    # Weight only the first objective: the 4 clones at excess 0.10 lose to trial 9.
     outright = opt.pick_from_front(front, weights=(1.0, 0.0))
-    assert outright["trial"] == 2 and outright["n_tied"] == 1
+    assert outright["trial"] == 9 and outright["n_tied"] == 1
 
     # A front that is ONE outcome wearing 4 hats: the pick is arbitrary and says so.
     tied = opt.pick_from_front(front[front["w"] == 1])
@@ -164,8 +208,8 @@ def test_pick_from_front_defaults_to_the_one_shared_preference():
     assert (opt.pick_from_front(front)["trial"]
             == opt.pick_from_front(front, weights=opt.PICK_WEIGHTS)["trial"])
     # ...and the preference still steers: each objective alone picks its own champion.
-    assert opt.pick_from_front(front, weights=(1.0, 0.0))["info_ratio"] == 1.20
-    assert opt.pick_from_front(front, weights=(0.0, 1.0))["excess_cagr"] == 0.30
+    assert opt.pick_from_front(front, weights=(1.0, 0.0))["excess_cagr"] == 0.30
+    assert opt.pick_from_front(front, weights=(0.0, 1.0))["tracking_error"] == 0.04
 
 
 def test_boundary_report_shares_are_not_multiplicity_weighted():
@@ -318,7 +362,7 @@ def test_objective_prunes_below_min_trades_per_year():
     def run_study(optuna_cfg):
         s = replace(strat, signals=one_trade, valid=lambda p: True, params={},
                     optuna=optuna_cfg)
-        study = optuna.create_study(directions=["maximize", "maximize"],
+        study = optuna.create_study(directions=list(opt.DIRECTIONS),
                                     sampler=optuna.samplers.RandomSampler(seed=1))
         study.optimize(lambda t: opt.objective(t, s, panel, Settings()), n_trials=1)
         return study.trials[0].state
@@ -329,10 +373,10 @@ def test_objective_prunes_below_min_trades_per_year():
 
 
 def test_pareto_and_trials_frames():
-    first, second = opt.OBJECTIVES          # (info_ratio, excess_return) — benchmark-relative
-    study = optuna.create_study(directions=["maximize", "maximize"])
-    for a, b in [(1.0, 0.2), (0.2, 0.8), (0.1, 0.1),                   # third is dominated
-                 (1.0, 0.2)]:                                          # fourth duplicates first
+    first, second = opt.OBJECTIVES          # (excess_cagr, tracking_error) — benchmark-relative
+    study = optuna.create_study(directions=list(opt.DIRECTIONS))
+    for a, b in [(0.2, 0.10), (0.1, 0.05), (0.05, 0.12),  # third: less excess AND more straying
+                 (0.2, 0.10)]:                                         # fourth duplicates first
         study.add_trial(optuna.trial.create_trial(
             params={"w": 1}, distributions={"w": optuna.distributions.IntDistribution(1, 2)},
             values=[a, b]))

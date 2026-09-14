@@ -11,9 +11,8 @@
 data:
   universe: LiquidLeaders  # ~100 liquid US names — breadth for cross-sectional ranking
   bar: 1d                  # daily bars (alt-data signals act over weeks–months)
-  # History is ingested from 2020 (see notebooks/03_altdata_update.ipynb) and we TRAIN from
-  # 2020 too, i.e. the full ingested span: ~5y of train, minus up to ~9mo of insider_window
-  # warm-up. That includes the 2020 COVID crash and reflation melt-up, a regime unlike
+  # We TRAIN from 2018 (see notebooks/03_altdata_update.ipynb for ingestion coverage): ~7y
+  # of train, minus up to ~1.5y of insider_window warm-up. That includes the 2020 COVID crash and reflation melt-up, a regime unlike
   # today's — narrowing `start` to 2021 trades statistical power for regime relevance and
   # needs no re-ingestion. Either way read the DSR, the §10b walk-forward and the §10e
   # sub-period table before believing any result.
@@ -30,17 +29,35 @@ data:
 # Study settings. The search SPACE is not here — each parameter declares its own
 # `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: informed-flow-1d-v22   # bump this whenever a `search:` bound changes: a journal
+  study: informed-flow-1d-v24   # bump this whenever a `search:` bound changes: a journal
                            # that mixes two spaces cannot be read (see README study history).
-                           # v21 added the `recency` sleeve (w_recency) and PINNED
-                           # min_events at 1 — the searched threshold on a rolling count
-                           # had become the strategy's dominant exit rule.
+                           # v24: the alt-data sleeve weights may now reach 0.0 (were floored
+                           # at 0.25), rating_halflife high 90 -> 180, max_hold low 21 -> 10 —
+                           # all three were pressing on v23's bounds (see README study history).
+                           # v23: same space and panel as v22; the ENGINE's objectives became
+                           # excess_cagr ↑ / tracking_error ↓ (were info_ratio / excess_cagr,
+                           # 0.975-correlated). The v22 journal is refused by the new engine.
+                           # v22: max_positions search floor 3 -> 10 (v20's pick sat on the
+                           # old floor of 3, the sixth floor-pinned pick in a row) AND
+                           # max_symbols 100 -> 110 (a new panel, so a new benchmark) — not
+                           # comparable with v21 on either axis. v21 added the `recency`
+                           # sleeve (w_recency) and PINNED min_events at 1 — the searched
+                           # threshold on a rolling count had become the dominant exit rule.
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
   n_trials: 1000
   min_trades_per_year: 15  # admissibility floor (PER YEAR, not absolute): daily,
                            # multi-position portfolio mode turns over far less than an
                            # intraday scanner — 15/yr ~= 75 trades over this 5y window
+
+# Execution rules the engine applies to this strategy AND its buy-and-hold benchmark.
+backtest:
+  fill: open               # open | pessimistic.  open: every order at the next bar's
+                           # adjusted open (neutral).  pessimistic: every buy at that bar's
+                           # HIGH, every sell at its LOW — the worst plausible intraday
+                           # execution, to test whether the edge survives it. Flipping this
+                           # changes every number: bump optuna.study, or a journal mixes two
+                           # execution models that nothing can tell apart.
 
 # Every parameter declared ONCE: what it means, what ships (`value`), what the
 # study may explore (`search`), and what the coarse sweep varies (`grid`).
@@ -70,7 +87,7 @@ params:
   rating_halflife:
     doc: EMA half-life (bars) for the rating-change stream (~1 month at 21).
     value: 21
-    search: { type: int, low: 5, high: 90, log: true }
+    search: { type: int, low: 5, high: 180, log: true }   # high 90 -> 180: 52% of v23's front sat at 90
   ptrev_halflife:
     doc: EMA half-life (bars) for the price-target revision stream.
     value: 21
@@ -81,27 +98,30 @@ params:
   # same strategy as (0.4, 0.4, 0.16, 0.2). That made the 4-D weight search really 3-D — a
   # wasted dimension that produced bogus "parameter at boundary" alarms whenever a weight
   # drifted to 1.0. So w_dtc is the FIXED numeraire (never searched) and the rest float
-  # against it. Every `search:` floor here is 0.25, NOT 0.0, on purpose: the study decides
-  # how BIG a sleeve is, never whether it exists. Existence is decided out of sample, by the
-  # 0.0 columns of the grids below (§10b·ii). EXPECTED NOISE: §8's boundary_report says
-  # "widen low" whenever a pick lands on 0.25 — it cannot know the floor is deliberate, so
-  # that one flag is not a finding. Every other boundary flag still means what it says.
+  # against it. Since v24 every searched floor is 0.0: the study may switch a sleeve OFF.
+  # Until v23 the floors were 0.25 ("the study sizes a sleeve, the grid decides whether it
+  # exists"), but that forced sleeves the search wanted gone into every pick: v23's insider
+  # sleeve had a NEGATIVE train rank-IC (−0.015 at 63d) and w_ptrev sat on its 0.25 floor for
+  # 64% of the front, so the shipped composite carried both by construction. The 0.0 columns
+  # of the grids below (§10b·ii) remain the out-of-sample referee on existence. w_dtc is the
+  # fixed 1.0 numeraire, so the weights can never all be zero. §8 will flag "widen low" on a
+  # pick at 0.0 — a weight cannot go negative, so that one flag is noise.
   w_insider:
     doc: Composite weight on insider buying. 0.0 in the grid ablates the sleeve.
     value: 1.0
-    search: { type: float, low: 0.25, high: 3.0, step: 0.25 }
+    search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
     grid: [0.0, 1.0]
   w_rating:
     doc: Composite weight on rating-change momentum. 0.0 in the grid ablates it.
     value: 1.0
-    search: { type: float, low: 0.25, high: 3.0, step: 0.25 }
+    search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
     grid: [0.0, 1.0]
   w_ptrev:
     doc: >-
       Composite weight on price-target REVISIONS (never the target-to-price level — Han-Kang
       2022 show price drifts against the level, worst in exactly this large-cap universe).
     value: 0.5
-    search: { type: float, low: 0.25, high: 3.0, step: 0.25 }
+    search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
     grid: [0.0, 0.5, 1.0]
   w_dtc:
     doc: >-
@@ -192,7 +212,7 @@ params:
       (measured max 3 bars parked, against the 65 it needed) — it fired ZERO times across
       the whole v16 holdout book.
     value: 126
-    search: { type: int, low: 21, high: 252, log: true }
+    search: { type: int, low: 10, high: 252, log: true }   # low 21 -> 10: 44% of v23's front sat at 21
   min_events:
     doc: >-
       Minimum trailing event DAYS for a name to be RANKABLE at all (an ineligible name is

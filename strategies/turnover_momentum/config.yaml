@@ -1,0 +1,121 @@
+# ===========================================================================
+# turnover_momentum — daily short-term momentum conditioned on share turnover
+# (Medhat & Schmeling, RFS 2022): last month's winners among the most-traded
+# names continue; the same sort among thinly traded names reverses.
+# Layout: data (what panel to load), optuna (study settings), params
+# (every knob: doc + shipped value + optional search space and sweep grid).
+# ===========================================================================
+
+data:
+  universe: Liquid500      # 500 names, point-in-time: ranked by median dollar volume over
+                           # 2020-01 -> 2020-06, a window that CLOSES before the backtest
+                           # opens (notebooks/01_universe_screener.ipynb §8b). Broad on
+                           # purpose — the turnover sort needs a real cross-section of
+                           # turnover, which 120 mega-caps do not have.
+  bar: 1d                  # daily bars; the effect is a one-month formation / one-month hold
+  start: "2020-07-01"      # first bar AFTER the ranking window
+  end: "2024-12-31"        # TRAIN cutoff — 2025+ is the notebook's untouched holdout
+  session: regular         # daily bars are all regular-session
+  max_symbols: 500         # the whole universe (every member has >= 1,000 sessions in-window)
+  # Attached to Panel.features at load time. Shares outstanding (SEC XBRL, point-in-time)
+  # turn volume into TURNOVER; below strategy.min_coverage breadth the strategy falls back
+  # to dollar volume and says so (scores()["turnover_source"]).
+  features: [fund_shares]
+
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
+optuna:
+  # Objectives are the engine defaults: info_ratio + excess_cagr against an equal-weight
+  # buy-and-hold of the SAME panel (backtest.benchmark). A long-only momentum book in a
+  # rising market earns a positive absolute Sharpe just by being invested, so only the
+  # benchmark-relative pair separates stock selection from market exposure.
+  study: turnover-momentum-1d-v2   # bump whenever a `search:` bound, the objective or the
+                                   # execution model changes — a journal that mixes two
+                                   # spaces cannot be read. v2: engine objectives became
+                                   # excess_cagr ↑ / tracking_error ↓ (v1 is refused)
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 42
+  n_trials: 400            # five searched knobs — a small space on purpose
+  min_trades_per_year: 24  # admissibility floor (PER YEAR, not absolute): ~2 round trips a
+                           # month. Kills a "buy 10 names and hold" artifact (~2/yr) without
+                           # deleting the quarterly cadence the rebalance_days search allows.
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+# Two invariants are enforced at load time (strategies._unpack): `value` must be
+# reachable by its own `search`, and must appear in its own `grid`.
+params:
+
+  # --- the signal ------------------------------------------------------------------
+  formation:
+    doc: >-
+      Trailing bars the momentum return is measured over (~1 month at 21 — the horizon the
+      paper finds strongest; it stays positive out to ~6 months). Pinned in the sweep so the
+      grid's free dimensions are the thesis controls below.
+    value: 21
+    search: { type: int, low: 5, high: 63, log: true }
+    grid: [21]
+  skip:
+    doc: >-
+      Bars skipped between the end of the formation window and today. 0 is the paper's
+      plain previous-month return; ~5 skips the last week, where the classic very-short-term
+      reversal lives. The grid tests both so the sweep says whether skipping helps HERE.
+    value: 0
+    search: { type: int, low: 0, high: 10 }
+    grid: [0, 5]
+
+  # --- the thesis knob -------------------------------------------------------------
+  turnover_window:
+    doc: Trailing bars the turnover level (mean volume / shares outstanding) is averaged over.
+    value: 63
+    search: { type: int, low: 21, high: 252, log: true }
+  turnover_q:
+    doc: >-
+      Cross-sectional turnover quantile a name must reach to be RANKED at all (0.5 = the
+      more-traded half; an ineligible name is dropped from the cross-section, not scored
+      neutral). THE thesis knob: 0.0 disables the conditioning and is the plain one-month
+      momentum control the paper says should be weaker or reversed; 0.8 is the top quintile
+      where the effect should be strongest. The grid carries all three so the sweep is the
+      falsification, not a tuning exercise.
+    value: 0.5
+    search: { type: float, low: 0.0, high: 0.9, step: 0.1 }
+    grid: [0.0, 0.5, 0.8]
+  polarity:
+    doc: >-
+      momentum holds the top movers, reversal the bottom ones. The other half of the
+      falsification: on the high-turnover slice reversal must LOSE. Kept searchable so the
+      optimizer can tell us if it does not.
+    value: momentum
+    search: { type: categorical, choices: [momentum, reversal] }
+    grid: [momentum, reversal]
+
+  # --- the book ----------------------------------------------------------------------
+  rebalance_days:
+    doc: >-
+      Bars between re-selections; the book is carried in between, so this IS the holding
+      period (~1 month at 21, the horizon the literature tests). Searched down to a week
+      and up to a quarter.
+    value: 21
+    search: { type: int, low: 5, high: 63, log: true }
+  max_positions:
+    doc: >-
+      Slots in the ONE shared book, 1/max_positions each at entry. NOT searched, by design:
+      informed_flow's studies picked the low bound of this knob six times running because a
+      concentrated momentum book is always "purer" in-sample — that is a risk decision, not
+      a parameter. The grid shows the 10-vs-20 trade-off once; ship what you can stomach.
+    value: 10
+    grid: [10, 20]
+  min_coverage:
+    doc: >-
+      fund_shares must cover at least this share of the universe on its best-covered bar to
+      define turnover; below it the strategy falls back to dollar volume (a size x turnover
+      mix, not turnover) and reports which one ran.
+    value: 0.5
+  retrim_k:
+    doc: >-
+      Single-name concentration cap (engine _retrim_loop): a held slot that grows to
+      retrim_k x its 1/max_positions target is trimmed back to it and the freed cash rotates
+      into the next pick. Risk control, not signal — a fixed policy, never searched. null
+      disables. Momentum books are exactly where one runaway name crowns a parameter set.
+    value: 2.0

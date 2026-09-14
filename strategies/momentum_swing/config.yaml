@@ -1,0 +1,202 @@
+# ===========================================================================
+# momentum_swing — daily swing trading in the Qullamaggie / Minervini style:
+# breakouts from tight bases after a leader move, and episodic pivots (huge gap
+# on huge volume after neglect), one ATR stop, a moving-average trail, a market
+# regime gate. Long only (the parabolic short is deliberately not shipped — README).
+# Layout: data (what panel to load), optuna (study settings), backtest (fill
+# model), params (every knob: doc + shipped value + optional search and grid).
+# ===========================================================================
+
+data:
+  universe: Liquid500      # 500 names, point-in-time: ranked by median dollar volume over
+                           # 2020-01 -> 2020-06, a window that CLOSES before the backtest
+                           # opens (notebooks/01_universe_screener.ipynb §8b). Liquid on
+                           # purpose: the modelled costs are honest there, and a $50k book
+                           # trading $12.5k clips is invisible in names doing $90M+/day.
+                           # The setup's own ADR floor picks the movers out of it.
+  bar: 1d                  # daily bars — swing trades held days to weeks
+  start: "2020-07-01"      # first bar AFTER the universe's ranking window
+  end: "2024-12-31"        # TRAIN cutoff — 2025+ is the notebook's untouched holdout
+  session: regular         # daily bars are all regular-session
+  max_symbols: 500         # the whole universe
+
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
+optuna:
+  study: momentum-swing-1d-v2   # bump whenever a `search:` bound, the objective, the fill
+                                # model or the execution model changes — a journal that
+                                # mixes two spaces cannot be read. v2: v1 (450 trials, 3
+                                # seeded workers = 300 duplicates, 93% pruned on the trade
+                                # floor) narrowed adr_min/vol/gap bounds toward the region
+                                # that trades at all and widened vol_mult per its boundary
+                                # report; run it with ONE worker (see IDEAS.md)
+  sampler: nsga2           # nsga2 | tpe | random
+  seed: 42
+  n_trials: 1000           # 13 searched knobs — NSGA-II needs the trials
+  min_trades_per_year: 20  # admissibility floor (PER YEAR, not absolute): a 4-slot swing
+                           # book holding names 2-6 weeks trades ~40-120 times a year at
+                           # full utilisation; below ~20/yr a front row is a handful of
+                           # lucky fills, not a strategy
+
+# Execution rules the engine applies to this strategy AND its benchmark.
+backtest:
+  fill: open               # next bar's adjusted open (the strategy is next-open executed,
+                           # which already pays the gap the intraday "opening range high"
+                           # entry would avoid). Flip to `pessimistic` for the worst-fill
+                           # stress and bump optuna.study.
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+# Two invariants are enforced at load time (strategies._unpack): `value` must be
+# reachable by its own `search`, and must appear in its own `grid`.
+params:
+
+  # --- which setups may enter -------------------------------------------------------
+  setup:
+    doc: >-
+      breakout | pivot | both. The grid runs each leg alone and together, so the sweep is
+      the ablation: does either setup carry the result, and do they add up?
+    value: both
+    search: { type: categorical, choices: [breakout, pivot, both] }
+    grid: [breakout, pivot, both]
+
+  # --- the breakout ----------------------------------------------------------------
+  lead_window:
+    doc: >-
+      Bars of the leader move (~3 months at 63). Breakout: measured BEFORE the base, so a
+      base that drifts does not eat the move. Pivot: the neglect window ending the day
+      before the gap. Also the window the average daily range (adr_min) is measured over.
+    value: 63
+    search: { type: int, low: 21, high: 252, log: true }
+  lead_min:
+    doc: >-
+      Minimum leader return for a breakout (Kullamägi: "30-100%+ in 1-3 months"; 25% ships
+      so the liquid universe produces enough events to clear the trade floor); a pivot
+      requires LESS than this (neglect). One threshold divides the two populations.
+    value: 0.25
+    search: { type: float, low: 0.05, high: 0.8, step: 0.05 }   # v1: the best rows sat at 0.9,
+                                                             # where the breakout leg is inert
+  base_window:
+    doc: >-
+      Bars in the consolidation (2-8 weeks in the source; 15 = 3 weeks). A breakout is a
+      close above the highest high of these bars. Must be shorter than lead_window.
+    value: 15
+    search: { type: int, low: 5, high: 60, log: true }
+  contraction:
+    doc: >-
+      Volatility-contraction test: the base's average daily range ÷ the leader-period's must
+      be at most this. 0.9 = the base is a tenth calmer than the move that preceded it
+      (0.75 is the source-faithful setting, and fires 22 times in 4.5 years on 500 liquid
+      names); 1.2 effectively disables the test — the literature has no directional
+      evidence for contraction, so the search may switch it off.
+    value: 0.9
+    search: { type: float, low: 0.4, high: 1.2, step: 0.05 }
+  depth_max:
+    doc: >-
+      Base high-to-low depth at most this fraction (an orderly base, not a collapse the
+      stock is climbing back out of). Structural, not searched.
+    value: 0.25
+  adr_min:
+    doc: >-
+      Average daily range (high/low − 1, mean over lead_window bars) floor. The setup needs
+      names that move — but high-range names are the lottery decile that underperforms on
+      average (Bali-Cakici-Whitelaw), so the search reaches 0 (no floor) and the trailing
+      exit is what makes the floor defensible at all. Only ~16% of Liquid500 name-days
+      clear 3.5%; 3% ships.
+    value: 0.03
+    search: { type: float, low: 0.0, high: 0.05, step: 0.005 }   # v1: >0.05 never cleared the floor
+  vol_mult:
+    doc: >-
+      Breakout-day volume ÷ its avg_window-bar average. Volume confirmation (the
+      high-volume return premium, Gervais-Kaniel-Mingelgrin); 0.5 effectively disables it.
+    value: 1.5
+    search: { type: float, low: 0.5, high: 5.0, step: 0.25 }   # v1 boundary report: widen high
+
+  # --- the episodic pivot ------------------------------------------------------------
+  gap_min:
+    doc: >-
+      Pivot: the open must be at least this far above the prior close (Kullamägi: "gap up
+      10%+"; 8% ships so the liquid universe produces enough events to score).
+    value: 0.08
+    search: { type: float, low: 0.03, high: 0.12, step: 0.01 }   # v1: >0.12 never cleared the floor
+  gap_vol_mult:
+    doc: >-
+      Pivot: gap-day volume ÷ its avg_window-bar average. Stockbee's 5-10x is a small-cap
+      number; 3x ships for liquid names. The gap must also be HELD (close ≥ open) — the
+      daily-bar stand-in for the opening-range-high entry.
+    value: 3.0
+    search: { type: float, low: 1.0, high: 5.0, step: 0.5 }   # v1: >5 never cleared the floor
+
+  # --- the market gate -----------------------------------------------------------------
+  regime:
+    doc: >-
+      none | fast | slow. The market is the panel's own equal-weight index (the benchmark's
+      composition). fast = its regime_fast SMA above its regime_slow SMA (the "10 over 20"
+      traffic light the community built around Kullamägi's "breakouts don't exist in a
+      falling market"); slow = the index above its regime_long SMA (the 200-day gate every
+      systematic rebuild of this style ends up with — Clenow, quant4free). The literature
+      says the gate halves drawdowns and adds little return; the grid tests all three.
+    value: fast
+    search: { type: categorical, choices: [none, fast, slow] }
+    grid: [none, fast, slow]
+  regime_fast:
+    doc: Fast SMA of the equal-weight index (fast regime). Fixed at the source's 10.
+    value: 10
+  regime_slow:
+    doc: Slow SMA of the equal-weight index (fast regime). Fixed at the source's 20.
+    value: 20
+  regime_long:
+    doc: Long SMA of the equal-weight index (slow regime). The classic 200-day / 10-month.
+    value: 200
+
+  # --- risk and exits -------------------------------------------------------------
+  avg_window:
+    doc: Bars in the volume average both setups compare against.
+    value: 20
+  atr_window:
+    doc: ATR smoothing window (bars).
+    value: 14
+  stop_atr:
+    doc: >-
+      Initial stop distance in ATRs below entry (fixed, not trailing). The source's
+      "low of the day, never wider than 1 ADR/ATR"; Stonks Capital's rebuild found 1 ATR too
+      tight. Evaluated intrabar by the engine and filled at the true open when a bar gaps
+      through it — overnight gap risk is in the numbers.
+    value: 1.5
+    search: { type: float, low: 0.5, high: 5.0, step: 0.25 }   # v1 boundary report: widen high
+  max_stop:
+    doc: >-
+      Skip a setup whose stop would sit further than this fraction below price. Under
+      fixed-fraction sizing (cash_frac) this BOUNDS the risk per trade at
+      cash_frac × max_stop (= 3% of the book here); risk-per-trade sizing proper needs the
+      per-entry cash fraction proposed in the README.
+    value: 0.12
+  trail_sma:
+    doc: >-
+      The trail: exit on the next open after the first close below this SMA. Kullamägi
+      trails the 10-day (fast names) or the 20-day (slower ones); both are in the grid.
+    value: 10
+    search: { type: int, low: 5, high: 50, log: true }
+    grid: [10, 20]
+  tp_r:
+    doc: >-
+      Full take-profit at this multiple of the stop distance; 0 = none (the trail is the
+      only profit exit). The engine has no partial sells, so the source's "sell a third at
+      3-5R" becomes a searchable whole-position target — Stonks Capital's rebuild found the
+      partial sell hurt, so 0 ships.
+    value: 0.0
+    search: { type: float, low: 0.0, high: 12.0, step: 1.0 }
+
+  # --- the book -----------------------------------------------------------------------
+  cash_frac:
+    doc: >-
+      ONE shared $10k wallet (engine cash-shared mode): each entry deploys this fraction of
+      the FREE cash, so the book can never be more than fully invested and simultaneous
+      breakouts compete for the same cash. 0.25 sits inside the source's "10-40% of the
+      account" and is the repo's default — params-only, never searched (a risk decision).
+      NOTE there is no position COUNT: each entry takes 25% of what is LEFT (25%, 19%,
+      14%, 11%, 8%...), so a signal-rich parameter set holds dozens of small positions
+      (the v2 pick held up to 82) — a diluted index the benchmark-relative objective
+      rewards. Read n_trades and time-in-market beside any front row.
+    value: 0.25

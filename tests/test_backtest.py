@@ -196,6 +196,46 @@ def test_stop_gap_through_fills_at_the_open_not_the_stop():
     assert t["exit_price"] == pytest.approx(85.0)            # the open, NOT the 98 stop
 
 
+# --- pessimistic fills ---------------------------------------------------------
+def test_pessimistic_fill_buys_at_the_high_and_sells_at_the_low(panel):
+    """Every buy prints at its bar's high, every sell at its low — in both engine modes."""
+    pf = bt.run(panel, _one_spike_signals(panel), fees=0.0, slippage=0.0, fill="pessimistic")
+    t = bt.trade_records(pf).iloc[0]
+    assert t["entry_price"] == pytest.approx(panel.high.iloc[41, 0])
+    assert t["exit_price"] == pytest.approx(panel.low.iloc[46, 0])
+    # The configured slippage still applies on top of the worst side.
+    slipped = bt.trade_records(bt.run(panel, _one_spike_signals(panel), fees=0.0,
+                                      slippage=0.001, fill="pessimistic")).iloc[0]
+    assert slipped["entry_price"] > panel.high.iloc[41, 0]
+    assert slipped["exit_price"] < panel.low.iloc[46, 0]
+
+    w = pd.DataFrame(0.0, index=panel.close.index, columns=panel.close.columns)
+    w.iloc[5:20, 0] = 0.5                          # portfolio mode: buy bar 5, sell bar 20
+    t = bt.trade_records(bt.run(panel, {"weights": w}, fees=0.0, slippage=0.0,
+                                fill="pessimistic")).iloc[0]
+    assert t["entry_price"] == pytest.approx(panel.high.iloc[5, 0])
+    assert t["exit_price"] == pytest.approx(panel.low.iloc[20, 0])
+    with pytest.raises(ValueError, match="fill"):
+        bt.run(panel, {"weights": w}, fees=0.0, slippage=0.0, fill="close")
+
+
+def test_pessimistic_fill_prices_a_stop_leg_at_the_bar_low():
+    """A stop exit is an order like any other: under pessimistic it prints at the bar's low."""
+    idx = pd.date_range("2024-01-02", periods=20, freq="B", tz="UTC")
+    close = pd.DataFrame({"AAA": 100.0}, index=idx)
+    close.iloc[10:] = 85.0                                   # collapse at bar 10
+    p = Panel(close=close, open_=close.copy(), high=close + 0.5, low=close - 0.5,
+              volume=pd.DataFrame(1_000.0, index=idx, columns=["AAA"]), bar="1d")
+    entries = pd.DataFrame(False, index=idx, columns=["AAA"])
+    entries.iloc[5] = True
+    pf = bt.run(p, {"entries": entries, "sl_stop": 0.02}, fees=0.0, slippage=0.0,
+                fill="pessimistic")
+    t = bt.trade_records(pf).iloc[0]
+    assert t["entry_price"] == pytest.approx(100.5)          # high of the entry bar
+    assert t["exit_ts"] == idx[10]
+    assert t["exit_price"] == pytest.approx(84.5)            # low of the gap bar
+
+
 def test_run_with_trailing_stop_caps_loss(panel):
     # Short the up-trending AAA with a tight 1% trailing stop: the stop must
     # exit quickly and keep the loss small.
@@ -267,6 +307,7 @@ def test_benchmark_is_buy_and_hold_and_beats_a_flat_strategy(panel):
                              total_return=stats["total_return"])
     assert abs(active["excess_cagr"]) < 1e-12
     assert abs(active["info_ratio"]) < 1e-9
+    assert abs(active["tracking_error"]) < 1e-9      # the benchmark never strays from itself
 
     # A strategy that never trades earns nothing, so it trails a rising benchmark.
     # AAA-only panel: the benchmark is unambiguously positive, so this half can't
@@ -280,6 +321,7 @@ def test_benchmark_is_buy_and_hold_and_beats_a_flat_strategy(panel):
     a0 = bt.active_stats(pf0, rising, fees=0.0, slippage=0.0,
                          total_return=s0["total_return"])
     assert a0["excess_cagr"] < 0
+    assert a0["tracking_error"] > 0                   # sitting in cash strays from the market
 
 
 def test_benchmark_matches_the_mean_of_the_per_symbol_returns(panel):
@@ -594,6 +636,45 @@ def test_sweep_portfolio_matches_evaluate(panel):
     # A bigger slot in the same shared book must move the number — proof the combos are
     # not silently sharing one pot.
     assert stats["total_return"].iloc[0] != pytest.approx(stats["total_return"].iloc[1])
+
+
+def test_pessimistic_sweep_matches_evaluate_and_charges_the_benchmark_too(panel):
+    """`strategy.fill` must reach sweep, evaluate AND the benchmark hurdle identically."""
+    from trading_simple import strategies
+
+    def weights_only(p, *, slot: float, **_):
+        w = pd.DataFrame(0.0, index=p.close.index, columns=p.close.columns)
+        w.iloc[5:30, 0] = slot
+        w.iloc[30:, 1] = slot                      # rotate AAA -> BBB: a sell and a buy
+        return {"weights": w}
+
+    strat = replace(strategies.load("informed_flow"), signals=weights_only,
+                    params={"slot": 0.5}, fill="pessimistic")
+    grid = [{"slot": 0.5}, {"slot": 1.0}]
+    stats = bt.sweep(strat, panel, grid, settings=_settings(), chunk_size=2)
+    for row, combo in zip(stats.to_dict("records"), grid, strict=True):
+        single = bt.evaluate(strat, panel, combo, settings=_settings())
+        assert row["total_return"] == pytest.approx(single["total_return"], rel=1e-9)
+        assert row["excess_cagr"] == pytest.approx(single["excess_cagr"], rel=1e-6)
+    opened = bt.sweep(replace(strat, fill="open"), panel, grid, settings=_settings())
+    assert (stats["total_return"] < opened["total_return"]).all()   # worse fills, every combo
+
+    worst, _ = bt.benchmark(panel, fees=0.0, slippage=0.0, fill="pessimistic")
+    neutral, _ = bt.benchmark(panel, fees=0.0, slippage=0.0)
+    assert worst < neutral                         # its one buy per name prints at the high
+
+
+def test_pessimistic_signal_sweep_with_stops_matches_evaluate(panel):
+    """The from_signals branch (stops + cash-shared wallet) under pessimistic fills."""
+    from trading_simple import strategies
+
+    strat = replace(strategies.load("donchian_breakout"), fill="pessimistic")
+    grid = [{"entry_window": 10, "atr_window": 7, "atr_mult": m} for m in (1.5, 3.0)]
+    stats = bt.sweep(strat, panel, grid, settings=_settings(), chunk_size=2)
+    for row, combo in zip(stats.to_dict("records"), grid, strict=True):
+        single = bt.evaluate(strat, panel, combo, settings=_settings())
+        assert row["n_trades"] == single["n_trades"]
+        assert row["total_return"] == pytest.approx(single["total_return"], rel=1e-9)
 
 
 def test_benchmark_cache_is_keyed_by_panel_not_identity(panel):

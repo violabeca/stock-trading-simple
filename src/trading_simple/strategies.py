@@ -23,6 +23,10 @@ A strategy is a folder ``strategies/<name>/`` containing:
   silent: a walk-forward re-picking from a drifted grid faithfully validates a
   strategy nobody runs, and reports no error at all while doing it.
 
+An optional fourth block, ``backtest:``, holds per-strategy execution rules the engine
+applies — today only ``fill`` (``open`` | ``pessimistic``, see
+:func:`trading_simple.backtest.fill_prices`), exposed as ``LoadedStrategy.fill``.
+
 :class:`LoadedStrategy` still exposes the three flat views the engine consumes —
 ``params`` / ``sweep`` / ``optuna["space"]`` — so this declaration style is the only
 thing that changed; :mod:`trading_simple.backtest`, :mod:`trading_simple.optimize`
@@ -38,6 +42,7 @@ from pathlib import Path
 
 import yaml
 
+from trading_simple.backtest import FILLS
 from trading_simple.config import PROJECT_ROOT
 
 STRATEGIES_DIR = PROJECT_ROOT / "strategies"
@@ -59,6 +64,7 @@ class LoadedStrategy:
         optuna: The ``optuna:`` block plus the ``space`` assembled from every
             parameter's ``search``.
         docs: Each parameter's ``doc`` string, for the ones that carry one.
+        fill: Fill model from ``backtest.fill`` (``"open"`` when absent).
     """
 
     name: str
@@ -71,7 +77,12 @@ class LoadedStrategy:
     sweep: dict = field(default_factory=dict)
     optuna: dict = field(default_factory=dict)
     docs: dict = field(default_factory=dict)
+    fill: str = "open"
 
+
+#: Keys the optional ``backtest:`` block may declare. Same reason as :data:`_PARAM_KEYS`: a
+#: typo (``fil: pessimistic``) would otherwise silently run the default fills.
+_BACKTEST_KEYS = {"fill"}
 
 #: Keys a long-form parameter entry may declare. Anything else is a typo, and a typo in
 #: ``serach:`` would otherwise mean "not searched" — silently, and only visible as a study
@@ -170,7 +181,8 @@ def load(name: str) -> LoadedStrategy:
             lists the available strategies).
         AttributeError: If ``strategy.py`` defines no ``signals`` function.
         ValueError: If the config declares a parameter the search or the grid
-            contradicts (see :func:`_unpack`).
+            contradicts (see :func:`_unpack`), or a ``backtest:`` block with an unknown
+            key or fill model.
     """
     folder = STRATEGIES_DIR / name
     module_file, config_file = folder / "strategy.py", folder / "config.yaml"
@@ -186,6 +198,13 @@ def load(name: str) -> LoadedStrategy:
         raise AttributeError(f"{module_file} must define a signals(panel, **params) function")
     cfg = yaml.safe_load(config_file.read_text()) or {}
     params, sweep, space, docs = _unpack(cfg.get("params", {}), name)
+    run_cfg = cfg.get("backtest") or {}
+    if unknown := set(run_cfg) - _BACKTEST_KEYS:
+        raise ValueError(f"{name}/config.yaml: backtest has unknown key(s) {sorted(unknown)}; "
+                         f"allowed: {sorted(_BACKTEST_KEYS)}")
+    fill = run_cfg.get("fill", "open")
+    if fill not in FILLS:
+        raise ValueError(f"{name}/config.yaml: backtest.fill is {fill!r}; choose one of {FILLS}")
     return LoadedStrategy(
         name=name,
         dir=folder,
@@ -199,4 +218,5 @@ def load(name: str) -> LoadedStrategy:
         # value it ships can never sit in two places that disagree.
         optuna={**cfg.get("optuna", {}), "space": space},
         docs=docs,
+        fill=fill,
     )

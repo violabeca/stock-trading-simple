@@ -65,7 +65,9 @@ cp -r strategies/_template strategies/<snake_case_name>
 
 ## 4 · Fill `config.yaml`
 
-Three blocks — `data`, `optuna` (study settings only), `params`. Every
+Blocks — `data`, `optuna` (study settings only), an optional `backtest`
+(`fill: open` by default; `pessimistic` buys at the bar's high and sells at its low,
+as a worst-case execution stress), and `params`. Every
 `signals()` keyword argument MUST appear under `params:`, declared **once**:
 
 ```yaml

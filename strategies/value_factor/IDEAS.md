@@ -43,3 +43,14 @@ Falsify per-sleeve with the same demeaned-IC cell the notebook uses for bp/ey/gp
   transiently inconsistent and one name's rank can distort (README documents it).
 - `LiquidLeaders` is a current-listings snapshot — survivorship in universe
   selection; the value premium literature is exactly where dead names matter.
+
+## Data quality (found 2026-09-12 while building `turnover_momentum`)
+
+`fund_shares` carries filer-side unit errors from `dei:EntityCommonStockSharesOutstanding`:
+AJG reported ×1,000,000 shares for two 2020 quarters (market cap ×1e6 → book-to-price and
+earnings yield collapse to ~0 → bottom rank), BALL a literal 0 on 2022-02-14 (dropped), RMD
+and CMG ÷1,000 for one quarter each (market cap ÷1,000 → both value ratios ×1,000 → **top
+rank** for a quarter), CCL ×1,000. The `fundamentals` table holds 124 rows with a
+non-positive share count across 87 symbols. A plausibility filter in the feature layer is
+the fix (engine proposal in `../turnover_momentum/IDEAS.md`); until then read a sudden
+top-decile value rank as a possible unit error.

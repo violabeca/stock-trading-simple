@@ -56,10 +56,12 @@ missing dimension as a *confirmation tilt*:
   buying ranks high, choppy/horizontal names sit near the middle, persistent selling low.
 
 Both are computed from `panel.close` alone — no new alt-data, no engine change — and enter
-the composite exactly like every other sleeve, weighted by `w_trend` / `w_rsi` (both `1.0`
-in `config.yaml`, so the overlay is **on by default**). A weight of `0` ablates a sleeve and
-renormalizes the rest, so you can switch either off — or let the sweep/Optuna search decide
-how much weight each earns. One real limitation: the
+the composite exactly like every other sleeve, weighted by `w_trend` / `w_rsi` (both `0.0`
+in `config.yaml`: **off by default and not searched**, because the v13-vs-v14 controlled
+holdout ablation put their effect at ~zero — holdout info ratio 2.02 → 2.02 — and the
+walk-forward folds kept each of them in only 1 of 4; the sweep grid's `[0.0, 1.0]` columns
+keep testing them out of sample). A weight above `0` enables a sleeve and renormalizes the
+rest. One real limitation: the
 tech sleeves are ranked **only within the alt-data-eligible cross-section**, so they can
 down-rank a name that has insider/analyst coverage but a weak price trend — they cannot
 pull in a pure price-uptrend name that has no alt-data at all. They confirm the alt-data
@@ -115,23 +117,25 @@ strictly before *D*. Combined with next-bar-open execution, an event known on
 day *D* moves a position no earlier than the open of *D+2* — deliberately
 conservative, immaterial at these horizons.
 
-**Parameters** (all in `config.yaml`):
+**Parameters** (the values are what `config.yaml` **ships** today; a study pick overwrites
+them there only when §7's "Promoting a pick" cell is run):
 
-| param | default | meaning |
+| param | shipped | meaning |
 |---|---|---|
 | `insider_window` | 63 | trailing bars for insider dollars, the dollar-volume normalizer, and eligibility — **triple duty**, so a pick here is not a clean statement about the insider horizon |
 | `rating_halflife` | 21 | EMA half-life (bars) for the rating-change stream |
 | `ptrev_halflife` | 21 | EMA half-life (bars) for the price-target revision stream |
-| `w_insider` / `w_rating` / `w_ptrev` / `w_dtc` | 0.4 / 0.3 / 0.3 / 0.3 | composite weights (a weight of 0, or a missing feature, ablates that signal) |
+| `w_insider` / `w_rating` / `w_ptrev` / `w_dtc` | 1.0 / 1.0 / 0.5 / 1.0 | composite weights; only their ratios matter, `w_dtc` is the fixed numeraire. A weight of 0 (grid only — the search floors at 0.25), or a missing feature, ablates that signal |
 | `w_recency` | 1.0 | weight on the coverage-recency sleeve (bars since the last insider/rating event, negated). It has **no window of its own**, so staleness is decoupled from `insider_window` |
 | `trend_fast` / `trend_slow` | 21 / 126 | fast / slow MA legs (bars) of the price-derived MA-trend crossover sleeve (`valid()` requires `trend_fast < trend_slow`) |
 | `rsi_period` | 14 | Wilder-RSI lookback (bars) for the RSI market-condition sleeve |
-| `w_trend` / `w_rsi` | 1.0 / 1.0 | weights on the MA-trend and RSI sleeves — **on by default** (0 ablates, like any sleeve); a soft price-regime tilt |
-| `q_in` / `q_out` | 0.8 / 0.6 | qualify above `q_in`, sell below `q_out` (hysteresis band) |
+| `w_trend` / `w_rsi` | 0.0 / 0.0 | weights on the MA-trend and RSI sleeves — **off by default and unsearched** (ablation measured ~zero holdout effect); the sweep grid still tests `1.0` |
+| `q_in` / `q_out` | 0.75 / 0.45 | qualify above `q_in`, sell below `q_out` (hysteresis band). Both v13 and v14 converged on exactly this pair from opposite sleeve mixes |
 | `max_hold` | 126 | time-stop backstop (bars) — see below; it only bites in the band |
 | `min_events` | 1 | eligibility floor: insider/rating event days in the window. Below it, a name is dropped from the ranking. **Pinned, not searched** — see below |
-| `max_positions` | 10 | slots in the book. Each is a fixed `1/max_positions` of the capital, so fewer names qualifying means idle cash, never a concentrated bet |
+| `max_positions` | 15 | slots in the book. Each is a fixed `1/max_positions` of the capital, so fewer names qualifying means idle cash, never a concentrated bet. The search floor is 10, and every study so far has picked its floor — see **Status** below |
 | `displace_margin` | 1.0 | when the book is full, how far a challenger must out-rank the weakest holding to take its slot (one rank place in ~91 names ≈ 0.011). `0.0` evicts on any epsilon; `1.0` is unreachable, so every newcomer waits for a vacancy. One axis, no separate on/off flag — see below |
+| `retrim_k` | 2.0 | concentration cap: a held name that grows to `retrim_k ×` its slot is trimmed back to it. Fixed policy, never searched — see below |
 
 **What `max_hold` is actually for.** It is the least load-bearing parameter here, and
 it exists for exactly one failure case: a name **parked in the hysteresis band**. Such
@@ -268,10 +272,12 @@ removal. **Run study v21 and the four walk-forward folds before quoting any numb
 the alt-data matrices to the panel at load time. Populate them by running
 **`notebooks/03_altdata_update.ipynb`** — that notebook is the single entry point for
 alt-data ingestion, incremental *and* historic (`MODE = "backfill"`), and it carries
-the coverage audit. Data is ingested from 2020, but the strategy **trains from 2021**
-(`data.start`): the two are separate knobs, so widening the window later is a
-one-line config change, not a re-ingestion. Note that ~4 years of train data is
-short — read the DSR and the sub-period table before believing a headline number.
+the coverage audit. Alt-data is ingested from 2018 (the coverage ledger's `covered_from`)
+and the strategy **trains on 2018–2024** (`data.start` / `data.end`) over the
+`max_symbols: 110` best-covered LiquidLeaders names; ingestion depth and the train window
+are separate knobs, so narrowing the window later (to skip the 2020 regime, say) is a
+one-line config change, not a re-ingestion. Read the DSR and the sub-period table before
+believing a headline number.
 
 **A missing sleeve is dropped, and so is a *thin* one.** A signal is used only if its
 weight is positive **and** it covers at least half the universe
@@ -366,9 +372,9 @@ Sharpe of 0.94 and still **lost to buy-and-hold on both train and holdout**.
 
 So the reference for everything here is an equal-weight buy-and-hold of the same names
 over the same window, paying the same costs (`backtest.benchmark`). The optimizer
-maximizes `info_ratio` and `excess_cagr` *against that benchmark*
-(`optimize.OBJECTIVES`); absolute Sharpe is still recorded, as a diagnostic, never as
-a target. Notebook §10a is the pass/fail gate.
+scores `excess_cagr` (maximized) against `tracking_error` (minimized), both *against
+that benchmark* (`optimize.OBJECTIVES`), and picks only among front trials that beat it;
+absolute Sharpe is still recorded, as a diagnostic, never as a target. Notebook §10a is the pass/fail gate.
 
 `excess_cagr` is **per year**, not cumulative, and that matters more than it sounds.
 A cumulative excess return grows with the length of the window, so it quietly rewards a
@@ -409,8 +415,8 @@ the market, so what is left is stock selection and nothing else. It runs in seco
 it is scored per sleeve, and a sleeve with a negative decile spread is not merely
 useless — it is dragging the composite the wrong way.
 
-**Backtest honestly.** `informed_flow.ipynb` trains on 2020–2024 (`data.start`) and keeps
-2025–2026 as an untouched holdout, and carries a validation block: costs-on plus
+**Backtest honestly.** `informed_flow.ipynb` trains on 2018–2024 (`data.start` /
+`data.end`) and keeps 2025–2026 as an untouched holdout, and carries a validation block: costs-on plus
 a cost-doubling stress and breakeven-bps; a 4-fold walk-forward; the Deflated
 Sharpe Ratio over the Optuna study; parameter-neighborhood stability; a
 sub-period table; a random-entry baseline; and a minimum-trades admissibility
@@ -442,12 +448,17 @@ the answer is blunt: six knobs are locally inert, and `max_positions` is a cliff
 on its own low bound — the edge is a concentration effect (+27%/yr at 8 slots, +13% at
 10), not a parameter set.
 
-**What the fixed walk-forward says — read this before trusting the holdout.** Once §10b
-re-picked inside the shipped family it stopped flattering the strategy: mean in-sample
-excess **+10.94%/yr** against mean out-of-sample **−3.49%/yr**, paired `t=4.65, p=0.02`,
-with only **2 of 4 folds** beating buy-and-hold. The 2025+ holdout looks strong, but four
-expanding folds inside 2020–2024 do not corroborate it, so the holdout result is
-**unconfirmed**, not a green light. See `IDEAS.md` for the open question.
+**What the walk-forward says — read this before trusting the holdout.** The first fixed
+§10b (2026-07-28) re-picked each fold from the *coarse grid* and reported mean in-sample
+excess **+10.94%/yr** against mean out-of-sample **−3.49%/yr** (`t=4.65, p=0.02`, 2 of 4
+folds beating buy-and-hold). That decay was **an artifact of the instrument**: a drift gate
+added to §9 showed the grid was running a strategy 11 of 12 knobs away from the pick. §10b·i
+was rebuilt (2026-08-01) so each fold runs its own 1,000-trial study and picks with the same
+`pick_from_front` §7 uses; on the v15 space that gives mean IS **+45.4%/yr** → mean OOS
+**+33.6%/yr** (median +23.9%), `t=0.44, p=0.69`, **3 of 4 folds** beating buy-and-hold, mean
+OOS info ratio +1.02 — with a fold spread of +105 / −18 / +14 / +33 on half-year windows.
+Read that as "no decay *detected* at n=4", not as a clean bill of health, and re-run the
+folds on the current space (v22) before quoting them for it.
 
 **Loading the train panel is not a free choice.** Load it on its **own** window; do not
 load full history and slice back. A feature *column* exists only where the query window
@@ -482,11 +493,13 @@ this shows *which names* did it.
   so a *backtest archive* survives — only future ingestion is exposed. The drop-in paid
   fallback is the same feed via Polygon/Massive's Benzinga add-on (~$99/mo, back to
   2011).
-- **Short sample.** Training on 2020-2024 is ~5 years, minus up to ~9 months of
-  `insider_window` warm-up. Prefer consistency across the sub-period table and the
-  walk-forward folds to a high headline number. (`data.start` and the ingested history
-  are separate knobs on purpose, so the window can be narrowed to skip the 2020 COVID
-  regime without re-ingesting anything.)
+- **Sample.** Training on 2018–2024 is ~7 years, minus up to ~1.5 years of
+  `insider_window` warm-up at its 378-bar ceiling — and the analyst sleeves are thin before
+  2020 (the price-target feed carries ~11k revisions/yr in 2018–19 against ~47k in 2024,
+  across all ingested names). Prefer consistency across the sub-period table and the
+  walk-forward folds to a high headline number. (`data.start` and the ingested history are
+  separate knobs on purpose, so the window can be narrowed to skip the 2020 COVID regime
+  without re-ingesting anything.)
 - **The holdout is one regime.** 2025–2026 is a single ~1.5-year window in a strong bull
   tape (equal-weight buy-and-hold did ~+45%/yr), and a 15-name book has high variance.
   The *direction* of a holdout finding can be trusted far more than its *magnitude* —
@@ -520,6 +533,9 @@ only what runs today.)
 | v19 | the `displace` categorical **collapsed into** `displace_margin`, whose range widened `0.0–0.15 → 0.0–1.0`; `displace_margin = 1.0` is bit-identical to the old `displace=false`, so the shipped strategy is unchanged and only the search space is. One dimension smaller, and no longer contains a parameter that silently does nothing | **no** |
 | v21 | the **`recency` sleeve** (`w_recency`, searched like any weight) is added, and **`min_events` loses its `search:`** and is pinned at 1. Both halves of one change: the searched threshold on a rolling count had become the strategy's dominant exit rule (see "The eligibility cliff"), and leaving it searchable would let the optimizer re-discover it. A new dimension and one removed; the shipped strategy changes too, not just the space | **no** |
 | v20 | `max_positions` low bound `15 → 3`. Both journals are populated (v19 5,005 trials, v20 2,500) and both fronts are a **single dominating trial**, so their picks are not tie-breaks — but v20's pick sits at `max_positions = 3`, the new floor, continuing the unbroken run of floor-pinned picks (30 → 15 → 8 → 5 → 3). Read it as a statement about concentration, not a converged value, and note `excess_cagr = 0.446` on a 3-name book is exactly where a concentration artifact would show up | v19 ↔ v20 **no** |
+| v22 | two changes at once: the `max_positions` low bound `3 → 10` (so the floor is a book, not a bet) **and** `max_symbols` `100 → 110` — a different panel and therefore a different benchmark. 1,936 trials run 2026-09-12; the pick again sits on the `max_positions` floor (see **Status** below) | v21 ↔ v22 **no** (space *and* panel differ) |
+| v23 | same space and panel as v22; the **engine's objectives** changed from `info_ratio` ↑ / `excess_cagr` ↑ (Spearman 0.975 across v22's trials — a 2-point front) to `excess_cagr` ↑ / `tracking_error` ↓, and the pick only chooses front rows beating buy-and-hold. The engine refuses to load the v22 journal under the new labels | **no** (different objectives) |
+| v24 | three v23 bounds that the front was pressing on: the alt-data sleeve weights (`w_insider`, `w_rating`, `w_ptrev`, `w_recency`) may reach **0.0** (were floored at 0.25, which forced the negative-IC insider sleeve and a floor-pinned `w_ptrev` into every pick), `rating_halflife` high `90 → 180` (52% of the front sat at 90), `max_hold` low `21 → 10` (44% sat at 21) | **no** (space differs) |
 
 **Resolved (v15).** `max_positions`'s low bound had been widened `8 → 5` without a study
 bump, so `informed-flow-1d-v15.log` held 4,457 trials that could only reach 8 and 412 that
@@ -528,14 +544,38 @@ v16 closed it. Note what the unified `params:` block can and cannot catch: it co
 config against itself, never against a journal written weeks ago, so **a bound change is
 still only caught by a human bumping the study name**.
 
-**Open issue in v21: nothing has been run in it yet.** The `recency` sleeve plus the
-pinned `min_events` changed both the space *and* the shipped strategy, so v20's 2,500
-trials cannot be read against it and `informed-flow-1d-v21.log` starts empty. Until it is
-run, the shipped `params:` values **are** the strategy — and they are v20's *defaults*,
-not v20's pick. That matters more than usual this time: v20's pick is the parameter set
-that drew `insider_window = 31` / `min_events = 3`, i.e. the one co-adapted to the exit
-channel v21 removes, so it is not a baseline the new strategy can be measured against.
-Re-run the study **and** the four walk-forward folds (§10b·i re-searches per fold, so it
-is the instrument that can actually judge this change) before quoting any tuned number.
-§10b·ii's `w_recency: [0.0, 1.0]` grid column is the out-of-sample vote on whether the new
-sleeve earns its weight — that vote belongs to the folds, never to the holdout.
+**Status (2026-09-12): v21 and v22 have both run — read v22 with three caveats.**
+
+`informed-flow-1d-v21.log` holds 2,500 trials plus four 1,000-trial walk-forward folds, and
+`informed-flow-1d-v22.log` — the space this config ships — holds **1,936** (1,818 complete,
+118 pruned by the 15/yr floor). v22 changed two things at once and is therefore comparable
+with v21 on neither axis: the `max_positions` floor moved `3 → 10` (v20's pick sat at 3, the
+sixth floor-pinned pick in a row) and `max_symbols` moved `100 → 110`, which changes the
+panel *and* the benchmark. The §10b `SLEEVE_KEYS` list also gained `w_recency`, so the fold
+ablation now votes on the recency sleeve. The shipped `params:` values are still config
+defaults, not v22's pick — §7's "Promoting a pick" cell writes a pick back only when run.
+
+| v22 | |
+|---|---|
+| best `info_ratio` | **1.27** (trial 1322, excess **+14.4%/yr**): `insider_window 101`, `rating_halflife 10`, `ptrev_halflife 39`, `w_insider 1.5`, `w_rating 1.25`, `w_ptrev 1.0`, `w_recency 2.5`, `q_in 0.82`, `q_out 0.44`, `max_hold 35`, `max_positions 10`, `displace_margin 0.40` |
+| best `excess_cagr` | **+17.5%/yr** (trial 1344, IR 1.19; `w_insider 0.25`, `w_ptrev 2.75`, otherwise as above) |
+| median trial | IR 0.75, excess +8.4%/yr; 97.6% of complete trials beat buy-and-hold in-sample |
+| Pareto front | 10 rows, **4 distinct outcomes** — the clones differ only in `max_hold` (35–246) and `displace_margin` (0.49–0.90) |
+
+1. **`max_positions` sits on its floor again** — 10, in 100 of the top 100 trials. The
+   study has said "fewer slots" at every floor it was given (30 → 15 → 8 → 5 → 3 → 10),
+   because the edge is monotone in concentration (v15: 8 → 9 → 10 slots gave +27.2 → +17.5
+   → +12.9%/yr). Searching it again will not converge; the honest move is to stop searching
+   it and pin it as a risk policy, like `retrim_k`, with the concentration curve recorded
+   once as the trade-off chosen.
+2. **`max_hold` and `displace_margin` are inert at every good pick** — that is what the
+   clone rows mean — so they only dilute NSGA-II. §10d said the same of `max_hold` on v15.
+3. **`w_recency` took the largest weight in the composite**: 2.5–2.75 in every top-100
+   trial, of a total near 9. The sleeve was added to *replace* the filing-calendar exit
+   cliff; at this weight it can re-create calendar-driven turnover continuously, and the
+   event study behind it found the information gone by bar 63. Run `exit_causes` and
+   compare `trades_per_year` against the v21 pick before promoting it; §10b·ii's `0.0`
+   column is the out-of-sample vote on whether the sleeve earns any weight at all.
+
+Re-run the four walk-forward folds on the v22 space (§10b·i re-searches per fold, so it is
+the instrument that can judge this space) before quoting any tuned number from it.

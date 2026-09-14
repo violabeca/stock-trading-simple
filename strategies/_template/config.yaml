@@ -1,4 +1,4 @@
-# TEMPLATE strategy config — three blocks: data, optuna, params.
+# TEMPLATE strategy config — blocks: data, optuna, backtest (optional), params.
 
 data:                      # which panel the notebook / optimizer loads
   universe: starter        # a name from settings.yaml or universes.yaml
@@ -25,6 +25,12 @@ optuna:
                            # than a long one for the same trading style): trials
                            # trading below this rate are pruned in-objective
                            # (300 fits intraday; ~25 for a daily portfolio-mode strategy)
+
+# Execution rules the engine applies to this strategy AND its benchmark (optional block).
+backtest:
+  fill: open               # open: every order at the next bar's adjusted open (default).
+                           # pessimistic: every buy at that bar's high, every sell at its
+                           # low — a worst-case execution stress. Bump optuna.study on a flip.
 
 # EVERY PARAMETER IS DECLARED ONCE, here — there is no separate sweep or space block:
 #

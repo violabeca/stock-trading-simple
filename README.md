@@ -92,6 +92,8 @@ strategies/
   value_factor/               strategy 8: DAILY cross-sectional value + quality on SEC XBRL fundamentals  (+ notebook)
   conviction_flow/            strategy 9: informed_flow plus selectivity gates (quality, agreement, score floor)  (+ notebook)
   gap_and_go/                 strategy 10: intraday opening-range breakout on overnight gaps  (+ notebook)
+  turnover_momentum/          strategy 11: DAILY short-term momentum conditioned on share turnover  (+ notebook; falsified on this data)
+  momentum_swing/             strategy 12: DAILY Qullamaggie-style breakouts + episodic pivots, ATR stop, SMA trail, regime gate  (+ notebook)
 notebooks/
   01_universe_screener.ipynb  find symbols worth loading
   02_backfill.ipynb           load daily AND intraday price history
@@ -175,6 +177,16 @@ adjusted into one consistent space. Signals computed on bar *t* execute at bar
 *t+1*'s open — never at the price that produced the signal. This "no
 look-ahead" rule is enforced by the engine, not by convention.
 
+**Fill pricing: `open` or `pessimistic`.** Each strategy picks its fill model in
+`config.yaml` (`backtest: {fill: ...}`, default `open`). `open` fills every order at
+the next bar's adjusted open, which is symmetric and neutral. `pessimistic` fills every
+**buy at that bar's high and every sell at its low**: the worst plausible intrabar
+execution. It covers entries, exits, rebalances, retrims and stop legs in every engine
+mode, with costs still charged on top. It answers one question: does the edge survive
+the worst fills, or does it only exist under the open-fill assumption? The benchmark
+always fills the same way as the strategy it is measured against. Flipping the switch
+changes every number, so bump `optuna.study` along with it.
+
 **Costs are always on.** Every backtest charges commission, half the quoted
 spread, and slippage per leg (the `costs:` block in settings). An edge that
 dies from 9 bps of round-trip friction was never an edge.
@@ -249,9 +261,18 @@ cannot *reverse* a position in one order, so an opposite-direction entry closes 
 open position instead (`upon_opposite_entry="close"` in the engine); the new direction
 opens on a later bar if its signal persists.
 
-**The objectives: benchmark-relative, and per year.** Optimization maximizes
-`info_ratio` and `excess_cagr` **together**, both measured against an equal-weight
-buy-and-hold of the same panel. Two traps are being avoided at once. *Absolute* Sharpe
+**The objectives: benchmark-relative, and per year.** Optimization scores two numbers
+**together**, both measured against an equal-weight buy-and-hold of the same panel:
+`excess_cagr` — how much more per year the strategy earns than the benchmark
+(maximized) — and `tracking_error` — how far its daily path strays from the benchmark,
+annualized (minimized). Earning more than the index requires owning something
+different from it, and owning something different is exactly what tracking error
+measures, so the two pull against each other and the front is a real menu: one strategy
+per level of straying, with `info_ratio` (their ratio, still recorded on every trial) at
+the knee. The previous pair, `info_ratio` and `excess_cagr`, was one number in two
+costumes — Spearman 0.975 across informed_flow's v22 trials — and collapsed
+multi-thousand-trial studies to fronts of one or two points. Two traps are being avoided
+at once. *Absolute* Sharpe
 rewards market exposure rather than skill — a long-only strategy in a rising market
 earns one just by being invested. And a *cumulative* excess return rewards a long
 backtest for being long: it can compare neither two strategies (windows here run from
@@ -266,7 +287,16 @@ reduces it to one row (and `optimize.pick_best(study)` does the same from a stud
 under `optimize.PICK_WEIGHTS` — **one balanced preference for the whole repo**, because
 this used to be a per-notebook literal and drifted into three different answers, one of
 them arguing from the pre-v5 objectives. Pass `weights=` explicitly if a strategy needs
-a different trade-off, and say why at the call site.
+a different trade-off, and say why at the call site. The pick only ever chooses a front
+row that **beats buy-and-hold** (`excess_cagr > optimize.MIN_PICK_EXCESS`, i.e. > 0):
+minimizing tracking error puts index-huggers that earn nothing at the low end of the
+front, and they stay visible there but are never picked. If no row qualifies, the pick
+falls back to the whole front and flags it (`beats_benchmark = False`).
+
+Each study is **stamped with the objectives it was scored on**. A journal stores its
+values by position only, so an old `(info_ratio, excess_cagr)` journal read under today's
+labels would silently present every information ratio as an excess return;
+`optimize.load_study` / `run_study` refuse such a journal instead — bump `optuna.study`.
 
 Both first collapse the front with `optimize.distinct_front`, which keeps one row per
 distinct *objective pair*. This is not cosmetic: an **inert** parameter — one that cannot
@@ -283,7 +313,7 @@ and re-run. Beware: more trials on the same data = more chances to overfit; judg
 on `pct_profitable` (breadth across symbols), on the Deflated Sharpe Ratio, and on
 held-out data. A per-strategy `optuna.min_trades_per_year` floor prunes trials
 trading below that rate, in-objective — a handful of lucky fills can post a
-spectacular `info_ratio`, and the floor keeps such artifacts off the front entirely.
+spectacular `excess_cagr`, and the floor keeps such artifacts off the front entirely.
 It is a **rate**, not an absolute trade count: an absolute floor is implicitly far
 stricter on a short backtest window than a long one for the identical trading style
 — and unstable for a strategy with an open-ended `end: null` window, since the
@@ -309,7 +339,7 @@ so their numbers can sit in one table (`notebooks/04_compare.ipynb`):
 5. **The hurdle is a strategy you can run.** `strategies/baseline/` is the
    equal-weight buy-and-hold of a universe, expressed through the normal strategy
    contract and pinned by a test to the engine's internal `backtest.benchmark()`.
-   The objectives (`excess_cagr`, `info_ratio`) measure distance to it on the
+   `excess_cagr`, `info_ratio` and `tracking_error` measure distance to it on the
    strategy's own panel; zero = "you could have just bought everything".
 6. **Every strategy notebook shows the baseline comparison** (equity overlay +
    `active_stats`), and every new strategy inherits all of the above via
@@ -372,8 +402,9 @@ through exactly this recipe with a validation gate at the end.
 * **Global** (`config/settings.yaml`): database, IBKR connection/pacing,
   trading costs, engine choice, per-symbol exchange overrides, hand-edited
   universes. Every key maps 1:1 onto `src/trading_simple/config.py`.
-* **Per strategy** (`strategies/<name>/config.yaml`): three blocks —
-  `data` (which panel to load), `optuna` (study name, sampler, trials), and
+* **Per strategy** (`strategies/<name>/config.yaml`): `data` (which panel to
+  load), `optuna` (study name, sampler, trials), an optional `backtest` block
+  (`fill: open | pessimistic`, see *Fill pricing*), and
   `params`, where each parameter is declared **once** with its `doc`, its shipped
   `value`, and optionally the `search` range and `grid` list it varies over.
   There is no separate sweep or space block: a knob's shipped value and the

@@ -100,6 +100,19 @@ def test_typo_in_an_entry_key_is_rejected(probe_dir):
         strategies.load("probe")
 
 
+def test_backtest_block_selects_the_fill_and_rejects_typos(probe_dir):
+    """`backtest.fill` defaults to open; a misspelt key or model fails at load, not silently."""
+    cfg = _write(probe_dir, "  window: 20\n") / "config.yaml"
+    base = cfg.read_text()
+    assert strategies.load("probe").fill == "open"                  # no block -> default
+    cfg.write_text(base + "backtest:\n  fill: pessimistic\n")
+    assert strategies.load("probe").fill == "pessimistic"
+    for bad in ("backtest:\n  fill: worst\n", "backtest:\n  fil: pessimistic\n"):
+        cfg.write_text(base + bad)
+        with pytest.raises(ValueError, match="backtest"):
+            strategies.load("probe")
+
+
 @pytest.mark.parametrize("name", strategies.available())
 def test_every_shipped_config_satisfies_its_own_invariants(name):
     """Every strategy in the repo — the check that keeps the fleet aligned, not just one.
