@@ -23,7 +23,10 @@ ibkr:
   host: 127.0.0.1
   port: 4002
   client_id: 1
-  max_requests_per_10min: 55   # IBKR account-wide cap is ~60/10min; stay under it
+  max_requests_per_10min: 80   # IBKR's documented cap is ~60/10min; a 65-request live
+                                # test on 2026-09-29 hit no pacing violation, but 80 is
+                                # untested and above even that -- watch for Error 420/162
+                                # "pacing violation" messages if the sweep starts erroring
   pace_seconds: 0.5
   extended_hours: false
 
@@ -49,3 +52,10 @@ exchanges: {}
 # config/universes.yaml, which is merged in on top of this map.
 universe:
   starter: [AAPL, MSFT, NVDA, JPM, XOM, GLD, SLV, SPY]
+  # Morning200's ten most liquid names by its own point-in-time ranking: median daily dollar
+  # volume over 2025-01..06, a window that closes before the 1m backtest opens (2025-07-01;
+  # notebooks/01_universe_screener.ipynb §8). Stored here in rank order (trend_following_1m).
+  Morning10: [HOOD, MU, COIN, SMCI, INTC, ORCL, GS, NOW, MRVL, SPOT]
+  # The direction study's five names (strategies/burst_scan/DIRECTION_REPORT.md): liquid, with 1m
+  # bars from 2025-06-18 and free options data (burst_scan/options_free_data.ipynb). darts_forecast.
+  DirectionFive: [MU, COIN, CSCO, AAL, ANET]

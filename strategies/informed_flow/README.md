@@ -7,6 +7,16 @@ first **alternative-data** strategy and its first **daily cross-sectional
 ranker**: each day it scores every name in a liquid universe on what insiders,
 analysts, and short sellers are doing, and holds the top-ranked names long.
 
+> **What ships today (v27, 2026-09-19).** Two of the five sleeves below carry the ranking, at
+> fixed equal weights: **short interest** and **analyst rating changes**. Insider buying,
+> price-target revisions and recency are still built (`strategy.py` is unchanged) but ship at
+> weight `0.0`: on **beta-adjusted** forward returns they carry no information in this large-cap
+> universe — analyst news is priced on the day it appears, `recency` is direction-blind, and the
+> insider table is 96% sells. The measurement, the data defects found along the way and the v26
+> result that prompted it are under **Status (2026-09-19)** near the end. The book is 30 slots,
+> sold when a name leaves the top fifth of the ranking, scored with open fills and the commission
+> priced at the real order size; **one** knob (`q_out`) is searched, on **one** objective.
+
 - **Corporate insiders (SEC Form 4).** Open-market insider *buys* are the
   single best-replicated alt-data signal (Cohen-Malloy-Pomorski 2012:
   opportunistic buys ~82 bp/mo; Lakonishok-Lee 2001: buys informative, sells
@@ -123,19 +133,19 @@ its verdict):
 
 | param | shipped | meaning |
 |---|---|---|
-| `insider_window` | 63 | trailing bars for insider dollars, the dollar-volume normalizer, and eligibility — **triple duty**, so a pick here is not a clean statement about the insider horizon |
-| `rating_halflife` | 21 | EMA half-life (bars) for the rating-change stream |
-| `ptrev_halflife` | 21 | EMA half-life (bars) for the price-target revision stream |
-| `w_insider` / `w_rating` / `w_ptrev` / `w_dtc` | 1.0 / 1.0 / 0.5 / 1.0 | composite weights; only their ratios matter, `w_dtc` is the fixed numeraire. A weight of 0 (grid only — the search floors at 0.25), or a missing feature, ablates that signal |
-| `w_recency` | 1.0 | weight on the coverage-recency sleeve (bars since the last insider/rating event, negated). It has **no window of its own**, so staleness is decoupled from `insider_window` |
+| `insider_window` | 126 | trailing bars for insider dollars, the dollar-volume normalizer, and eligibility — **triple duty**. Pinned since v27: with `w_insider` at 0 only the eligibility job is left ("any insider or rating event in ~6 months" ranks ~473 of 500 names a day) |
+| `rating_halflife` | 21 | EMA half-life (bars) for the rating-change stream. Pinned since v27 — measured inert: half-lives 5 / 21 / 63 give the same beta-adjusted IC |
+| `ptrev_halflife` | 21 | EMA half-life (bars) for the price-target revision stream (sleeve off) |
+| `w_insider` / `w_rating` / `w_ptrev` / `w_dtc` | 0.0 / 1.0 / 0.0 / 1.0 | composite weights; only their ratios matter, `w_dtc` is the fixed numeraire. A weight of 0, or a missing feature, ablates that signal. **None is searched since v27**: which sleeves exist is decided by a pre-registered rule on beta-adjusted IC (see **Status (2026-09-19)**), re-read by the diagnostics notebook §2a on every run |
+| `w_recency` | 0.0 | weight on the coverage-recency sleeve (bars since the last insider/rating event, negated). It has **no window of its own**, so staleness is decoupled from `insider_window`. Off since v27: it is direction-blind and its IC is zero at 5–63 bars |
 | `trend_fast` / `trend_slow` | 21 / 126 | fast / slow MA legs (bars) of the price-derived MA-trend crossover sleeve (`valid()` requires `trend_fast < trend_slow`) |
 | `rsi_period` | 14 | Wilder-RSI lookback (bars) for the RSI market-condition sleeve |
-| `w_trend` / `w_rsi` | 0.0 / 0.0 | weights on the MA-trend and RSI sleeves — **off by default and unsearched** (ablation measured ~zero holdout effect); the sweep grid still tests `1.0` |
-| `q_in` / `q_out` | 0.75 / 0.45 | qualify above `q_in`, sell below `q_out` (hysteresis band). Both v13 and v14 converged on exactly this pair from opposite sleeve mixes |
-| `max_hold` | 126 | time-stop backstop (bars) — see below; it only bites in the band |
+| `w_trend` / `w_rsi` | 0.0 / 0.0 | weights on the MA-trend and RSI sleeves — **off by default and unsearched** (ablation measured ~zero holdout effect) |
+| `q_in` / `q_out` | 0.90 / 0.80 | qualify above `q_in`, sell below `q_out` (hysteresis band). v13, v14 and the whole v26 front sat near 0.75 / 0.45 — but those studies paid pessimistic fills (~1% per leg), which makes "never sell" optimal whatever the signal says. Measured directly, only the **top fifth** of the ranking pays, so the band now sits there. `q_out` is **the one searched knob** (0.60–0.85); `q_in` is pinned |
+| `max_hold` | 126 | time-stop backstop (bars) — see below; it only bites in the band. Pinned since v27 |
 | `min_events` | 1 | eligibility floor: insider/rating event days in the window. Below it, a name is dropped from the ranking. **Pinned, not searched** — see below |
-| `max_positions` | 15 | slots in the book. Each is a fixed `1/max_positions` of the capital, so fewer names qualifying means idle cash, never a concentrated bet. The search floor is 10, and every study so far has picked its floor — see **Status** below |
-| `displace_margin` | 1.0 | when the book is full, how far a challenger must out-rank the weakest holding to take its slot (one rank place in ~91 names ≈ 0.011). `0.0` evicts on any epsilon; `1.0` is unreachable, so every newcomer waits for a vacancy. One axis, no separate on/off flag — see below |
+| `max_positions` | 30 | slots in the book. Each is a fixed `1/max_positions` of the capital, so fewer names qualifying means idle cash, never a concentrated bet. **Pinned as a risk policy** (every study that searched it picked its floor). 30 since v27: still the top 6% of ~470 ranked names, the same return per name as the top 15 on train, about half the name-specific luck. `backtest.order_notional` is `account / max_positions` — change them together |
+| `displace_margin` | 1.0 | when the book is full, how far a challenger must out-rank the weakest holding to take its slot (one rank place in ~470 names ≈ 0.002). `0.0` evicts on any epsilon; `1.0` is unreachable, so every newcomer waits for a vacancy. One axis, no separate on/off flag — see below. Pinned since v27 |
 | `retrim_k` | 2.0 | concentration cap: a held name that grows to `retrim_k ×` its slot is trimmed back to it. Fixed policy, never searched — see below |
 
 **What `max_hold` is actually for.** It is the least load-bearing parameter here, and
@@ -271,13 +281,16 @@ removal. **Run study v21 and the four walk-forward folds before quoting any numb
 
 **Data.** `data.features: [insider, ratings, price_target, short_interest]` attaches
 the alt-data matrices to the panel at load time. Populate them by running
-**`notebooks/03_altdata_update.ipynb`** — that notebook is the single entry point for
-alt-data ingestion, incremental *and* historic (`MODE = "backfill"`), and it carries
+**`notebooks/03_altdata_update.py`** (marimo) — that notebook is the single entry point for
+alt-data ingestion (every run fetches only what each name is missing), and it carries
 the coverage audit. Alt-data is ingested from 2018 (the coverage ledger's `covered_from`)
-and the strategy **trains on 2018–2024** (`data.start` / `data.end`) over the
-`max_symbols: 110` best-covered LiquidLeaders names; ingestion depth and the train window
-are separate knobs, so narrowing the window later (to skip the 2020 regime, say) is a
-one-line config change, not a re-ingestion. Read the DSR and the sub-period table before
+and the strategy **loads 2018–2024** (`data.start` / `data.end`) but is **scored only from
+2020-07-01** (`optuna.score_from`), over the 500 names of `Liquid500` — a point-in-time
+universe ranked on 2020-H1 dollar volume, so nothing is scored before its membership was
+knowable. (Until v25 it was the 110 best-covered `LiquidLeaders` names, screened on *today's*
+liquidity: the book ranked among ex-post winners.) The 2018–2020 bars only warm the rolling
+windows. Ingestion depth, the load window and the scored window are separate knobs, so moving
+the scored start is a one-line config change, not a re-ingestion. Read the DSR and the sub-period table before
 believing a headline number.
 
 **A missing sleeve is dropped, and so is a *thin* one.** A signal is used only if its
@@ -287,8 +300,22 @@ not decoration. Without it, a barely-ingested table still passes a naive "any da
 check: the handful of covered names get real percentile ranks while everyone else
 takes the neutral `.fillna(0.5)`, so the sleeve silently becomes a large arbitrary
 tilt on those few names and pure noise for the rest. This shipped for real —
-`short_interest` once covered 3 of 100 names — which is why `03_altdata_update.ipynb`
+`short_interest` once covered 3 of 100 names — which is why `03_altdata_update.py`
 now audits breadth and depth, not just freshness.
+
+**The floor holds bar by bar, and a stale level expires.** Breadth on a sleeve's best bar is
+not breadth on every bar. From the 2026-07-15 settlement on, short interest stopped being
+ingested for 395 of `Liquid500`'s names (the ingestion notebook defaulted to `LiquidLeaders`),
+and they ranked on their 2026-06-30 days-to-cover for months with no error anywhere. Now
+`features.py` masks a short-interest level older than 45 days (`_SI_MAX_AGE_DAYS`; no two FINRA
+dissemination dates were ever more than 19 days apart), and `strategy._sleeve_rank` silences a
+sleeve on any bar where it covers less than half the universe — so a stale table becomes a
+silent sleeve (and, if it was the only one, cash), never a tilt toward the names still covered.
+The cap also removed a historical defect: FINRA reports by ticker, and six names inherited a
+different company's short interest across a rename (Weight Watchers' days-to-cover sat on WTW
+for 1,005 days, CoreSite's on COR for 624, Genesis Healthcare's on GEN for 610). Re-scored with
+both changes, v31's train alpha moves +10.08% → +10.28% (570 → 567 trades); every v31 number
+above predates them.
 
 **Troubleshooting the buckets — why is this name in (or out)?**
 
@@ -406,41 +433,52 @@ the weakest holding, and by how clear a margin — and is *searched*, not assume
 concentration argues for chasing the top of the ranking and turnover costs argue against
 it. Which of the two wins turns out to depend on `max_positions`; see the table above.
 
-One honest caveat: with fractional shares the whole model is scale-invariant, so the
-`init_cash` figure is a **reporting convention, not a constraint**. $10,000 and
-$1,000,000 give identical returns. What actually binds is the shared pot and the slot
-count.
+One honest caveat: with fractional shares the simulation is scale-invariant, so the
+`init_cash` figure is a **reporting convention, not a constraint** — $10,000 and
+$1,000,000 give identical returns. **Real trading is not scale-invariant**, because of the $1
+minimum commission: the engine spreads it over a $10,000 order by default (1 bp per leg), but a
+30-slot book on a $30k account places $1,000 orders, where it is 10 bp. `config.yaml` therefore
+declares `backtest.order_notional: 1000` (account ÷ slots), and the diagnostics notebook re-prices
+it for the `ACCOUNT` you set there. (The v26 overlay pick placed 400+ orders a year of $70–670;
+the backtest reported $19 of fees where a real $10k account would have paid ~$350.)
 
 **And check the signal before the backtest.** The diagnostics notebook's §2a (train) and §5b
-(holdout) measure the ranking directly, with
-the engine out of the way: the rank information coefficient and the top-minus-bottom
-decile spread against *cross-sectionally demeaned* forward returns. Demeaning removes
-the market, so what is left is stock selection and nothing else. It runs in seconds,
-it is scored per sleeve, and a sleeve with a negative decile spread is not merely
-useless — it is dragging the composite the wrong way.
+(holdout) measure the ranking directly, with the engine out of the way, per sleeve: the rank
+information coefficient, and the forward return of the top `max_positions` names. One trap, which
+this README used to fall into: a Spearman rank-IC **does not change** when the market's average is
+subtracted, so "cross-sectionally demeaned" removes nothing from it — a ranking that merely leans
+toward high-beta names looks skilled in a rising market (a pure-beta ranking scores ≈ +0.02 when
+the market rises 20%/yr). The **fair check** therefore removes each name's trailing beta times the
+market's forward return, and reads the IC per calendar year, inside three dollar-volume groups,
+and by fifth of the ranking — a long-only book can only use information that sits at the top. Its
+composite row is the **signal rule**, a hard gate, and the rule that decided which sleeves ship.
 
 **Backtest honestly — two notebooks, two jobs.** Training runs 2018–2024 (`data.start` /
-`data.end`) and 2025+ is an untouched holdout.
+`data.end`, scored from 2020-07) and 2025+ is the holdout — **not untouched**: it has been read
+under eight study versions (v13 → v26) and design changes followed those reads, so everything
+measured on it alone is a *warning* in the verdict, not a gate.
 
 - **`informed_flow.ipynb` optimizes, on the training panel only** (it never loads the
-  holdout). It runs the study, reads the Pareto front, checks the search bounds, shows the
-  pick against buy-and-hold, and saves every distinct admissible front row to
-  `studies/<study>.candidates.yaml`.
-- **`informed_flow_diagnostics.ipynb` decides what ships.** Set `CANDIDATES` (`"pick"`, any
-  trial numbers from that file, `"config"`) and it compares them side by side:
-  - rank IC per sleeve;
-  - costs and pessimistic fills;
-  - year by year;
-  - the deflated Sharpe over the study;
-  - parameter-neighbourhood stability;
-  - a random-entry baseline;
-  - a 4-period walk-forward that re-optimizes per period, with every candidate also scored on
-    each period;
-  - ablations of recency and the risk methods on each period's own pick;
-  - the warm holdout.
+  holdout). It tops the study up to `optuna.n_trials` and never past it, draws the whole study
+  as one curve (alpha against `q_out`), picks with `opt.pick_from_front` among all admissible
+  trials, checks the search bounds, shows the pick against buy-and-hold, and saves the best
+  distinct admissible trials to `studies/<study>.candidates.yaml`.
+- **`informed_flow_diagnostics.ipynb` decides what ships.** `CANDIDATES` defaults to
+  `["pick", "config"]` — the tuned pick beside the **no-tuning control** — and it compares them:
+  - plain rank IC per sleeve, then the **fair check** (beta-adjusted, per year, per dollar-volume
+    group, by fifth) and whether the book holds what the ranking likes;
+  - costs at the real order size, 2× costs, and pessimistic fills as a stress row;
+  - year by year; parameter-neighbourhood stability; concentration;
+  - symbol-shuffled books on train (information) **and on the holdout window** (a gate; shuffled
+    freely and within dollar-volume thirds);
+  - a walk-forward that re-runs the study every six months from 2022 to the last bar, each
+    period's panel loaded on its own window, stitched into one out-of-sample record — beside the
+    no-tuning control, and with "ratings off" and "sell threshold 0.47" re-scored per period;
+  - the warm holdout, as warnings.
 
-  All of it ends in one **verdict scoreboard** of pass/fail gates. Only a candidate that
-  passes can be promoted into `config.yaml` without `FORCE`.
+  All of it ends in one **verdict scoreboard** ordered by three questions — is there skill, is it
+  worth the risk, can it be run. Only a candidate that passes can be promoted into `config.yaml`
+  without `FORCE`, and a PASS is a reason to paper-trade, not to fund.
 
 Report `n_trades` beside every Sharpe.
 
@@ -593,6 +631,307 @@ only what runs today.)
 | v22 | two changes at once: the `max_positions` low bound `3 → 10` (so the floor is a book, not a bet) **and** `max_symbols` `100 → 110` — a different panel and therefore a different benchmark. 1,936 trials run 2026-09-12; the pick again sits on the `max_positions` floor (see **Status** below) | v21 ↔ v22 **no** (space *and* panel differ) |
 | v23 | same space and panel as v22; the **engine's objectives** changed from `info_ratio` ↑ / `excess_cagr` ↑ (Spearman 0.975 across v22's trials — a 2-point front) to `excess_cagr` ↑ / `tracking_error` ↓, and the pick only chooses front rows beating buy-and-hold. The engine refuses to load the v22 journal under the new labels | **no** (different objectives) |
 | v24 | three v23 bounds that the front was pressing on: the alt-data sleeve weights (`w_insider`, `w_rating`, `w_ptrev`, `w_recency`) may reach **0.0** (were floored at 0.25, which forced the negative-IC insider sleeve and a floor-pinned `w_ptrev` into every pick), `rating_halflife` high `90 → 180` (52% of the front sat at 90), `max_hold` low `21 → 10` (44% sat at 21). **Plus, before v24 ever ran:** the **risk overlay** (`risk_method` none / cash_switch / vol_target, searched with `risk_off_exposure` and `target_vol`); the engine objectives `excess_cagr` ↑ / **`volatility`** ↓ (were `tracking_error` ↓); and warm-start (`score_from`) scoring for every holdout and walk-forward test window | **no** (space, objectives and OOS scoring differ) |
+| v25 | the objective became `excess_cagr` **alone** (volatility commented out) and the risk-overlay searches were commented out, with no entry here. The one-trial front picked a 5-slot book trading 16.7/yr — below the 20/yr picking floor, through a silent fallback. Train excess +23.4%/yr at beta 1.32; **holdout** excess +10.1%/yr at beta **2.11**, volatility 46% vs buy-and-hold's 18%, alpha after beta **−34.6%/yr**, composite rank-IC ≈ 0. Verdict FAIL on 4 gates — and three gates it passed were broken (IDEAS.md, "Assessment 2026-09-15") | **no** (one objective) |
+| v26 | four changes at once: objectives **`[alpha_cagr, volatility]`**; universe `LiquidLeaders` → point-in-time **`Liquid500`** (a new panel and benchmark); every trial scored from **2020-07-01** (`optuna.score_from`, the first bar after the universe's ranking window); the risk overlay searched again, `max_positions` **pinned** at 15. The diagnostics notebook was rebuilt alongside (bootstrap intervals, a stitched walk-forward, a symbol-shuffled random baseline, beta/drawdown/IC gates) | **no** (objectives, universe and window all differ) |
+| v27 | the 2026-09-19 redesign, every axis at once: **one objective** (`alpha_cagr`; the `volatility` objective had turned v26's front into an exposure dial), **one searched knob** (`q_out` 0.60–0.85; everything else pinned), sampler `random` with a budget of **40** trials that is never topped up, **two sleeves** at fixed equal weights (`short_interest`, `ratings`; the other three at 0 by a pre-registered rule on beta-adjusted IC), the risk overlay pinned off, **30 slots**, `q_in 0.90 / q_out 0.80`, **open fills** (pessimistic is now a stress row) and the commission priced at the real order size (`backtest.order_notional: 1000`, a new engine key). The diagnostics gates were rebuilt alongside (signal rule, shuffled books on unseen data, walk-forward to the last bar with a no-tuning control, completed holds not lots, holdout-only numbers and risk limits as warnings, deflated Sharpe removed) | **no** (objective, space, sleeves, slots, fills and costs all differ) |
+| v28 | **nothing is searched**: `q_out` pinned at its pre-registered 0.80 (v27's refit picks beat the untuned config in 2 of 9 walk-forward periods), `n_trials: 1`. The strategy that ships is v27's `config` candidate, unchanged; what changed is the **instrument**: the walk-forward re-reads the sleeve-selection rule inside every period (v27's had seen its 2022–2024 test periods when it chose the sleeves), and the stability table works again | v27 `config` ↔ v28 **yes** (same rules); journals no (different space) |
+| v29 – v31 | one change each, adoption rule written in IDEAS.md before each run. **v29**: measurement only (the road from the v26 pick and flip-back arms, a naive 50-most-traded basket, shuffled books over the whole walk-forward, SPY, a `SCORECARD` line). **v30**: universe `Liquid500` → `Liquid1000` — **rejected** (rule arm P(alpha > 0) 92% → 75%). **v31**: `neutral_groups: 5` — every sleeve ranked inside dollar-volume fifths, adopted on train evidence alone | v28 ↔ v29 **yes** (same rules); v30, v31 **no** (universe / ranking differ) |
+| v32 | **`short_interest` alone** (`w_rating: 0.0`): the sleeve rule's t bar rises 2 → **3**, a walk-forward period in which no sleeve passes holds the **equal-weight universe** (was cash), and the holdout shuffle gate becomes a warning. Instrument added at the same time: the late-fill (+50 bp/leg) and whole-share gates (blockers 2 and 3), §5e (is the open fillable?), and repaired data (a 45-day short-interest max age, a per-bar coverage floor, every traded universe re-ingested). **PASS**: rule arm alpha +6.4% (P 98%), 0% of shuffles ≥ real; t ≥ 3 left 2022-H1/H2 on buy & hold (1.5-2 years of history) and the calendar-year test left 2023-H2 there | **no** (sleeves, rule, fallback and data all differ) |
+| v33 | the rule's calendar-year test "IC > 0 in ≥ 80% of years" → "**no full year with IC t < −2**". Same shipped strategy. **PASS**, adopted by its pre-registered rule (v32's test had locked `short_interest` out of 2023-H2): 6/9 full periods positive (was 5/9), stitched alpha unchanged at +6.4% | v32 ↔ v33 **yes** (same strategy; instrument only) |
+| v34 | **`dtc_window: 42`** — the short-interest sleeve ranks days-to-cover AVERAGED over the last 42 bars (~4 FINRA settlements) instead of the latest one. Chosen on TRAIN (IC rises 0.046 → 0.055 with the window, top-decile churn halves); change-in-short-interest measured ≈ 0 and dropped. **PASS**, adopted under the protocol's execution-robustness clause: rule arm +7.9% (P 98%, 7/9 periods), completed holds 153 → 47/yr, break-even round trip 110 → 451 bp, train alpha under late fills +0.2% → +6.4% and under pessimistic fills −8.8% → +3.6%. Paired vs v33: rule arm Δ +1.6% (P 67%) — mostly the rule passing short interest one period earlier (2022-H2) — and fixed rules Δ −0.2% (P 46%): the smoothing adds robustness, not return. Holdout alpha +7.3% → +3.4% | **no** (the signal differs) |
+| v35 | two changes kept apart. **(a) data integrity (always adopted):** short-interest rows filed under a ticker that then belonged to ANOTHER issuer are dropped (`features._SI_OTHER_ISSUER`: BNY was a municipal fund at FINRA's 1.00 floor until 2026-05, B, DOC, COR, GEN, META, WTW, COHR; CZR, IR and HHH added after the run by a code review), and SPY/GLD/SLV leave Liquid500/Liquid1000 (497/997 names). Size: v34's rules on clean data read walk-forward alpha **+7.1%** (P 97%) against the +7.9% v34 recorded, holdout +3.4% → +0.9%: the wrong-company rows (mostly BNY) had flattered the out-of-sample record. **(b) the first real optimization:** an EXHAUSTIVE grid over `dtc_window` [1 … 126] (8 points), re-run inside every walk-forward period. The main study and all nine re-runs picked **126** (the grid edge; train +13.2% vs +8.6-9.7% for 21-84: a jump, not a plateau); re-tuned vs pinned 42: **+2.2 pts/yr, P 83%, 6/9 periods**, train late-fill alpha +12.1%. Adopted by v35's own pre-registered rule, flagged UNCONFIRMED under protocol v2 (P < 0.971); pinned at 126 | **no** (data and universe differ) |
+| v36 | **the walk-forward trades a point-in-time universe re-formed every six months** (`WF_UNIVERSE = "rolling"`: Liquid500's own recipe on the 6 months before each period — by 2026 only 357 of the live top 500 are Liquid500 names), prices and alt-data refreshed for the 258 new pool names first. **FAIL (3 gates) — an instrument defect, found and measured:** each period's sleeve rule read its IC on names chosen by liquidity at the END of the training window, a forward selection that hides short interest (heavily shorted names that later surged are exactly the ones that became liquid). On 2020-07 → 2023-12 the IC reads **+0.022 (t 1.7) on end-selected names, +0.057 (t 5.2) point in time, +0.058 (t 4.6) on the fixed Liquid500**; the rule passed short interest in 3/10 periods and the rule arm fell to −2.2%. The book itself was fine: **fixed rules on the rolling universe +12.4% alpha (P 97%, CAGR +23.8% vs +9.6%)**, PRIMARY Δ vs the fixed Liquid500 −0.0% (P 50%) — the universe does not change what the signal earns. Fixed in v37 | **no** (universe differs) |
+| v37 | three things. **(1) instrument fix:** a rolling period's sleeve rule now reads its IC point in time (the union of every past membership, each name counted only on the dates it was a member). **(2) data fix (always adopted):** the recovered companies' own FINRA rows under their old tickers are mapped to today's (`features._SI_PREDECESSOR`: BK→BNY, FB→META, GOLD→B from 2019-01, PEAK→DOC, ABC→COR, SYMC/NLOK→GEN, WLTW→WTW, IIVI→COHR, FI→FISV, ERI→CZR, GDI→IR; each checked at FINRA-ADV ÷ own volume ≈ 1.00). Train alpha −1.8 pts: correct data costs flattery. **(3) `min_events: 0` (class R): REJECTED** — fixed rules Δ −1.1 pts (P 31%), 2025+ −1.8, train −4.8: the names the event gate kept out are mostly interlisted/ADRs whose FINRA short interest covers only the US line, so their days-to-cover reads falsely low and they rank top. On the corrected rolling instrument the rule picks short interest 8/10 but also `ratings` in three early periods (2023-H1: −21%); rule arm +2.8% (P 67%) — **FAIL (2 gates)**, for the incumbent too (≈ +5.7%). Fixed short-interest book on the rolling universe: **+11.2% (P 95%), CAGR +22.5% vs +9.6%**, beta 1.17 (1.6-2.3 in 2025-26) | **no** |
+| v38 | `max_positions: 30 → 20` (class A, judged on its mechanism under the amendment fixed before it ran). **REJECTED:** fixed rules Δ +0.7 pts (P 59%; needs 80%), 2025+ −2.7, leave-top-5-out +2.9 → +0.9 (the gain was a handful of winners: AMD, NVDA, OKLO, SNDK …), 18 completed holds a year (gate 20), holdout −3.5% (warning). Train +0.6. Fewer slots bought more lottery tickets, not more skill — the book stays at 30 | **no** |
+| v39 | the final confirmation: the adopted chain (short interest alone, days-to-cover over 126 bars, 30 slots, `min_events: 1`) on the rolling universe with 500 + 500 shuffled books; baseline = v33's rules on the fixed Liquid500 (clean data). **FAIL (1 gate: the procedure's P(alpha > 0) 83% < 90%)**, every other gate passes: procedure +5.6% (1% of 500 shuffles ≥ real), fixed book **+12.3% (P 97%), CAGR +23.4% vs +9.6% (SPY +12.0%)**, late fills +10.7%, whole shares +11.2%, pessimistic fills +7.4%; whole night paired: fixed rules +5.8 pts (P 82%), with late fills +9.8 (P 95%) | **no** (rolling universe) |
+| v40 | **replication of v35(b):** the shipped `dtc_window: 126` against the a-priori 42 on the ROLLING point-in-time universe (143 of its 500 names by 2026 are not Liquid500). Pre-registered before v39's numbers were read: confirm at P(PRIMARY > 0) ≥ 0.80 and P(CLEAN > 0) ≥ 0.50, revert below 0.50. Result: fixed rules **−0.1 pt (P 0.4965)**, 2025+ −2.4 (P 38%), the procedure −3.2 (P 16%), leave-top-5-out −3.0 → +1.0; train +3.9. **REVERTED to 42** — the longer average won only on the data it was picked on. Config study → v41 (the revert; not yet run) | **no** |
+| v41 | the final confirmation of what SHIPS after v40's revert (short interest alone, days-to-cover over 42 bars, 30 slots, `min_events: 1`), rolling universe, 500 + 500 shuffles, baseline = v33's rules on the fixed Liquid500. **PASS — every hard gate:** procedure alpha **+8.8% (P 94%, 7/9 periods)**, CAGR +19.7% vs +9.6% (SPY +12.0%), 0 of 500 shuffles ≥ real; fixed book +12.4% (P 98%), CAGR +23.3%. Whole night paired: fixed rules +5.9 pts (P 86%), late fills +9.5 (P 97%), leave-top-5-out +6.2 → +2.1. Warnings: holdout (fixed Liquid500) alpha +1.4%; the last partial period (2026-07 → 09) alpha −41% at beta 2.1 | **no** |
+
+**Status (2026-09-24): v32 → v40 in one night — what earned what, out of sample.** One change per
+version, each pre-registered in IDEAS.md before it ran; from v34 each version is compared PAIRED with the
+last adopted one inside the same walk-forward (§4d). Since v36 the walk-forward trades a point-in-time
+top 500 re-formed every six months (what a live book could have traded); the old fixed `Liquid500` is
+reported beside it.
+
+**What ships** (`config.yaml`, study v41 — **PASS**, every hard gate, 2026-09-26): `short_interest` alone, days-to-cover averaged over **42** bars, ranked
+inside five dollar-volume groups, 30 equal slots, buy in the top tenth / sell below the top fifth,
+market-on-open orders. Nothing is searched.
+
+| the final confirmation (v39, run with `dtc_window 126`; 42 differs by v40's row below) — walk-forward 2022-01 → 2026-09 on the ROLLING universe | result |
+|---|---|
+| the book (fixed rules): CAGR · buy-and-hold · SPY | **+23.4%/yr** · +9.6% · +12.0% |
+| … alpha after beta (P > 0) · beta · return ÷ vol | **+12.3%** (97%) · 1.15 · 0.92 vs 0.50 |
+| … with every order 50 bp worse than the open · whole shares at $30k · buy-high/sell-low | +10.7% · +11.2% · +7.4% |
+| the full procedure (sleeves re-read every six months) | +5.6% (P 83% — the one FAILED gate, bar 90%) |
+| … against 500 symbol-shuffled books inside liquidity tenths | 1% ≥ real (real − mean +7.6 pts) |
+| the whole night, paired: v39 vs v33's rules on the fixed Liquid500, same days | fixed rules **+5.8 pts/yr (P 82%, 7/9 periods)**; with late fills **+9.8 (P 95%)**; 2025+ +9.6; leave-top-5-out +3.3 → +3.0 |
+| holdout 2025-01 → 2026-09 (fixed Liquid500, a warning) | CAGR +26.1% vs +18.8%, alpha +3.9% (P 68%), max DD −20.9%, commission 0.23%/yr |
+| train (2020-07 → 2024-12) | alpha +11.1%, break-even round trip 895 bp (v32: 110), 30 completed holds a year |
+
+**Which change earned what (paired, out of sample).**
+
+| version | change | out-of-sample effect | decision |
+|---|---|---|---|
+| v32 | `short_interest` alone, sleeve bar t ≥ 3, buy & hold when nothing passes | rule arm +4.0% (v31) → +6.4%: `ratings` had flipped in and out | adopted |
+| v33 | "no bad full year" instead of "80% of years positive" | +0.0 alpha, 6/9 periods (was 5/9) | adopted — a sounder rule, not a gain |
+| v34 | days-to-cover averaged over 42 bars | fixed rules −0.2 (P 46%), but trading −70% and late-fill train alpha +0.2 → +6.4% | adopted for execution robustness |
+| v35 | (a) wrong-company FINRA rows dropped; (b) exhaustive grid → 126 bars | (a) the old data had FLATTERED the record by ~0.8 pts; (b) +2.2 pts (P 83%) | (a) always; (b) adopted, unconfirmed → v40 |
+| v36 | rolling point-in-time universe | fixed rules −0.0 vs Liquid500 (P 50%): the universe does not change what the signal earns | adopted as the instrument; its rule read IC on end-selected names (a defect, fixed in v37) |
+| v37 | (a) point-in-time rule reading; (b) predecessor tickers' data; (c) `min_events: 0` | (c) fixed rules −1.1 (P 31%), train −4.8 | (a), (b) always; (c) REJECTED |
+| v38 | 20 slots instead of 30 | fixed rules +0.7 (P 59%), 2025+ −2.7, leave-top-5-out +2.9 → +0.9 | REJECTED |
+| v39 | final confirmation, 500 + 500 shuffles | see above | FAIL (1 gate), everything else passes |
+| v41 | the shipped config's own final confirmation (42 bars) | procedure +8.8% (P 94%); whole night fixed rules +5.9 (P 86%), late fills +9.5 (P 97%) | **PASS** |
+| v40 | 126 vs 42 bars, replicated on the rolling universe | 126 − 42: fixed rules −0.1 (P 0.4965), 2025+ −2.4 (P 38%), procedure −3.2 (P 16%), train +3.9 | **REVERTED to 42** by the pre-registered rule (P < 0.50): 126 only won where it was chosen |
+
+**Read it with four caveats.** (1) Every version was judged on the same walk-forward; the paired numbers
+count ten looks, and only 2025+ is clean of the choices made on train. (2) 2026 has been bad: 2026-H1
+alpha −30% at beta 1.7, 2026-Q3 −3% at beta 2.3 — the rolling universe adds high-beta new listings. (3)
+Before the scored window, on names forward-selected for 2020 liquidity, the ranking's IC was −0.055
+(2018-07 → 2020-06); tonight showed that selecting names by FUTURE liquidity hides this signal (IC
++0.022 vs +0.057 point in time), which likely explains it, but the evidence FOR the sleeve starts in
+2020. (4) 8 of today's 30 names are foreign filers whose FINRA short interest covers only the US line
+(IDEAS.md, parked). (5) **Against SPY, the index a live account would hold instead, the edge is thinner:** the fixed-rules book beat SPY by +8.9 / +7.4 / −0.8 / **+41.0** / −0.7 points in 2022 … 2026 (rolling universe), and hedged with its SPY beta it earned +7.6%/yr (+1.7% on the fixed Liquid500) — most of it in 2025 (IDEAS.md, "Measured 2026-09-26"). A PASS was never the bar for funding: **paper-trade first**, market-on-open, and
+compare fills with the open.
+
+**Status (2026-09-20, night): v31 — liquidity-neutral ranking — adopted on train evidence, and its
+verdict is FAIL (2 gates, narrowly). `config.yaml` ships it; `neutral_groups: 0` restores v29.**
+One change: every sleeve is ranked inside dollar-volume fifths (`neutral_groups: 5`), so the
+composite cannot lean toward heavily traded names. Adopted by the train-only rule fixed beforehand
+(still passes the signal rule, top 30 keep 96% of their forward return, rank correlation with
+dollar volume 0.27 → 0.02).
+
+| v31 vs v29 (same universe, same everything else) | plain ranking (v29) | liquidity-neutral (v31) |
+|---|---|---|
+| train alpha · composite fair IC (t) | +11.4% · +0.048 (6.0) | +10.1% · +0.044 (5.7) |
+| walk-forward, **rule arm**: alpha · P(alpha > 0) · periods | +8.4% · 92% · 6/9 | **+4.0% · 87% · 5/9** |
+| … against shuffled books inside liquidity tenths, whole walk-forward | 0% ≥ real · real − mean +7.7 pts | **3% ≥ real · real − mean +5.7 pts** |
+| config sleeves fixed · **short interest only** · all five sleeves | +12.3% · +8.0% · +6.6% | +8.8% · **+9.5% (P 100%)** · +3.7% |
+| holdout alpha · P · shuffles ≥ real (free / within tenths) | +10.7% · 94% · 0% / 3% | +6.3% · 86% · 4% / **10%** |
+| train alpha under pessimistic fills | −0.6% | −2.4% |
+| verdict | PASS | **FAIL** — rule arm P 87% < 90%; holdout within-tenths shuffle |
+
+**What v31 measured:** about **3.5 points a year of the fixed arm's out-of-sample alpha (12.3 →
+8.8), and 4.4 of the rule arm's, was the lean toward heavily traded names** — a bet that paid
+through 2022-26 and that nothing in the thesis promises. What is left is smaller but still there:
+against books with the same rules, costs and liquidity profile the neutral rule arm earns +5.7
+points a year over the whole walk-forward (3 of 100 shuffles did as well). Whether to carry the
+lean is a choice, not a finding: v29 (lean in) passes every gate, v31 (lean out) is the cleaner
+measurement of stock selection and misses two gates narrowly.
+
+**The one thing that held in every experiment: `short_interest` alone.** Walk-forward alpha +8.0%
+(P 96%) on `Liquid500`, +8.4% (P 96%) on `Liquid1000`, +9.5% (P 100%) liquidity-neutral — while
+the rule arm swung +8.4 / +3.2 / +4.0 because `ratings` (t ≈ 2 on train, negative on the
+holdout) flips in and out of it, and "all five sleeves" swung +6.6 / +10.7 / +3.7. The control arm
+without the calendar-year test did *worse* here (+2.0%, P 73%): it let `ratings` in once more.
+The next rule to pre-register is a stricter, multiple-testing-aware bar for a sleeve (IDEAS.md).
+
+### Scorecard v26 → v31 (one change per step after v28)
+
+| | v26 | v27 | v28 | v29 | v30 | v31 |
+|---|---|---|---|---|---|---|
+| the change | — | redesign: 2 sleeves, band at the top fifth, 30 slots, no overlay, one objective, open fills, real-size commission, 1 knob | nothing searched; walk-forward re-reads the sleeve rule each period; stability table fixed | measurement only: road + flips, naive basket, whole-walk-forward shuffles, SPY | universe 500 → 1,000 | liquidity-neutral ranking |
+| train alpha | +8.4% | +11.4% | +11.4% | +11.4% | +13.1% | +10.1% |
+| walk-forward, honest arm: alpha (P > 0) | −10.8% (1%) | +9.2% (99%) — flattered | **+8.4% (92%)** | +8.4% (92%) | +3.2% (75%) | +4.0% (87%) |
+| … `short_interest` only | — | — | +8.0% (96%) | +8.0% (96%) | +8.4% (96%) | +9.5% (100%) |
+| … shuffled books, whole walk-forward: share ≥ real | — | — | — | **0%** | 17% | 3% |
+| holdout alpha (P > 0) | −9.7% (4%) | +10.7% (94%) | +10.7% (94%) | +10.7% (94%) | +5.5% (74%) | +6.3% (86%) |
+| … shuffles inside liquidity tenths ≥ real | — | — | 3% | 3% | 10% | 10% |
+| train alpha, pessimistic fills | (scored on them) | −0.6% | −0.6% | −0.6% | +2.5% | −2.4% |
+| verdict | FAIL | fixed rules PASS, tuned pick FAIL | PASS | PASS | **FAIL (3)** — rejected | **FAIL (2)** |
+
+**Status (2026-09-20, later): v30 — a broader universe — REJECTED by the rule fixed before it ran.**
+One change: `Liquid500` → `Liquid1000` (same point-in-time recipe, floor $50M → $20M a day;
+screener notebook §8c). Everything else as v29.
+
+| v30 vs v29 | `Liquid500` (v29) | `Liquid1000` (v30) |
+|---|---|---|
+| train alpha · composite fair IC (t) · top-30 forward | +11.4% · +0.048 (6.0) · +1.61%/quarter | **+13.1%** · +0.048 (5.5) · +1.73%/quarter |
+| train alpha under pessimistic fills · completed holds/yr | −0.6% · 109 | +2.5% · 83 |
+| walk-forward, **rule arm**: alpha · P(alpha > 0) · periods | **+8.4% · 92% · 6/9** | **+3.2% · 75% · 8/9** |
+| … sleeves the rule chose | `short_interest` 9/10 · `ratings` 4/10 | `ratings` 9/10 · `short_interest` 4/10 |
+| … against shuffled books, whole walk-forward | 0% of shuffles ≥ real | **17% ≥ real — FAIL** |
+| config sleeves fixed · all five sleeves · 15 slots | +12.3% · +6.6% · +14.3% | +9.3% · **+10.7%** · +7.8% |
+| holdout alpha · P · shuffles ≥ real (free / within tenths) | +10.7% · 94% · 0% / 3% | +5.5% · 74% · **7% / 10% — FAIL** |
+| verdict | PASS | **FAIL (3 gates)** |
+
+Breadth helped in-sample and hurt everywhere it could not see. Adoption rule (IDEAS.md): keep the
+broader universe only if the rule arm's P(alpha > 0) does not fall below v29's — it fell from 92%
+to 75%, so `config.yaml` is back on `Liquid500`.
+
+**What v30 exposed is more useful than its result: the pre-registered signal rule has a
+knife-edge.** On `Liquid1000`, `short_interest`'s rank-IC for the half-year 2020 is **−0.000**.
+The rule asks for "IC > 0 in ≥ 80% of calendar years", so with two, three or four years of
+history that one reading fails the sleeve (1/2, 2/3, 3/4 < 0.8) and it stayed locked out of five
+walk-forward periods, which then ran on `ratings` alone (OOS alpha +0.3 … +3.9%). A test that
+treats −0.0004 like −0.05, counts a half-year like a year, and gets *stricter* the less data
+there is, is not robust. v31 adds a control arm that re-reads the rule without that test; the gate
+still reads the rule as pre-registered, and a better rule is for the next study to pre-register
+(IDEAS.md). Also worth keeping: on the broader universe **all five sleeves beat the two chosen
+ones** out of sample (+10.7% vs +9.3%) — the first sign that insider and price-target information
+may carry something outside the 500 most-watched names, as finding 4b suggested.
+
+**Status (2026-09-20): v29 — the same strategy under a better instrument. What earned what.**
+v29 changed no rule and no universe; it added attribution arms, a naive control, SPY, and a
+shuffled-book test over the WHOLE walk-forward (IDEAS.md has the iteration plan v29 → v31 with
+the adoption rules fixed before each run). Verdict PASS; every v28 number reproduced.
+
+| v29: stitched walk-forward 2022-01 → 2026-09-11, alpha after beta | alpha | step / cost | P(alpha > 0) | return ÷ vol |
+|---|---|---|---|---|
+| **THE ROAD** · road 0 — the v26 pick exactly as it ran (5 tuned sleeves, band 0.73/0.47, 15 slots, `vol_target` 0.10, pessimistic fills, $10,000-order commission) | **−0.5%** | — | 44% | 0.40 |
+| road 1 — + fills at the open, commission at the real order size | +6.6% | **+7.0** | 98% | 1.04 |
+| road 2 — + risk overlay off | +11.9% | **+5.4** | 99% | 1.02 |
+| road 3 — + sleeves chosen by the signal rule (equal weights) | +10.8% | −1.2 | 91% | 0.87 |
+| road 4 — + sell when a name leaves the top fifth (0.90 / 0.80, `max_hold` 126) | +14.3% | **+3.6** | 99% | 1.05 |
+| road 5 — + 30 slots = `config.yaml` today | +12.3% | −2.1 | 100% | **1.09** |
+| **FLIP-BACKS** · today's rules with pessimistic fills | +0.1% | **−12.2** | 53% | 0.51 |
+| … selling at rank 0.47 | +6.4% | −5.9 | 94% | 0.80 |
+| … all five sleeves at equal weight | +6.6% | −5.6 | 90% | 0.78 |
+| … the `vol_target` 0.10 overlay | +7.0% | −5.2 | 100% | 1.11 |
+| … short interest only (ratings off) | +8.0% | −4.2 | 96% | 0.85 |
+| … 15 slots | +14.3% | +2.1 | 99% | 1.05 |
+| **CONTROLS** · the rule arm (sleeves re-chosen every period — the honest number) | **+8.4%** | | 92% | 0.84 |
+| naive: equal-weight 50 most traded names, re-chosen each period | +5.8% (CAGR +16.0% vs the rule arm's +16.8%) | | 86% | 0.76 |
+| SPY, same window | CAGR +12.0% | | | |
+
+Read it as: **(1) the execution model was the biggest single lever** — scoring on buy-high/sell-low
+fills turned a +6.6% book into a −0.5% one, and still turns today's +12.3% into +0.1%; **(2) the
+risk overlay cost 5 points**, in both directions of the comparison; **(3) selling when a name
+leaves the top fifth earns 3.6–5.9 points**; **(4) choosing sleeves by the rule is worth +5.6
+under today's band but −1.2 under v26's** — sleeve selection only pays once the book actually
+holds the top of the ranking (and the v26 weights had been tuned on these very years);
+**(5) 30 slots instead of 15 gives up ~2 points of alpha for less luck** (return ÷ vol 1.09 vs
+1.05, P 100% vs 99%). Road steps 3–5 and the fixed flips share one flaw — today's sleeves were
+chosen on 2020-07 → 2024-12 — so read differences, not levels; the rule arm is the clean level.
+
+**The strongest skill test so far (new in v29):** the rule arm's own book re-run on 100
+symbol-shuffled rankings, shuffled only inside dollar-volume tenths, stitched over the whole
+walk-forward: shuffled mean +0.7%, p95 +5.4%, **0 of 100 ≥ the real +8.4%**; real − mean **+7.7
+points a year** against books with the same rules, costs and liquidity profile. On the holdout
+alone (250 draws): 0% of free shuffles and 3.2% of within-tenths shuffles ≥ real.
+
+**Status (2026-09-19, night): v28 ran — PASS on every hard gate, with three honest caveats.**
+v28 ships v27's `config` rules unchanged; what it changed is the instrument (see the v27 block
+below for why).
+
+| v28 (run 2026-09-19) | `config` — nothing searched |
+|---|---|
+| walk-forward of the WHOLE procedure | the signal rule re-read inside each of ten periods (2022-01 → 2026-09-11, 4.69 y), on that period's training data only. **The rule chose `short_interest` in 9/10 periods, `ratings` in 4/10, and `insider` / `price_target` / `recency` in 0/10** — retiring them was not hindsight. One period (2022-H2) no sleeve passed and the book sat in cash. **Rule arm, stitched: CAGR +16.8% vs buy-and-hold +9.4%, alpha +8.4%, P(alpha > 0) 92% (90% interval −1.2% … +19.5%), 6/9 full periods positive, return ÷ vol 0.84 vs 0.55.** IS +7.1% → OOS +10.9% (no decay). This is the honest number; v27's +9.2% / +12.3% had seen 2022–2024 when the sleeves were chosen |
+| controls, same periods | config sleeves fixed **+12.3%** (P 100%) · short interest only +8.0% (P 96%) · all five sleeves equal weight +6.6% (P 90%) · config sleeves selling at rank 0.47 +6.4% (P 94%). Every arm is positive; choosing sleeves beats not choosing (+8.4 vs +6.6), the high sell threshold beats the v26 habit (+12.3 vs +6.4) |
+| stability (§3d, working again) | 11 neighbours over `q_out`, `q_in`, `max_hold`, `insider_window`: all 11 alpha > 0, median keeps 100%, **0 spikes, 0 cliffs**; `q_out` a plateau (0.75 → +9.8%, 0.85 → +8.3%, centre +11.4%), the other three inert |
+| shuffled books on the holdout (150 per kind) | real +10.7% vs p95 **+6.4% (free) / +8.1% (within dollar-volume thirds) / +8.7% (within tenths)**; shuffles ≥ real 0% / 3% / 3%; real − shuffled mean +14.0 / +12.9 / +12.6 points. Passes the strictest control, at roughly p ≈ 0.03 — real, not overwhelming (a p95 from 150 draws is itself ±1.5–2 points) |
+| holdout (used) | as v27 `config`: CAGR +34.7% vs +18.9%, alpha +10.7% (beta 1.27), P 94%, return ÷ vol 1.52 vs 1.18, max DD −23.4%. The one warning: composite beta-adjusted IC +0.002 (t 0.1) |
+| against what you could actually buy | **SPY** (total return): train +16.8%/yr, walk-forward window +12.0%, holdout +18.4% — the book beats it in all three (+27.0 / +16.8 rule arm / +34.7). An equal-weight basket of the **50 most traded names** (ranked before each window): +18.5 / +15.2 / **+44.8%** — the book beats it on train and over the walk-forward window and **loses to it on the holdout** |
+| verdict | **PASS** (8 hard gates; 1 warning) |
+
+**Read the PASS with these three caveats.**
+
+1. *Execution decides everything.* Train alpha is +11.4% with fills at the open and **−0.6% with
+   buy-high/sell-low fills**. The strategy turns the book over ~3.6×/yr; it only works if
+   market-on-open orders really fill near the open. Only paper trading can measure that.
+2. *2025–26 was a tide for heavily traded names*, and this book leans toward them (rank correlation
+   ≈ 0.4 between the short-interest sleeve and dollar volume). A naive basket of the 50 most traded
+   names beat the book on the holdout. The within-tenths shuffle says the ranking added something
+   beyond that lean (p ≈ 0.03), and over 2020–24 the book beat the same naive basket by 8 points a
+   year — but the holdout's +10.7% alpha is the thinnest part of the evidence, and its broad IC is
+   zero (positive only inside the most traded third).
+3. *The rule's latest reading disagrees with `config.yaml`.* Re-read on data to 2026-06-30 the rule
+   keeps `short_interest` alone; `ratings` (train t 2.2, holdout IC −0.022 at t −3.0) drops out.
+   The gates validate *the procedure* — re-read every six months and hold what passes — so that is
+   what should be paper-traded; `config.yaml` still ships the train-window reading
+   (`short_interest` + `ratings`) until you promote the newer one.
+
+A PASS is a reason to **paper-trade** (IDEAS.md, "Production, only after a PASS"), not to fund. The
+holdout has now been read under ten study versions; the only untouched data is the future.
+
+**Status (2026-09-19, evening): v27 ran — the fixed rules PASS, the tuned pick FAILS — and its
+read led to v28** (below the table: what v28 changed and why).
+
+| v27 (run 2026-09-19) | `config` = fixed rules, `q_out 0.80` · `pick #4` = the study's best, `q_out 0.60` |
+|---|---|
+| study | 40 trials, one knob. Train alpha across `q_out` 0.60 … 0.85: +11.6 / +11.4 / +9.5 / +9.8 / +11.4 / +8.3% — **flat**; the pick is a coin flip against `config` |
+| train (2020-07 → 2024-12) | `config`: CAGR +27.0% vs buy-and-hold +14.7%, **alpha +11.4%**, beta 1.06, return ÷ vol 1.38 vs 0.86, max DD −18.5%, 109 holds/yr; alpha every year (+20.2 / +2.7 / +14.7 / +6.4 / +10.8%). Slots 15/20/30/40 → alpha 13.4 / 11.9 / 11.4 / 9.1% (smooth, unlike v26). Held names: mean rank 0.94, +2.4%/quarter beta-adjusted (t 4.4). Shuffled books on train: mean −0.4% (open fills: the construction is no longer a drag), z +3.7 |
+| costs | 11 bp fees + 1 bp slippage per leg (`order_notional 1000`); alpha at 2× costs +11.2%; break-even round trip 257 bp. **Pessimistic fills: +11.4% → −0.6%** (`pick`: +11.6% → +5.0%) — execution quality decides everything |
+| walk-forward | ten refits 2022-01 → 2026-09-11 (4.69 y), 40 trials each, panels loaded per period. **Tuned picks: CAGR +19.3% vs +9.4%, alpha +9.2%, P(alpha > 0) 99%, 8/9 full periods positive, return ÷ vol 0.95 vs 0.55. No tuning (`config`): CAGR +22.4%, alpha +12.3%, P 100%, return ÷ vol 1.09.** IS +11.5% → OOS +9.8% (p 0.66: no decay detected). **Tuned beat untuned in 2/9 periods.** §4b: "ratings off" loses 5/9 periods to the pick but wins on the mean (+14.5% vs +9.8%); "sell at 0.47" loses 5/9 and on the mean (+7.8%) |
+| holdout (2025-01 → 2026-09-11, used) | `config`: CAGR **+34.7% vs +18.9%**, alpha **+10.7%** (beta 1.27), P(alpha > 0) 94% (90% interval −0.2% … +26.5%), return ÷ vol 1.52 vs 1.18, max DD −23.4%, 185 completed holds, real commission 0.65%/yr of $30k; alpha 2025 +4.4%, 2026 +26.5%. `pick`: alpha +3.8%, P 68%. **But** the composite's beta-adjusted IC there is +0.002 (t 0.1; 2025 +0.023, 2026 −0.045), and `ratings` is −0.022 (t −3.0); only the top of the ranking still pays (`short_interest` top 30: +2.8%/quarter, t 2.8) |
+| shuffled books on the holdout (150 per kind) | `config`: real +10.7% vs p95 +4.4% (free) / +5.4% (within dollar-volume thirds), **0% of shuffles ≥ real**, real − mean +14%. `pick`: real +3.8% vs p95 +7.0% / +8.7% — **FAIL** |
+| verdict | `config` **PASS** · `pick #4` **FAIL (1 gate)** |
+
+**What the v27 read found wrong with v27 itself, and what v28 does.**
+
+1. *The walk-forward did not test the decision that mattered.* v27 chose its two sleeves ONCE, on
+   2020-07 → 2024-12, and then walked forward through 2022–2024 — periods that choice had seen.
+   Only the refit of `q_out` was out of sample there. → **v28 re-reads the signal rule inside every
+   walk-forward period**, on that period's training data alone, and trades whatever passes (cash if
+   nothing does). The gates read that **rule arm**; "config sleeves, fixed", "all five sleeves",
+   "short interest only" and "sell at 0.47" run beside it as controls.
+2. *The optimizer earned nothing* (2/9 periods; +9.2% tuned vs +12.3% untuned; the tuned pick
+   fails the shuffle gate the fixed rules pass). By the rule fixed before the run → **v28 pins
+   `q_out` at its pre-registered 0.80; nothing is searched**, `n_trials: 1` like `baseline`.
+3. *The stability gate could not fail*: `strategy.valid` counts the composite weights, a candidate
+   dict holding only searched keys has none, so every neighbour was rejected and the table was
+   empty. → **v28 validates neighbours on top of `config.yaml`** and draws the neighbourhood over
+   the pinned book rules (`q_out`, `q_in`, `max_hold`, `insider_window`).
+4. *"IC > 0" on the holdout passed at +0.002 (t 0.1).* → a warning unless t ≥ 1.
+
+**Status (2026-09-19): v26 ran and FAILED — and the read of it led to v27.** Recorded here
+because re-running the notebooks overwrites their saved outputs. The v22 status further down is
+kept for the record.
+
+| v26 (run 2026-09-15) | |
+|---|---|
+| study | **4,000** trials (3,861 complete) against a configured `n_trials: 1000` — the optimize cell added 2,000 on every run. From about trial 1,500 on, 35–45% of new trials reused one ranking (`w_insider 1.0`, `w_recency 1.25` in 93% of the last 2,000). The 33 distinct front rows are **one ranking × an exposure dial** (`vol_target` 0.10–0.18 → `cash_switch` → `none`): alpha per unit of beta is 12–18% on every row |
+| pick #3016 | `vol_target`, `target_vol 0.10` — the search floor, flagged "widen low". Train: CAGR +16.1% vs buy-and-hold +14.4%, **alpha +8.4%**, beta 0.53, volatility 10.9%, 119 lots/yr. **Holdout** (2025-01 → 2026-09-11, 52 completed holds): CAGR **+0.6% vs +18.4%**, **alpha −9.7%**, P(alpha > 0) 4%. The overlay cut the book to ~25% invested in April 2025 (low 18.5%), at the low, and was still 40% in May |
+| #3218 | the max-alpha front row (`none`, `q_in 0.95`, `max_hold 241`). Train alpha +18.5%, beta 1.09. Holdout CAGR +30.2%, alpha +6.2%, **beta 1.30**, P(alpha > 0) 67% (90% interval −14.3% … +29.8%), volatility 25.8% vs 15.9%. Return ÷ volatility: train 1.60 vs the market's 0.85, **holdout 1.17 vs 1.16** |
+| walk-forward | six half-year refits 2022-01 → 2024-12, **1,000 trials each** (not the main study's 4,000). OOS alpha +7.1, −6.0, −11.1, −5.6, +3.3, −26.1. **Stitched: CAGR −6.2% vs +5.9%, alpha −10.8%, P(alpha > 0) 1%.** Mean IS +12.6% → OOS −6.4% (paired p = 0.01). The refits agreed on **no** ranking parameter (`w_insider` 0.25–2.75, `rating_halflife` 18–151, `w_recency` 0.5–3.75); five of six chose `vol_target`. §4b, same picks with the overlay off: +7.1, −1.9, −3.8, −0.6, +19.2, −24.8 (mean **−0.8** vs −6.4) — the overlay cost alpha in every period it was chosen |
+| in-sample checks | stability: 4 spikes (`insider_window`, `rating_halflife`, `w_insider`, `q_out`), 3 cliffs, 5 inert. Slots 5/10/15/20/30 → alpha 7.0/5.8/8.4/3.5/−1.4%. Symbol-shuffled books: mean alpha **−6.6%** (p95 −2.7%) — the rules themselves cost ~6%/yr under pessimistic fills, so the walk-forward reads "no demonstrable skill plus the drag", not "negative skill". Fill timing: alpha +13.4% (open) → +8.4% (pessimistic). Deflated Sharpe 0.000 at every `n_eff` |
+| rank IC | composite, plain: train +0.020 (1 mo, t 3.1), holdout +0.027 (t 2.2). Holdout exits 98% via `q_out`, median hold 102 bars, median rank at exit 0.49 |
+| verdict | pick **FAIL (4 gates)**, #3218 **FAIL (5 gates)** |
+
+**What the 2026-09-19 assessment measured on top (train 2020-07 → 2024-12, read-only).** The
+§2a rank IC does not remove beta (a Spearman IC is unchanged by cross-sectional demeaning), so it
+was re-measured on **beta-adjusted** 63-bar forward returns, per calendar year and inside
+dollar-volume terciles. The beta suspicion was wrong for the train window (rank-vs-beta
+correlation 0.02–0.06), and the sleeves separate cleanly:
+
+| sleeve | beta-adjusted IC, 63 bars | t | years > 0 | terciles > 0 |
+|---|---|---|---|---|
+| `short_interest` | +0.048 | 4.7 | 5/5 | 3/3 |
+| `ratings` | +0.025 | 2.2 | 4/5 | 3/3 |
+| `insider` | +0.011 | 0.4 | 3/5 | 2/3 |
+| `price_target` | +0.005 | 0.3 | 3/5 | 3/3 (≈ 0) |
+| `recency` | −0.012 | −0.9 | 3/5 | 0/3 |
+| all five, equal weight | +0.033 | 3.4 | 5/5, fading to +0.005 in 2024 | 3/3 |
+| **`short_interest` + `ratings`** | **+0.048** | **6.0** | **5/5 (0.042–0.054)** | **3/3** |
+
+Only the top fifth of the two-sleeve ranking pays (+1.3%/quarter vs the average name, t 6.3; the
+4th fifth −0.2%); the daily top 30 earn +1.6%/quarter (t 4.3), the top 15 the same (t 3.4). The
+v26 pick gave `short_interest` 25% of the composite weight and 56% to `insider` + `recency`.
+
+**Why three sleeves carry nothing here — data defects found, and why they are not the reason.**
+
+- *Price targets.* Yahoo does not consistently split-adjust prior targets: TSLA's 3:1 split reads
+  as every analyst cutting −67%, AMZN's and GOOGL's 20:1 as −95% (1.2% of rows are beyond ±50%).
+  Screening them changes nothing (sum, mean, raises-minus-cuts, half-life 5: IC −0.005 … +0.008).
+  An event study says why: on a clear revision day the stock moves **+0.77% / −1.01%** (t 17 /
+  −13, n ≈ 15,500) — so dates and signs are right — and **nothing** follows from the next open on
+  (5, 21, 63 bars). Ratings: **+1.77% / −2.00%** on the day, then a small slow drift (+0.2% /
+  −0.4% over 63 bars), which is why that sleeve passes narrowly. In the 500 most-watched names
+  analyst news is priced within the day; a faster feed would not help a daily strategy.
+- *Recency* is direction-blind: `_event_days` counts `abs(flow) > 0`, so a fresh downgrade or
+  insider sale ranks as high as a fresh upgrade or buy. IC +0.004 / +0.002 / 0.000 / −0.012 at
+  5 / 10 / 21 / 63 bars. A direction-aware version (sign of the last rating change × freshness)
+  is the ratings sleeve under another name, and its IC *grows* with horizon (+0.007 → +0.024);
+  `rating_halflife` 5, 21 and 63 score the same, so the half-life is inert.
+- *Insider.* 96% of rows are **sells** (204,066 vs 8,527 buys), netted against buys although the
+  thesis calls sells uninformative; two AIG rows with price = shares = 50,000,000 are worth $4
+  quadrillion; 14% of buy rows price outside 0.5–2× the close (LLY "buying" 40.9m shares at
+  $18.75 with the stock at $142); corporate "10% owner" rows (GILD, MS, AZN) are filed under the
+  owner's own ticker. Screened versions still score zero (buys only +0.001, EMA-weighted −0.011,
+  number of buyers +0.003; names with a screened buy in 63 bars beat the rest by +0.13%/quarter,
+  t 0.2). The likely reason is the universe: the insider-buy effect is a small-cap effect, and in
+  Liquid500 purchases are rare (≈60 names per quarter) and small (median $131k).
+
+The data fixes are proposals (IDEAS.md); none changes v27, which uses neither sleeve.
 
 **Resolved (v15).** `max_positions`'s low bound had been widened `8 → 5` without a study
 bump, so `informed-flow-1d-v15.log` held 4,457 trials that could only reach 8 and 412 that

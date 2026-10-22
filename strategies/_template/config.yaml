@@ -2,7 +2,9 @@
 
 data:                      # which panel the notebook / optimizer loads
   universe: starter        # a name from settings.yaml or universes.yaml
-  bar: 1d                  # 1d | 1m
+  bar: 1d                  # 1d | 1m — the STORED bar
+  resample: null           # minutes (5, 15, ...) to derive coarser candles from a 1m load;
+                           # never backfilled (data.resample_panel). Bump `study` on a change
   start: "2018-01-01"
   end: null                # set to the TRAIN cutoff; the notebook's out-of-sample
                            # section loads end=null and replays the tail as the
@@ -20,6 +22,14 @@ optuna:
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42
   n_trials: 100
+  # objectives: [excess_cagr, volatility]  # the default; one or two of optimize.SCOREABLE
+                           # (excess_cagr, alpha_cagr, info_ratio, volatility,
+                           # tracking_error, max_drawdown) — directions are built in. One
+                           # name = a single-objective study whose "front" is its best trial.
+                           # Changing this needs a new `study` name. alpha_cagr is for a
+                           # near-zero-beta book only (see optimize.OBJECTIVES).
+  # score_from: "2018-03-01"  # score every trial WARM from this date (signals on the whole
+                           # panel) — skips an indicator warm-up. Stamped into the journal.
   # min_trades_per_year: 300  # admissibility floor, PER YEAR not absolute (an
                            # absolute count is implicitly stricter on a short window
                            # than a long one for the same trading style): trials

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import typer
 
@@ -165,37 +165,82 @@ def backfill(
     typer.echo(f"prices: {total} rows written")
 
 
+@app.command("backfill-sweep")
+def backfill_sweep(
+    bar: str = typer.Option("1m", help="Bar size (IBKR only): 1m | 5m | 1h"),
+    since: datetime = typer.Option(..., formats=["%Y-%m-%d"], help="First day (YYYY-MM-DD)"),
+    until: datetime = typer.Option(None, formats=["%Y-%m-%d"], help="Last day (default today)"),
+    tracker_path: str = typer.Option(
+        "var/backfill_1m_tracker.csv",
+        help="Progress ledger CSV: one row per symbol, alphabetical"),
+    retry_empty: bool = typer.Option(
+        False, "--retry-empty", help="Also re-attempt symbols the ledger marked 'empty'"),
+    skip_covered: bool = typer.Option(
+        True, "--skip-covered/--no-skip-covered",
+        help="Skip a symbol without an IBKR call if the DB already spans the window"),
+    extended_hours: bool = typer.Option(None, "--extended-hours/--regular-only",
+                                        help="Include pre/post-market bars"),
+) -> None:
+    """Sweep EVERY symbol in every universe, alphabetically, through one paced
+    IBKR connection, checkpointed to a resumable CSV ledger.
+
+    Unlike ``backfill``, there is no ``--universe``/``--symbols`` — the target is
+    always the full union of every universe in ``config/universes.yaml``. Safe to
+    kill (Ctrl-C, Gateway drop, machine restart) and re-run with the SAME
+    --bar/--since/--until: the ledger at --tracker-path records one row per symbol
+    with its target window and status ('pending' | 'done' | 'empty'), and a re-run
+    only re-fetches rows still 'pending' (plus 'empty' ones with --retry-empty).
+    Widening --since/--until resets the affected rows back to 'pending' rather than
+    trusting stale coverage. ``--skip-covered`` (on by default) also checks the
+    database directly before ever calling IBKR, so symbols an earlier notebook
+    backfill already covers cost no request at all. This can run for days for a
+    large universe/window — run it under ``nohup``/``tmux`` with IB Gateway logged
+    in throughout.
+    """
+    from trading_simple import jobs
+    from trading_simple.config import load_settings
+
+    logging.basicConfig(level=logging.WARNING)
+    settings = load_settings()
+    start = since.date().isoformat()
+    end = (until.date() if until else date.today()).isoformat()
+    tracker = jobs.run_ibkr_sweep(
+        settings.all_symbols(), bar=bar, since=start, until=end, tracker_path=tracker_path,
+        extended_hours=extended_hours, retry_empty=retry_empty, skip_covered=skip_covered)
+    done = int((tracker["status"] != "pending").sum())
+    typer.echo(f"sweep: {done}/{len(tracker)} symbols done -> {tracker_path}")
+
+
 @app.command()
 def altdata(
     dataset: str = typer.Option(
         "all", help="insider | ratings | price_target | short_interest | fundamentals | all"),
     universe: str = typer.Option(None, help="Universe name from config, or ALL (every symbol)"),
     symbols: str = typer.Option(None, help="Comma-separated symbols (overrides --universe)"),
-    since: datetime = typer.Option(..., formats=["%Y-%m-%d"], help="First day (YYYY-MM-DD)"),
-    skip_covered: bool = typer.Option(
-        False, "--skip-covered/--no-skip-covered",
-        help="Skip (dataset, symbol) already backfilled to at least --since (uses the ledger)"),
+    since: datetime = typer.Option(
+        ..., formats=["%Y-%m-%d"], help="Deepest day of history wanted (YYYY-MM-DD)"),
     refresh: bool = typer.Option(
-        False, "--refresh", help="Re-fetch even symbols the ledger marks as already covered"),
-    bulk: bool = typer.Option(
-        False, "--bulk",
-        help="Insider only: backfill from SEC's quarterly Form 345 data sets (whole-market "
-             "downloads) instead of per-filing scraping — far faster for closed quarters"),
+        False, "--refresh", help="Ignore the ledger: re-fetch every symbol's whole window"),
+    stale_days: int = typer.Option(
+        None, help="Days a symbol's newest data may age before it is refreshed "
+                   "(default: per dataset, cli._STALE_DAYS)"),
 ) -> None:
-    """Ingest alternative data into the shared database (idempotent UPSERT).
+    """Ingest the alternative data each symbol is MISSING into the shared database (UPSERT).
 
     This repo's own providers — SEC EDGAR Form 4 (insider) and XBRL companyfacts
     (fundamentals), Yahoo Finance (analyst rating changes and price targets),
     FINRA (short interest) — populate the alt-data tables consumed by
     :mod:`trading_simple.features`, with no dependency on the sibling repo. Prints
-    one ``altdata <ds> <SYM>: N rows`` line per symbol and a final
-    ``altdata: N rows written`` (the notebook helpers parse these).
+    one ``altdata <ds> [i/n] <SYM>: N rows`` line per symbol and a final
+    ``altdata: N rows written``.
 
-    ``--skip-covered`` consults the ``altdata_coverage`` ledger and skips symbols
-    already backfilled to ``--since``, so adding one name to a universe re-fetches
-    only that name (``--refresh`` forces a re-fetch). ``--universe ALL`` targets
-    every registered symbol. Historic backfills should be run from
-    ``notebooks/03_altdata_update.ipynb``, which also carries the coverage audit.
+    The ``altdata_coverage`` ledger decides what is missing, name by name: the history
+    back to ``--since`` and the days since the last refresh (:func:`_coverage_plan`).
+    A fully covered name costs nothing, so a run over ``--universe ALL`` (every
+    registered symbol) is cheap when little is missing. Insider history comes from
+    SEC's quarterly bulk data sets, only the days after the newest published quarter
+    from the per-filing scraper. Run it from ``notebooks/03_altdata_update.py``,
+    which also carries the coverage audit.
     """
     from trading_simple.config import load_settings
     from trading_simple.db import Security, all_symbols, make_engine, upsert_securities
@@ -214,8 +259,8 @@ def altdata(
                 if dataset == "all" else (dataset,))
 
     upsert_securities(engine, [Security(symbol=s) for s in syms])  # FK before alt-data rows
-    total = sum(_run_altdata(ds, engine, settings, syms, start,
-                             skip_covered=skip_covered, refresh=refresh, bulk=bulk)
+    total = sum(_run_altdata(ds, engine, settings, syms, start, refresh=refresh,
+                             stale_days=stale_days)
                 for ds in datasets)
     typer.echo(f"altdata: {total} rows written")
 
@@ -282,28 +327,43 @@ def altdata_status(
 # makes the generic ``covered_from <= want_from`` skip test unconditionally true.
 COMPLETE_SENTINEL = date(1900, 1, 1)
 
-# Per-dataset meaning of ``since``, which decides how an already-covered symbol is
-# deepened when the requested window is widened earlier:
-#   "range"      — ``since`` limits the fetch (insider filings/quarters, FINRA
-#                  settlements), so fetch ONLY the missing early gap
-#                  [want_from, covered_from), bounded by ``until``.
+# Per-dataset meaning of ``since``, which decides how a symbol's missing days are fetched:
+#   "range"      — ``since``/``until`` bound the fetch (insider filings/quarters, FINRA
+#                  settlements), so each missing piece is fetched on its own.
 #   "whole"      — one fetch returns the ENTIRE history regardless of ``since``
-#                  (companyfacts), so once covered it is complete to inception
-#                  (recorded with COMPLETE_SENTINEL) and never re-fetched to deepen.
+#                  (companyfacts), so it is complete to inception once fetched
+#                  (recorded with COMPLETE_SENTINEL) and only ever refreshed whole.
 #   "monolithic" — one request returns the whole frame and ``since`` is a
-#                  client-side row filter (yfinance ratings/price targets), so
-#                  deepen with ONE re-fetch using the earlier ``since``.
+#                  client-side row filter (yfinance ratings/price targets), so ONE
+#                  fetch from the earliest missing day covers every missing piece.
 _SEMANTICS = {"insider": "range", "short_interest": "range", "fundamentals": "whole",
               "ratings": "monolithic", "price_target": "monolithic"}
+
+#: Days before a symbol's recorded ``covered_to`` that a refresh re-reads. ``covered_to`` is
+#: the RUN date, not the newest data: FINRA publishes a settlement about two weeks after it,
+#: so a settlement dated before a run can still be unpublished at that run (31 days re-reads
+#: the last two settlement files); a Form 4 accepted on the run date after the run is caught
+#: by 2 days. One Yahoo request returns a name's whole analyst list, so re-writing 30 days of
+#: its rows is free; companyfacts is always the whole history.
+_OVERLAP_DAYS = {"insider": 2, "short_interest": 31, "ratings": 30, "price_target": 30,
+                 "fundamentals": 0}
+
+#: Days a symbol's newest data may age before it counts as missing (``--stale-days``
+#: overrides). 0 = anything not refreshed today. A refresh of the per-name sources costs one
+#: request per name whatever is new (Yahoo's analyst lists, SEC companyfacts: ~2,300 requests,
+#: 20-40 minutes each over the full registry), so they wait a week; short interest is two
+#: downloads for every name and insider only the filings since the last run.
+_STALE_DAYS = {"insider": 0, "short_interest": 0, "ratings": 6, "price_target": 6,
+               "fundamentals": 6}
 
 
 @dataclass(frozen=True, slots=True)
 class FetchSpec:
-    """One symbol's effective fetch window plus the coverage to record for it.
+    """One symbol's fetch window plus the coverage to record for it once fetched.
 
-    ``until is None`` means "open to today" (a full/monolithic fetch); a set
-    ``until`` marks a bounded gap-fill that must NOT advance the recorded
-    ``covered_to`` (``rec_to`` stays the pre-existing value).
+    ``until is None`` means "open to today"; a set ``until`` bounds a piece of missing
+    history. ``rec_from``/``rec_to`` are the window recorded in the ledger:
+    :func:`db.upsert_coverage` widens the stored window, and every piece touches it.
     """
 
     symbol: str
@@ -314,41 +374,81 @@ class FetchSpec:
 
 
 def _coverage_plan(syms: list[str], coverage: dict[str, tuple[date, date]],
-                   want_from: date, want_to: date, *, kind: str,
-                   skip_covered: bool) -> tuple[list[FetchSpec], list[str]]:
-    """Plan each symbol's effective fetch window from the ledger (pure).
+                   want_from: date, want_to: date, *, kind: str, overlap: int = 0,
+                   stale_days: int = 0, refresh: bool = False) -> list[FetchSpec]:
+    """Plan only what each symbol is missing, from the ledger (pure).
 
-    A symbol already covered back to ``want_from`` is skipped; a partially-covered
-    ``range`` symbol is narrowed to its missing early gap ``[want_from, covered_from)``
-    (leaving the covered tail untouched); ``whole``/``monolithic`` partials and
-    brand-new symbols get a full fetch. With ``skip_covered`` off, everything is
-    fetched — the pre-ledger behaviour.
+    The ledger holds one window per symbol, ``(covered_from, covered_to)``. A symbol can
+    miss two pieces: the HISTORY from ``want_from`` up to ``covered_from``, and the TAIL
+    after ``covered_to`` once that is more than ``stale_days`` old (re-read from
+    ``covered_to - overlap``, see :data:`_OVERLAP_DAYS`). Per ``kind``:
+
+    * ``range``: each piece is its own fetch, so a covered name costs only its tail;
+    * ``whole``: either piece means one full fetch, recorded complete to inception;
+    * ``monolithic``: one fetch from the earliest missing day covers both pieces.
+
+    A symbol not in the ledger — or every symbol under ``refresh`` — gets the whole
+    window ``[want_from, want_to]``.
 
     Args:
         syms: Symbols requested for this run.
         coverage: ``{symbol: (covered_from, covered_to)}`` from :func:`db.load_coverage`.
-        want_from: The run's requested start date.
-        want_to: The run's requested end date (today).
+        want_from: The deepest day of history wanted.
+        want_to: The run's end date (today).
         kind: The dataset's coverage semantics (see :data:`_SEMANTICS`).
-        skip_covered: Whether to honour the ledger.
+        overlap: Days before ``covered_to`` a tail re-reads.
+        stale_days: Days ``covered_to`` may age before the tail counts as missing.
+        refresh: Ignore the ledger.
 
     Returns:
-        ``(specs, skipped)`` — fetch plans and the skipped symbols, preserving order.
+        Fetch plans in input order; a symbol without one is up to date.
     """
-    rec_from_full = COMPLETE_SENTINEL if kind == "whole" else want_from
-    if not skip_covered:
-        return [FetchSpec(s, want_from, None, rec_from_full, want_to) for s in syms], []
+    whole_from = COMPLETE_SENTINEL if kind == "whole" else want_from
     specs: list[FetchSpec] = []
-    skipped: list[str] = []
     for s in syms:
-        cov = coverage.get(s)
-        if cov is not None and cov[0] <= want_from:          # already deep enough
-            skipped.append(s)
-        elif cov is not None and kind == "range":            # partial range → gap only
-            specs.append(FetchSpec(s, want_from, cov[0], want_from, cov[1]))
-        else:                                                # new, or monolithic/whole re-fetch
-            specs.append(FetchSpec(s, want_from, None, rec_from_full, want_to))
-    return specs, skipped
+        cov = None if refresh else coverage.get(s)
+        if cov is None:
+            specs.append(FetchSpec(s, want_from, None, whole_from, want_to))
+            continue
+        history = cov[0] > want_from
+        tail = (want_to - cov[1]).days > stale_days
+        tail_from = max(want_from, cov[1] - timedelta(days=overlap))
+        if kind == "range":
+            if history:
+                specs.append(FetchSpec(s, want_from, cov[0], want_from, cov[0]))
+            if tail:
+                specs.append(FetchSpec(s, tail_from, None, tail_from, want_to))
+        elif history or tail:
+            since = tail_from if kind == "monolithic" and not history else want_from
+            specs.append(FetchSpec(s, since, None, whole_from if since == want_from else since,
+                                   want_to))
+    return specs
+
+
+def _split_at(specs: list[FetchSpec], day: date) -> tuple[list[FetchSpec], list[FetchSpec]]:
+    """Split each spec into its part up to ``day`` and its part after it (pure).
+
+    Insider history comes from SEC's quarterly bulk data sets, which end with the newest
+    published quarter (``day``): only the days after it need the per-filing scraper.
+
+    Args:
+        specs: Fetch plans from :func:`_coverage_plan`.
+        day: The last day the bulk source covers.
+
+    Returns:
+        ``(upto, after)`` — the bounded parts on or before ``day`` and the parts after it.
+    """
+    upto: list[FetchSpec] = []
+    after: list[FetchSpec] = []
+    for sp in specs:
+        end = sp.until or sp.rec_to
+        if sp.since <= day:
+            stop = min(end, day)
+            upto.append(FetchSpec(sp.symbol, sp.since, stop, sp.rec_from, stop))
+        if end > day:
+            start = max(sp.since, day + timedelta(days=1))
+            after.append(FetchSpec(sp.symbol, start, sp.until, start, sp.rec_to))
+    return upto, after
 
 
 def _group_by_window(specs: list[FetchSpec]) -> dict[tuple[date, date | None], list[FetchSpec]]:
@@ -370,36 +470,19 @@ def _cov_row(sp: FetchSpec) -> dict:
             "rows": None}
 
 
-def _coverage_targets(syms: list[str], coverage: dict[str, tuple[date, date]], since: date,
-                      *, skip_covered: bool) -> tuple[list[str], list[str]]:
-    """Back-compat shim: the ``(to_fetch, skipped)`` partition from :func:`_coverage_plan`.
-
-    The partition is independent of ``kind``/``want_to``, so this preserves the
-    original behaviour (skip iff ``skip_covered`` and ``covered_from <= since``).
-    """
-    specs, skipped = _coverage_plan(syms, coverage, since, since, kind="range",
-                                    skip_covered=skip_covered)
-    return [sp.symbol for sp in specs], skipped
-
-
 def _run_altdata(ds: str, engine, settings, syms: list[str], start: date,
-                 *, skip_covered: bool = False, refresh: bool = False, bulk: bool = False) -> int:
-    """Ingest one alt-data dataset for ``syms`` since ``start``; return rows written.
+                 *, refresh: bool = False, stale_days: int | None = None) -> int:
+    """Ingest what ``syms`` are missing of one alt-data dataset; return rows written.
 
-    Per-symbol network sources (insider per-filing, ratings, price_target,
-    fundamentals) are fetched one symbol at a time so a single failure is isolated
-    and reported, never aborting the run; short interest and bulk insider are
-    batched by fetch window. :func:`_coverage_plan` turns the ``altdata_coverage``
-    ledger into a per-symbol plan (``skip_covered`` honoured unless ``refresh``):
-    a symbol already covered back to ``start`` is skipped; a partially-covered
-    ``range`` dataset (insider, short_interest) fetches ONLY the missing early gap
-    ``[start, covered_from)`` and leaves the covered tail; a ``whole`` dataset
-    (fundamentals) is complete once covered; a ``monolithic`` dataset (ratings,
-    price_target) re-fetches once to deepen. Each cleanly-fetched symbol widens its
-    ledger window.
-
-    ``bulk`` (insider only) swaps the per-filing scrape for SEC's quarterly Form 345
-    data sets: a whole-market download per window.
+    :func:`_coverage_plan` reads the ``altdata_coverage`` ledger and plans, name by
+    name, only the missing history back to ``start`` and the days since the name's
+    last refresh. Short interest is batched (one FINRA file per settlement serves
+    every name). Insider history up to SEC's newest published quarterly data set
+    comes from those bulk files, only the days after it from the per-filing scraper.
+    The per-name sources (that scraper, Yahoo's ratings and price targets, SEC
+    companyfacts) go one symbol at a time, so one failure is isolated and reported.
+    Every piece widens the symbol's ledger window as soon as it is fetched, so an
+    interrupted run resumes where it stopped.
 
     Args:
         ds: Dataset name (``insider`` | ``ratings`` | ``price_target`` |
@@ -407,17 +490,16 @@ def _run_altdata(ds: str, engine, settings, syms: list[str], start: date,
         engine: Database engine.
         settings: Resolved settings (for exchange overrides).
         syms: Symbols to ingest.
-        start: Earliest date to fetch.
-        skip_covered: Skip symbols already backfilled to ``start`` (per the ledger).
-        refresh: Ignore the ledger and re-fetch every symbol.
-        bulk: Insider only — use the quarterly Form 345 bulk data sets.
+        start: The deepest day of history wanted.
+        refresh: Ignore the ledger and re-fetch every symbol's whole window.
+        stale_days: Days a symbol's newest data may age before it is refreshed
+            (``None``: :data:`_STALE_DAYS`).
 
     Returns:
         Number of rows written for this dataset.
     """
     from trading_simple.db import (
         load_coverage,
-        upsert_coverage,
         upsert_fundamentals,
         upsert_insider,
         upsert_price_targets,
@@ -430,56 +512,37 @@ def _run_altdata(ds: str, engine, settings, syms: list[str], start: date,
         raise typer.BadParameter(
             f"Unknown dataset {ds!r} "
             "(insider | ratings | price_target | short_interest | fundamentals | all)")
-    today = date.today()
-    coverage = load_coverage(engine, ds)
-    specs, skipped = _coverage_plan(syms, coverage, start, today, kind=kind,
-                                    skip_covered=skip_covered and not refresh)
-    if skipped:
-        typer.echo(f"altdata {ds}: skipping {len(skipped)} symbol(s) already covered "
-                   f"back to {start} (--refresh to force)")
-    gaps = sum(1 for sp in specs if sp.until is not None)
-    if gaps:
-        typer.echo(f"altdata {ds}: {gaps} symbol(s) gap-fill only (fetching before covered_from)")
+    specs = _coverage_plan(
+        syms, load_coverage(engine, ds), start, date.today(), kind=kind,
+        overlap=_OVERLAP_DAYS[ds], refresh=refresh,
+        stale_days=_STALE_DAYS[ds] if stale_days is None else stale_days)
+    todo = len({sp.symbol for sp in specs})
+    history = sum(sp.until is not None for sp in specs)
+    typer.echo(f"altdata {ds}: {len(syms) - todo} of {len(syms)} symbol(s) up to date; "
+               f"fetching {todo} ({history} with missing history)")
     if not specs:
-        typer.echo(f"altdata {ds}: nothing to do — all {len(syms)} symbols already covered")
         return 0
 
-    if ds == "insider" and bulk:
-        from trading_simple.providers.sec import iter_insider_bulk
-        # Stream quarter-by-quarter per window: UPSERT each quarter's rows and release
-        # them, so a full-universe backfill never holds millions of trades at once.
-        written = 0
-        for (since, until), group in _group_by_window(specs).items():
-            gsyms = [sp.symbol for sp in group]
-            for quarter, rows in iter_insider_bulk(gsyms, since, until=until):
-                written += upsert_insider(engine, rows)
-                typer.echo(f"altdata insider (bulk) {quarter}: {len(rows)} rows")
-            upsert_coverage(engine, ds, [_cov_row(sp) for sp in group])
-        typer.echo(f"altdata insider (bulk): {written} rows across {len(specs)} symbols")
-        return written
     if ds == "short_interest":
-        # Bulk CDN files (one per settlement, all symbols, no auth) — the Query API's
-        # symbol domainFilter 504s on a full universe. Stream per settlement, UPSERT and
-        # release, mirroring the insider bulk path.
         from trading_simple.providers.finra import iter_short_interest_bulk
-        written = 0
-        for (since, until), group in _group_by_window(specs).items():
-            gsyms = [sp.symbol for sp in group]
-            try:
-                for settle, rows in iter_short_interest_bulk(gsyms, since, until=until):
-                    written += upsert_short_interest(engine, rows)
-                    typer.echo(f"altdata short_interest {settle}: {len(rows)} rows")
-            except Exception as exc:  # noqa: BLE001 — a FINRA outage must not abort the run
-                typer.echo(f"altdata short_interest: error ({exc})")
-                continue
-            upsert_coverage(engine, ds, [_cov_row(sp) for sp in group])
-        typer.echo(f"altdata short_interest (bulk): {written} rows across {len(specs)} symbols")
-        return written
+        return _ingest_batched(ds, engine, specs, iter_short_interest_bulk,
+                               upsert_short_interest)
     if ds == "insider":
-        from trading_simple.providers.sec import fetch_insider
-        return _ingest_per_symbol(ds, engine, specs,
-                                  lambda s, since, until: fetch_insider(s, since, until=until),
-                                  upsert_insider)
+        from trading_simple.providers.sec import (
+            bulk_published_until,
+            fetch_insider,
+            iter_insider_bulk,
+        )
+        try:
+            last = bulk_published_until()
+        except Exception as exc:  # noqa: BLE001 — SEC unreachable: retry next run, record nothing
+            typer.echo(f"altdata insider: SEC unreachable ({exc}); skipped, run again later")
+            return 0
+        upto, after = _split_at(specs, last) if last else ([], specs)
+        written = _ingest_batched(ds, engine, upto, iter_insider_bulk, upsert_insider)
+        return written + _ingest_per_symbol(
+            ds, engine, after, lambda s, since, until: fetch_insider(s, since, until=until),
+            upsert_insider)
     if ds == "ratings":
         from trading_simple.providers.yf import fetch_ratings
         return _ingest_per_symbol(
@@ -499,13 +562,48 @@ def _run_altdata(ds: str, engine, settings, syms: list[str], start: date,
                               upsert_fundamentals)
 
 
+def _ingest_batched(ds: str, engine, specs: list[FetchSpec], iterate, upsert) -> int:
+    """Fetch windows from a whole-market source, recording each window once it is done.
+
+    Specs sharing a ``(since, until)`` window share its downloads (one FINRA file per
+    settlement, one SEC zip per quarter, each serving every symbol); rows are upserted
+    per file and released, so memory stays bounded. A window that fails (an outage) is
+    reported and left unrecorded, so the next run fetches it again.
+
+    Args:
+        ds: Dataset name (for log lines and the ledger).
+        engine: Database engine.
+        specs: Fetch plans from :func:`_coverage_plan`.
+        iterate: ``(symbols, since, until=) -> iter[(label, rows)]`` bulk provider.
+        upsert: ``(engine, rows) -> n`` writer.
+
+    Returns:
+        Total rows written.
+    """
+    from trading_simple.db import upsert_coverage
+
+    written = 0
+    for (since, until), group in _group_by_window(specs).items():
+        try:
+            for label, rows in iterate([sp.symbol for sp in group], since, until=until):
+                written += upsert(engine, rows)
+                typer.echo(f"altdata {ds} (bulk) {label}: {len(rows)} rows")
+        except Exception as exc:  # noqa: BLE001 — an outage must not abort the run
+            typer.echo(f"altdata {ds} (bulk) {since}..{until or 'today'}: error ({exc})")
+            continue
+        upsert_coverage(engine, ds, [_cov_row(sp) for sp in group])
+    typer.echo(f"altdata {ds} (bulk): {written} rows for {len({sp.symbol for sp in specs})} "
+               "symbol(s)")
+    return written
+
+
 def _ingest_per_symbol(ds: str, engine, specs: list[FetchSpec], fetch, upsert) -> int:
-    """Fetch + upsert each spec one at a time, recording ledger coverage on success.
+    """Fetch + upsert each spec one at a time, recording its ledger coverage at once.
 
     A failing symbol is logged and skipped — and NOT recorded, so it retries next
     run; a symbol that fetches cleanly (even with zero rows) IS recorded (with its
-    spec's ``covered_from``/``covered_to``), so a genuinely event-free name is not
-    re-attempted forever.
+    spec's ``rec_from``/``rec_to``) right away, so a genuinely event-free name is not
+    re-attempted forever and an interrupted run resumes after the last finished name.
 
     Args:
         ds: Dataset name (for log lines and the ledger).
@@ -519,18 +617,18 @@ def _ingest_per_symbol(ds: str, engine, specs: list[FetchSpec], fetch, upsert) -
     """
     from trading_simple.db import upsert_coverage
 
-    total, covered = 0, []
-    for sp in specs:
+    total = 0
+    for i, sp in enumerate(specs, 1):
         try:
             rows = fetch(sp.symbol, sp.since, sp.until)
         except Exception as exc:  # noqa: BLE001 — isolate a bad symbol
-            typer.echo(f"altdata {ds} {sp.symbol}: 0 rows ({exc})")
+            typer.echo(f"altdata {ds} [{i}/{len(specs)}] {sp.symbol}: 0 rows ({exc})")
             continue
         total += upsert(engine, rows)
-        covered.append({"symbol": sp.symbol, "covered_from": sp.rec_from,
-                        "covered_to": sp.rec_to, "rows": len(rows)})
-        typer.echo(f"altdata {ds} {sp.symbol}: {len(rows)} rows")
-    upsert_coverage(engine, ds, covered)
+        upsert_coverage(engine, ds, [{"symbol": sp.symbol, "covered_from": sp.rec_from,
+                                      "covered_to": sp.rec_to, "rows": len(rows)}])
+        typer.echo(f"altdata {ds} [{i}/{len(specs)}] {sp.symbol}: {len(rows)} rows "
+                   f"(since {sp.since})")
     return total
 
 
@@ -564,11 +662,13 @@ def optimize(
     syms = symbols_with_bars(engine, settings.universe_symbols(d["universe"]), d["bar"],
                              d["start"], d.get("end"), limit=d.get("max_symbols"))
     panel = load_panel(engine, syms, d["bar"], d["start"], d.get("end"),
-                       session=d.get("session", "regular"), exchanges=settings.exchanges)
+                       session=d.get("session", "regular"), exchanges=settings.exchanges,
+                       resample=d.get("resample"))
     if d.get("features"):  # attach alt-data feature matrices for alt-data strategies
         from trading_simple import features
         features.attach_features(panel, engine, d["features"], settings=settings)
-    typer.echo(f"optimize {strategy}: {len(syms)} symbols, study={strat.optuna['study']}")
+    typer.echo(f"optimize {strategy}: {len(syms)} symbols @ {panel.bar}, "
+               f"study={strat.optuna['study']}, objectives={list(opt.objectives_for(strat))}")
     typer.echo("dashboard: uvx optuna-dashboard "
                f"{opt.study_path(strat, strat.optuna['study'])}  "
                "(run in another terminal, live at http://127.0.0.1:8080)")

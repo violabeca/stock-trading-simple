@@ -15,7 +15,9 @@ data:
 # Study settings. The search SPACE is not here — each parameter declares its own
 # `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: squeeze-1m-v3     # v3: 2026-07-19 engine realism (panel-priced costs +
+  study: squeeze-1m-v4     # v4: 2026-09-27 wallet shorts lock cash — short proceeds
+                           # no longer fund longs; a short's stop covers it whole. v3 not comparable.
+                           # v3: 2026-07-19 engine realism (panel-priced costs +
                            # pessimistic stop fills, exit-wins signal conflicts) — v2 journals not comparable.
                            # v2: capital model changed to one shared $10k wallet — v1
                            # scored independent per-symbol books (and predates the

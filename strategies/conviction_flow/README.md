@@ -47,7 +47,9 @@ positive floor rejects it — "we can't verify quality, don't buy"). If the
 fundamentals table is too thin to rank at all (below `_MIN_COVERAGE = 0.5`
 breadth), the gate **self-disables** and the strategy degrades to `informed_flow` —
 the same graceful degradation a missing alt-data sleeve gets. All `fund_*` matrices
-are already point-in-time lagged in `features.py`, so there is no look-ahead.
+are already point-in-time lagged in `features.py`, so there is no look-ahead. Share
+counts are also screened there (thousand-fold unit slips dropped, stale counts masked),
+so `mktcap` is missing, not wrong, for a name SEC reports no usable share count for.
 
 ## Data
 
@@ -56,7 +58,7 @@ are already point-in-time lagged in `features.py`, so there is no look-ahead.
 `fund_shares, fund_equity, fund_ni_ttm, fund_gp_ttm, fund_assets` (the quality
 gate). Universe `LiquidLeaders`, daily bars, train 2021–2024, 2025+ untouched
 holdout. All features are already ingested (see
-`notebooks/03_altdata_update.ipynb`, `--dataset fundamentals`); no new ingestion or
+`notebooks/03_altdata_update.py`, `--dataset fundamentals`); no new ingestion or
 engine change was needed to add this strategy.
 
 ## Reading the result

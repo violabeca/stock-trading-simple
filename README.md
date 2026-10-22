@@ -94,12 +94,22 @@ strategies/
   gap_and_go/                 strategy 10: intraday opening-range breakout on overnight gaps  (+ notebook)
   turnover_momentum/          strategy 11: DAILY short-term momentum conditioned on share turnover  (+ notebook; falsified on this data)
   momentum_swing/             strategy 12: DAILY Qullamaggie-style breakouts + episodic pivots, ATR stop, SMA trail, regime gate  (+ notebook)
+  level_flow/                 strategy 13: intraday multi-week level bounce/break scanner, long/short, per-entry risk sizing  (+ 2 notebooks)
+  trend_following/            strategy 14: DAILY long/short trend starts (Donchian + ADX), 12-1 relative-strength slots, ratcheting ATR chandelier stop  (+ notebook)
+  trend_following_1m/         strategy 15: trend_following's code on 1-MINUTE bars of ten liquid stocks (Morning10), session rules, alpha objective  (+ notebook)
+  burst_scan/                 strategy 16: activity bursts on 5-minute bars; a LONG and a SHORT sub-strategy, each with its own detector and walk-forward classifier, holds past the close  (+ 5 notebooks)
 notebooks/
   01_universe_screener.ipynb  find symbols worth loading
   02_backfill.ipynb           load daily AND intraday price history
-  03_altdata_update.ipynb     ingest + audit alternative data (insider, ratings, price targets, short interest, fundamentals)
+  03_altdata_update.py        ingest + audit alternative data (marimo; short interest, insider, fundamentals, ratings, price targets)
   04_compare.ipynb            the cross-strategy scoreboard: every strategy vs its buy-and-hold baseline
 scripts/nbclean.py            clears notebook outputs; run on staged .ipynb by the pre-commit hook
+scripts/marketdata_dump.py    resumable MarketData.app download (last year: EOD option chains with open
+                              interest, news; no price bars) for the DB's well-covered 1m names → var/marketdata/
+scripts/finviz_ratings.py     Finviz's last-20 analyst actions per ingested name (paced, stops when blocked),
+                              as analyst_ratings / price_targets-shaped CSVs in var/finviz/ to compare with Yahoo
+collectors/                   24/7 data collection, separate from the framework (own deps, own TimescaleDB via
+                              docker compose): binance_depth.py = Binance futures order books (see its README)
 tests/                        offline tests (synthetic data, ~5 s)
 ```
 
@@ -158,6 +168,14 @@ strategies choose at load time with `data.session: regular | extended | both`.
 Extended-hours collection is **off by default** (`ibkr.extended_hours` in
 settings) — turn it on when you want to explore after-hours behavior.
 
+**Coarser intraday bars are derived, never backfilled.** The database holds one intraday
+history (`1m`). A strategy that wants to trade 5- or 15-minute candles sets `data.resample: 5`
+(minutes) and `load_panel` builds them from the 1m bars at load time
+(`data.resample_panel`): buckets start at each session's first stored bar, so 09:30–09:34 is
+one candle and a half-day's last partial bucket stays inside its day; the candle keeps its
+first bar's timestamp. Everything downstream is bar-agnostic. Each execution bar is its own
+experiment — bump `optuna.study` when you change it.
+
 **Session-consistent indicators.** Intraday volume is U-shaped (huge at the
 open, quiet at lunch) and extended-hours volume is thin. An indicator that
 averages across all of that is comparing apples to oranges. Two defenses:
@@ -202,7 +220,14 @@ changes every number, so bump `optuna.study` along with it.
 
 **Costs are always on.** Every backtest charges commission, half the quoted
 spread, and slippage per leg (the `costs:` block in settings). An edge that
-dies from 9 bps of round-trip friction was never an edge.
+dies from 9 bps of round-trip friction was never an edge. The commission has a **$1
+minimum**, which the engine turns into a fee fraction at an assumed **$10,000 order** (1 bp).
+That is right for a wallet that trades a few large positions and ~10× too cheap for a many-slot
+portfolio book: 30 slots of a $30k account place $1,000 orders, where $1 is 10 bp, and at 1 bp a
+high-turnover parameter set looks almost free. Such a strategy declares its real order size —
+`backtest: {order_notional: 1000}` in its `config.yaml` — and every backtest, sweep and study of it
+(and its benchmark) is charged at that size (`backtest.strategy_costs`). Changing it changes
+every number, so bump `optuna.study` along with it. Only `informed_flow` sets it today.
 
 **Stops.** A strategy may return `sl_stop` / `tp_stop` (stop distance as a
 fraction of entry price — e.g. an ATR multiple) and `sl_trail: true` to make
@@ -216,7 +241,11 @@ analyst price-target revisions (Yahoo), short interest (FINRA), and company
 trailing-twelve-month net income and gross profit) — each ingested by this repo's
 own providers (no dependency on the sibling repo) and stored point-in-time: every
 row carries a `known_at` (when it became public — for fundamentals, the filing
-date), so features never see a value before it existed. A strategy opts in with a
+date), so features never see a value before it existed. Filers' own mistakes in the
+fundamentals (thousand-fold unit slips, zero share counts, abandoned XBRL tags) stay stored
+as filed: the SEC parser falls back tag by tag per filing, and `features.py` screens
+implausible share counts and masks any fundamentals level no filing has refreshed in over
+two years. A strategy opts in with a
 `data.features:` list in its config; `features.attach_features` then rides those
 matrices on `Panel.features` (one wide *date × symbol* frame per signal, already
 lagged), and `signals()` reads them like any price field — forming price-relative
@@ -225,21 +254,36 @@ Panel. The `informed_flow` strategy ranks stocks on the insider/ratings/short-
 interest composite; `value_factor` ranks them on a value + quality composite from
 the fundamentals sleeve. Adding a new alt-data strategy needs no engine change —
 just a folder and a `data.features:` line; adding a new *feature type* is one
-builder in `features.py` (plus its provider), like the fundamentals sleeve.
+builder in `features.py` (plus its provider), like the fundamentals sleeve. The
+**option-chain features** (`opt_atm_iv`, `opt_skew`, `opt_put_skew`, `opt_cpiv`, option
+volumes and open interest) are read from local files instead: `scripts/marketdata_dump.py`
+downloads MarketData.app's end-of-day chains to `var/marketdata/chains/`, and
+`providers.marketdata.build_cache()` (notebook 03, §5b) solves their implied volatilities and
+keeps one summary per name and day in `var/options/`.
 
-**`03_altdata_update.ipynb` is the single entry point for alt-data ingestion**,
-incremental *and* historic (`MODE = "backfill"`). The insider backfill pulls SEC's
-**quarterly Form 3/4/5 bulk data sets** (`tsim altdata --bulk`) — one ~14 MB download
-per quarter serves every issuer, turning a days-long per-filing scrape into minutes
-while recording the same per-symbol coverage ledger, so a re-run skips the solid
-history; the live per-filing scraper stays the incremental path for the current,
-unpublished quarter. It also **audits coverage**, which
+**`03_altdata_update.py` (marimo) is the single entry point for alt-data ingestion.**
+Every run fetches only what is **missing**, name by name, for every name in the database: a
+coverage ledger records which window of each dataset each name already has, so a run fetches
+the history a name lacks back to `BACKFILL_START` and the days since its last refresh, and a
+name that is up to date costs nothing. The insider history comes from SEC's **quarterly Form
+3/4/5 bulk data sets** — one ~14 MB download per quarter serves every issuer — and only the days
+after the newest published quarter from the per-filing scraper; short interest comes from
+FINRA's per-settlement files, which carry every name. Each finished name is recorded at once,
+so a stopped run continues where it stopped. The notebook shows the plan before anything is
+downloaded, and starts only when its button is pressed. It also **audits coverage**, which
 matters more than it sounds: a half-ingested table does not fail loudly, it goes
 quiet. Because a cross-sectional ranker imputes a *neutral median* rank wherever a
 name has no data, a sleeve covering a handful of symbols still looks scored — it
 silently becomes a large arbitrary tilt on those few names and noise for everyone
 else. So the notebook checks **breadth and depth, not just freshness**, and
-`informed_flow` drops any sleeve covering less than half the universe.
+`informed_flow` drops any sleeve covering less than half the universe — on every bar, not
+just on its best one. A table can also go quiet at its **end**: from July 2026 routine
+updates refreshed only the 120 `LiquidLeaders` names while `informed_flow` ranked 500, and
+395 of them carried a weeks-old short interest with every check green; its successor, the
+union of the traded universes, still left ~1,500 of ~2,300 names without short interest from
+July to October 2026. So the notebook now covers every name, its §4a audits the newest data of
+every universe a strategy trades, and `features.py` masks a short-interest level older than
+45 days instead of carrying it (FINRA publishes twice a month).
 
 **Two execution models.** A strategy returning `entries`/`exits` runs **per-symbol**:
 each symbol trades its own `init_cash` in its own account. A strategy returning a
@@ -262,6 +306,10 @@ name trimmed back to its slot once its realized book weight reaches `retrim_k ×
 target (e.g. `2` = double), so a single runaway winner cannot come to dominate the book;
 the freed cash rotates into the next name the strategy picks. The cap is off by default
 (`backtest._retrim_loop`), so the benchmark and every strategy that omits it are unaffected.
+A negative weight is a **short**: its sale proceeds stay locked for the buy-back (as in the
+wallet), so a long/short book's gross exposure stays at most ~100% of the book, and a strategy
+may return a `borrow` rate (yearly, per name and bar) that the engine charges each short for
+every calendar day it is held (`informed_flow_ls`).
 
 There is a third, wallet-shaped variant of the signal path — and it is **the repo
 default**: a strategy returning a scalar `cash_frac` alongside `entries`/`exits` runs
@@ -269,10 +317,19 @@ against **one cash-shared wallet** of `init_cash` *total*, each entry deploying 
 fraction of the currently free cash — so total invested can never exceed the wallet,
 exactly how a single real account would scan many names. Every shipped signal strategy
 trades this way; per-symbol books remain available only as a diagnostic (drop
-`cash_frac` from the returned dict). One wallet-mode rule to know: percent sizing
+`cash_frac` from the returned dict). Two wallet-mode rules to know: percent sizing
 cannot *reverse* a position in one order, so an opposite-direction entry closes the
 open position instead (`upon_opposite_entry="close"` in the engine); the new direction
-opens on a later bar if its signal persists.
+opens on a later bar if its signal persists. And a short's sale proceeds are **locked**
+for buying it back (`lock_cash=True`): they can never fund a long, so the book stays at
+most 100% invested with shorts included, and a stop on a short always covers the whole
+position — without it a long could spend the proceeds and the stop would then cover only
+what cash was left. `cash_frac` may also be a dense per-bar
+**frame**, read at each fill bar (`backtest.cash_frac_size`): that is how a strategy sizes
+every entry off its own stop distance — `min(1/slots, risk_per_trade / stop)`, the
+risk-per-trade rule (`level_flow`). A NaN cell would make vectorbt skip that entry with no
+error, so the engine refuses a frame with NaNs. Percent sizing is of the *free* cash, so
+five same-day entries at a 1/5 slot deploy 20%, 16%, 12.8%, … — never 100%.
 
 **The objectives: return over the benchmark, against the annual risk rate — both per
 year.** Optimization scores two numbers **together**:
@@ -284,6 +341,19 @@ year.** Optimization scores two numbers **together**:
 In words: *beat the market, as calmly as possible*. The front is a real menu of return
 against risk. A strategy that de-risks, by sitting partly in cash in a downtrend or scaling
 down when markets turn wild (informed_flow's `risk_method`), gets credit for it.
+
+One sanctioned alternative on the return side: **`alpha_cagr`**, the return left after the
+market exposure the book *actually ran* — `cagr − beta × benchmark cagr`, with `beta`
+measured on per-bar returns (`backtest.active_stats` reports both). It exists for a long/short
+intraday scanner that is flat most of the day (`level_flow`): `excess_cagr` asks such a book
+to out-earn a fully invested basket, which it cannot do by construction, so every study would
+end in "nothing beats buy-and-hold" without ever measuring whether the *selection* had value.
+Alpha still charges for whatever beta the book took — a long-only book with beta ≈ 1 gets
+alpha ≈ excess, so nothing is given away — and a cash-heavy book cannot game it, because its
+alpha is then simply its own small return. `informed_flow` scores it too, from the other
+direction: its return-only study (v25) crowned a five-name long book with beta 2.1 whose
+holdout excess of +10%/yr was all exposure — alpha after beta −35%/yr. Maximizing excess
+rewards concentrating in high-beta names; alpha charges for it.
 
 Two earlier pairs were retired:
 - `info_ratio` and `excess_cagr` were one number in two costumes (Spearman 0.975), so fronts
@@ -313,10 +383,30 @@ minimizing volatility puts timid books (mostly cash, or the calmest names) that 
 market at the low end of the front; they stay visible there but are never picked. If no row qualifies, the pick
 falls back to the whole front and flags it (`beats_benchmark = False`).
 
+**Choosing other objectives.** The pair above is the default. A strategy can score one or
+two other metrics instead, in its `config.yaml`:
+
+```yaml
+optuna:
+  study: my-strategy-excess-only-v1   # a new name: the old journal was scored on the pair
+  objectives: [excess_cagr]           # or e.g. [excess_cagr, max_drawdown]
+```
+
+Pick from `optimize.SCOREABLE`: `excess_cagr`, `alpha_cagr`, `info_ratio`, `volatility`,
+`tracking_error` and `max_drawdown`. Each metric's direction is built in, so a sign slip cannot optimize a
+strategy backwards. Absolute `sharpe`, `cagr` and `total_return` are left out on purpose (see
+above). With one objective there is no trade-off, so the "front" is just the best trial (or
+the trials tied for it). Everything downstream reads the objectives off the study itself:
+`pareto_frame`, `pick_from_front`, `pick_best` and `plots.plot_pareto`, which draws that
+objective against volatility. Every metric the study does not score is still recorded on each
+trial, and the pick still only chooses a row above the study's hurdle — `excess_cagr > 0`,
+or `alpha_cagr > 0` when the study leads with alpha (`optimize.HURDLES`).
+
 Each study is **stamped with the objectives it was scored on**. A journal stores its
 values by position only, so an old `(info_ratio, excess_cagr)` journal read under today's
 labels would silently present every information ratio as an excess return;
-`optimize.load_study` / `run_study` refuse such a journal instead — bump `optuna.study`.
+`optimize.load_study` / `run_study` refuse a journal scored on anything other than the
+strategy's configured objectives — bump `optuna.study`.
 
 Both first collapse the front with `optimize.distinct_front`, which keeps one row per
 distinct *objective pair*. This is not cosmetic: an **inert** parameter — one that cannot
@@ -344,8 +434,9 @@ the same fixed count.
 so their numbers can sit in one table (`notebooks/04_compare.ipynb`):
 
 1. **One shared $10,000 wallet.** Each strategy trades a single cash account of
-   `init_cash` *total* (the `cash_frac` wallet or a `weights` portfolio — never one
-   book per symbol). The dollar amount is a global setting no strategy may override.
+   `init_cash` *total* (the `cash_frac` wallet — a scalar or a per-entry frame — or a
+   `weights` portfolio — never one book per symbol). The dollar amount is a global
+   setting no strategy may override.
 2. **Fractional shares.** No share rounding anywhere, so with one shared book every
    result is scale-invariant: $10k is a reporting convention, not a constraint.
 3. **Same costs.** One global cost model (`config/settings.yaml`), applied identically
@@ -424,7 +515,8 @@ through exactly this recipe with a validation gate at the end.
   universes. Every key maps 1:1 onto `src/trading_simple/config.py`.
 * **Per strategy** (`strategies/<name>/config.yaml`): `data` (which panel to
   load), `optuna` (study name, sampler, trials), an optional `backtest` block
-  (`fill: open | pessimistic`, see *Fill pricing*), and
+  (`fill: open | pessimistic`, see *Fill pricing*; `order_notional`, the real order size in
+  dollars, see *Costs are always on*), and
   `params`, where each parameter is declared **once** with its `doc`, its shipped
   `value`, and optionally the `search` range and `grid` list it varies over.
   There is no separate sweep or space block: a knob's shipped value and the

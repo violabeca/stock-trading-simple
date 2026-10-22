@@ -5,6 +5,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
+from trading_simple.config import IBKRSettings
 from trading_simple.exchanges import REGISTRY
 from trading_simple.providers import ibkr, yf
 
@@ -81,6 +82,125 @@ def test_pacer_enforces_min_gap():
 def test_contract_args_by_venue():
     assert ibkr.contract_args("AAPL", REGISTRY["US"]) == ("AAPL", "SMART", "USD")
     assert ibkr.contract_args("NESN", REGISTRY["SIX"]) == ("NESN", "EBS", "CHF")
+
+
+# --- IBKR: reconnect on a dropped connection ---------------------------------
+class _FakeIB:
+    """Duck-typed stand-in for ``ib_async.IB`` — no network, no event loop."""
+
+    def __init__(self, fail_first: int = 0):
+        self.fail_first = fail_first  # how many connect() calls should raise first
+        self.connect_calls = 0
+        self.sleeps: list[float] = []
+
+    def sleep(self, s: float) -> None:
+        self.sleeps.append(s)
+
+    def disconnect(self) -> None:
+        pass
+
+    def connect(self, host, port, clientId, timeout) -> None:  # noqa: N803 - matches ib_async
+        self.connect_calls += 1
+        if self.connect_calls <= self.fail_first:
+            raise ConnectionError("gateway not back up yet")
+
+
+def _settings() -> IBKRSettings:
+    return IBKRSettings(host="127.0.0.1", port=4002, client_id=10)
+
+
+def test_reconnect_succeeds_on_first_attempt():
+    ib = _FakeIB(fail_first=0)
+    assert ibkr._reconnect(ib, _settings(), attempts=4, wait_s=0) is True
+    assert ib.connect_calls == 1 and ib.sleeps == [0]
+
+
+def test_reconnect_retries_then_succeeds():
+    ib = _FakeIB(fail_first=2)
+    assert ibkr._reconnect(ib, _settings(), attempts=4, wait_s=0) is True
+    assert ib.connect_calls == 3
+
+
+def test_reconnect_gives_up_after_all_attempts():
+    ib = _FakeIB(fail_first=10)
+    assert ibkr._reconnect(ib, _settings(), attempts=3, wait_s=0) is False
+    assert ib.connect_calls == 3
+
+
+# --- IBKR: a slow answer is not the end of history ---------------------------
+class _ScriptedIB:
+    """Answers history requests from a script of ``(bars, seconds the answer takes)`` on a fake
+    clock; ``sleep`` is free."""
+
+    def __init__(self, script):
+        self.script, self.now, self.timeouts = list(script), 0.0, []
+
+    def sleep(self, s: float = 0.0) -> None:
+        self.now += s
+
+    def reqHistoricalData(self, contract, **kw):  # noqa: N802 - matches ib_async
+        self.timeouts.append(kw["timeout"])
+        bars, took = self.script.pop(0)
+        self.now += took
+        return bars
+
+
+def _window(ib):
+    pacer = ibkr.Pacer(max_per_window=100, window_s=600, min_gap_s=0)
+    return ibkr.fetch_window(ib, "SPY", "20250115 23:59:00", "10 D", bar="1m", use_rth=False,
+                             pacer=pacer, clock=lambda: ib.now)
+
+
+def test_a_timed_out_window_is_asked_again_and_a_quick_empty_one_ends_the_history():
+    timeout = ibkr.REQUEST_TIMEOUT_S
+    slow_then_ok = _ScriptedIB([([], timeout), (["bar"], 30.0)])
+    assert _window(slow_then_ok) == (["bar"], "ok") and slow_then_ok.timeouts == [timeout] * 2
+    quick_empty = _ScriptedIB([([], 0.4)])
+    assert _window(quick_empty) == ([], "empty") and len(quick_empty.timeouts) == 1
+    never = _ScriptedIB([([], timeout)] * (ibkr.TIMEOUT_RETRIES + 1))
+    assert _window(never) == ([], "timeout") and not never.script   # every try was used
+
+
+def test_a_symbol_that_never_answers_is_left_out_not_stored_with_a_hole(monkeypatch):
+    import sys
+    import time
+    from types import SimpleNamespace
+
+    bar = {"date": pd.Timestamp("2024-01-10 15:00", tz="UTC"), "open": 1.0, "high": 1.0,
+           "low": 1.0, "close": 1.0, "volume": 10.0}
+    script = {"SLOW": [([], 0.06), ([], 0.06)],          # two windows' worth of silence
+              "FAST": [([bar], 0.0), ([], 0.0)]}         # one window of bars, then the start
+
+    class IB:
+        def connect(self, *args, **kwargs):
+            pass
+
+        def isConnected(self):  # noqa: N802 - matches ib_async
+            return True
+
+        def qualifyContracts(self, *contracts):  # noqa: N802 - matches ib_async
+            return contracts
+
+        def sleep(self, s=0.0):
+            pass
+
+        def disconnect(self):
+            pass
+
+        def reqHistoricalData(self, contract, **kw):  # noqa: N802 - matches ib_async
+            bars, took = script[contract.symbol].pop(0)
+            time.sleep(took)                                # a real (short) wait: a timeout
+            return bars
+
+    monkeypatch.setitem(sys.modules, "ib_async", SimpleNamespace(
+        IB=IB, Stock=lambda symbol, exchange, currency: SimpleNamespace(symbol=symbol),
+        util=SimpleNamespace(df=lambda raw: pd.DataFrame(raw))))
+    monkeypatch.setattr(ibkr, "REQUEST_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(ibkr, "TIMEOUT_RETRIES", 1)
+    seen = []
+    out = ibkr.fetch_batch(["SLOW", "FAST"], "1m", date(2024, 1, 1), date(2024, 1, 15),
+                           settings=_settings(), on_symbol=lambda s, bars: seen.append(s))
+    assert list(out) == ["FAST"] and len(out["FAST"]) == 1 and seen == ["FAST"]
 
 
 def test_ib_frame_to_bars_rth_tagging_and_sentinels():

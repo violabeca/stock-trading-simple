@@ -1,0 +1,192 @@
+# ===========================================================================
+# informed_flow_ls_p1 — RESEARCH COPY of informed_flow_ls v6 for proposal 1 (STRATEGY_OVERVIEW.md
+# §6; informed_flow_ls/RESEARCH_LOG.md §38P, 2026-10-21). Not shipped: every value below is v6's,
+# and its extra knobs (sizing, beta_window, max_size, w_sishare, short_below_ma, hedge) are OFF.
+# Each was tested as an iteration and none passed the pre-registered bar; `sizing: beta` is a
+# documented RISK option (lower drawdown and volatility for ~1 pt of alpha). Delete this folder,
+# or fold `sizing` into informed_flow_ls, once the user has decided.
+# ===========================================================================
+
+data:
+  universe: Liquid500      # the headless default (tsim optimize). The walk-forward notebook
+                           # trades a ROLLING point-in-time top 500 instead (informed_flow v36):
+                           # each 6-month period's members ranked on the 6 months before it.
+  bar: 1d
+  start: "2018-01-01"      # warm-up for the 126-bar windows before score_from
+  end: null                # everything stored: the walk-forward is the out-of-sample test and
+                           # paper trading from 2026-10-20 the final check (all earlier data has
+                           # been read by informed_flow's eleven versions)
+  session: regular
+  max_symbols: 500
+  features: [short_interest, fund_shares, opt_skew]   # opt_skew: providers/marketdata.py
+                           # (build its cache first: notebook 03, "Option chains")
+
+optuna:
+  study: informed-flow-ls-p1   # bump whenever a `search:` bound, the objective, the
+                           # execution model or the borrow model changes. v2 (2026-10-20):
+                           # skew_smooth 5 + score_smooth 5 (RESEARCH_LOG.md §4, §6); v3-v4
+                           # added two short filters that failed the fresh-names test (§22);
+                           # v5 = the v2 design, re-adopted; v6 (2026-10-21) = v5 + short_stop
+                           # 1.0, on the refreshed short-interest data (§31-§34).
+  sampler: tpe
+  seed: 42
+  n_trials: 80             # per walk-forward period (the notebook's inner study); a headless
+                           # `tsim optimize` runs this many on the config's panel
+  objectives: [alpha_cagr] # a dollar-neutral book has beta near 0: excess over a fully invested
+                           # basket is unreachable by construction (optimize.OBJECTIVES)
+  score_from: "2020-07-01" # every trial scored warm from here (as informed_flow since v26)
+  min_trades_per_year: 20  # admissibility floor, per year
+
+backtest:
+  fill: open               # live = market-on-open orders (informed_flow v32)
+  order_notional: 1000     # $30k account, 30 positions (15 a side): each order ~$1,000
+
+params:
+  dtc_window:
+    doc: >-
+      Bars days-to-cover is averaged over before ranking (informed_flow shipped 42 since v34;
+      126 failed to replicate on the rolling universe in v40).
+    value: 42
+    search: { type: int, low: 21, high: 126, step: 21 }
+  skew_window:
+    doc: >-
+      Bars over which the change in put skew (opt_skew: IV of the 95% put minus the ATM call)
+      is measured. The 2026-10-19 screen read 20: rising skew predicted underperformance over
+      10-21 days on both halves of ~1,100 optionable names (IC +0.015..+0.024, NW t 2.6-5.2).
+    value: 20
+    search: { type: int, low: 10, high: 60, step: 5 }
+  w_si:
+    doc: Weight of the short-interest sleeve in the composite (the numeraire; not searched).
+    value: 1.0
+  w_skew:
+    doc: >-
+      Weight of the put-skew sleeve relative to short interest. Equal weight ships (an equal
+      composite resists overfitting); before October 2025 there are no chains and the sleeve
+      is silent whatever its weight.
+    value: 1.0
+    search: { type: float, low: 0.0, high: 2.0, step: 0.25 }
+  neutral_groups:
+    doc: >-
+      Dollar-volume groups each sleeve is ranked within (days-to-cover has volume in its
+      denominator; v31 measured ~3.5 pts/yr of informed_flow's alpha as that lean). Never
+      searched (informed_flow lesson).
+    value: 5
+  q_in:
+    doc: Long entry rank (the short side enters at 1 - q_in).
+    value: 0.9
+  q_out:
+    doc: Long exit rank (the short side exits above 1 - q_out). Never searched (v27 lesson).
+    value: 0.8
+  slots:
+    doc: >-
+      Positions per side. 15 + 15 = informed_flow's 30; 20 slots were rejected in v38 (a few
+      lottery winners), and slot counts were floor-pinned by every study that searched them.
+    value: 15
+  max_hold:
+    doc: Bars a position is held unless it still ranks in its entry zone.
+    value: 126
+  gross:
+    doc: >-
+      Long plus short exposure as a share of the book (user choice 2026-10-19: 50% long / 50%
+      short, no margin). The engine locks short proceeds, so gross cannot exceed ~100% when
+      orders are placed; 0.98 leaves headroom for fees.
+    value: 0.98
+  sides:
+    doc: >-
+      both | long | short. The walk-forward's controls run the long side alone; the shipped
+      book is both sides.
+    value: both
+  short_stop:
+    doc: >-
+      The squeeze stop: a short whose close rises this far above its entry close is bought
+      back, and is not shorted again until its rank has left the short entry zone. 1.0 since
+      v6 (2026-10-21, RESEARCH_LOG §34): the 50% stop bought back at the squeeze's top (14
+      stopped shorts lost 29% each, then fell 9%); 0.75, 1.0 and no stop all beat 0.5 on the top
+      500 and on names 501-1000. The crowded exit (short_max_si) still bounds a squeeze.
+    value: 1.0
+    search: { type: float, low: 0.25, high: 1.0, step: 0.25 }
+  short_max_si:
+    doc: >-
+      Short interest / shares outstanding above which a name is never shorted (hard to
+      borrow; squeeze risk); a held short reaching it is bought back. 0.2 helped on the top 500
+      (RESEARCH_LOG §14) but cost 3.9 pts on the fresh names 501-1000 (§22): reverted.
+    value: 0.3
+  si_mid:
+    doc: Crowding tier for the borrow fee (short interest / shares outstanding).
+    value: 0.1
+  si_high:
+    doc: >-
+      Upper crowding tier for the borrow fee.
+    value: 0.2
+  borrow_gc:
+    doc: >-
+      Yearly borrow fee below si_mid. There is no free borrow-fee history, so the tiers are
+      assumptions on the conservative side of the literature (general collateral ~0.25-0.5%,
+      specials several percent: D'Avolio 2002; Muravyev, Pearson & Pollet 2022).
+    value: 0.005
+  borrow_mid:
+    doc: Yearly borrow fee between si_mid and si_high.
+    value: 0.03
+  borrow_high:
+    doc: Yearly borrow fee above si_high (up to short_max_si).
+    value: 0.1
+  min_price:
+    doc: Minimum close for a name to be ranked.
+    value: 5.0
+  retrim_k:
+    doc: >-
+      A long that grows to k x its slot is trimmed back (engine concentration cap; longs only).
+      Shorts are bounded by short_stop instead.
+    value: 2.0
+  skew_smooth:
+    doc: >-
+      Sessions the put skew is averaged over before its change is taken. v1 used the raw daily
+      level (1): its 20-day change jumped every day and the book crossed its bands daily — fees
+      took 10% of the book in 2026. 5 adopted 2026-10-20 (RESEARCH_LOG §4: +5.4 pts, P 0.998,
+      every option-era period better).
+    value: 5
+  score_smooth:
+    doc: >-
+      Sessions the composite is averaged over before it is ranked (1 = off). 5 adopted
+      2026-10-20 on top of skew_smooth (RESEARCH_LOG §6: +2.3 pts, P 0.885, 6/10 periods); 10 was
+      worse (§8), so the window is not a dial to push. With skew_smooth it also held on the fresh
+      names 501-1000 (§22: +1.3 pts over no smoothing).
+    value: 5
+  long_share:
+    doc: >-
+      The long side's share of gross (0.5 = dollar-neutral, the user's 50/50 choice). 0.43
+      (beta-neutral) tested 2026-10-20: beta -> 0.00 but alpha -0.6 pts — a risk choice, not an
+      edge.
+    value: 0.5
+  sizing:
+    doc: >-
+      equal | beta. "beta" scales a slot at entry by the median beta / the name's beta (between
+      1/max_size and max_size), frozen while held, so every position carries about the same
+      market risk and the ex-ante beta stays near 0 (proposal 1, RESEARCH_LOG §38P).
+    value: equal
+  beta_window:
+    doc: Bars of the trailing beta (to the equal-weight eligible names) that "beta" sizing reads.
+    value: 126
+    search: { type: int, low: 63, high: 252, step: 63 }
+  max_size:
+    doc: >-
+      Bounds of "beta" sizing: a slot is scaled between 1/max_size and max_size of its equal size
+      (1.0 = equal sizing).
+    value: 1.5
+    search: { type: float, low: 1.0, high: 2.0, step: 0.25 }
+  w_sishare:
+    doc: >-
+      Weight of a second short-interest sleeve, short interest / shares outstanding (no volume in
+      its denominator). Iteration 2 (RESEARCH_LOG §38P): it runs net short beta and loses the
+      rebounds; rejected at 0.5, 1 and 2.
+    value: 0.0
+  short_below_ma:
+    doc: >-
+      When > 0, short (and keep short) only names closing below this many bars' average. Loop 2's
+      R1; iteration 3 tested it with and without an index fill: rejected.
+    value: 0
+  hedge:
+    doc: >-
+      Index fund symbol that fills every empty short slot ("" = off). It must be in the panel; it
+      is never ranked. Iteration 3: rejected.
+    value: ""

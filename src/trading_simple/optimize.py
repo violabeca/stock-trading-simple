@@ -1,11 +1,14 @@
 """Optuna optimization: multi-objective, resumable, one study file per run.
 
-Every study scores **two objectives at once** — the annualized excess return over
+By default a study scores **two objectives at once** — the annualized excess return over
 buy-and-hold (maximized) and the strategy's own annualized volatility, its annual risk
 rate (minimized) — so the result
 is a *Pareto front* of defensible trade-offs rather than a single (possibly degenerate)
-winner. :func:`pick_best` then reduces the front to one trial under an explicit
-preference weighting, choosing only among trials that beat the benchmark, and
+winner. A strategy can score one or two other metrics instead with ``optuna.objectives``
+in its config (:data:`SCOREABLE`; :func:`objectives_for`); a one-objective study's
+"front" is simply its best trial. :func:`pick_best` then reduces the front to one trial
+under an explicit preference weighting, choosing only among trials that beat the
+benchmark, and
 :func:`boundary_report` checks whether the winner is pressing against the
 searched ranges (a hint to widen ``optuna.space`` and re-run).
 
@@ -83,28 +86,56 @@ log = logging.getLogger(__name__)
 #: strategy's return up by 3x to "compare it fairly" inverts the truth — sitting in cash
 #: is a real cost paid against a fully-invested benchmark, and it is the very thing that
 #: has to be earned back. The benchmark-relative framing prices it correctly already.
+#:
+#: **The one sanctioned alternative return objective is ``alpha_cagr``** — the return left
+#: after the market exposure the book *actually ran* (``cagr − beta × benchmark cagr``,
+#: :func:`backtest.active_stats`). It exists for a long/short intraday scanner that is flat
+#: most of the day: ``excess_cagr`` asks such a book to out-earn a fully invested basket
+#: (+47%/yr on the 1m tape), which it cannot do by construction, so every study would end in
+#: the same "nothing beats buy-and-hold" without ever measuring whether the selection had
+#: value. Alpha still charges the book for whatever beta it did take (a long-only book with
+#: beta ≈ 1 gets alpha ≈ excess, so nothing is given away) and a cash-heavy book cannot game
+#: it — its alpha is simply its own small return. It is NOT an absolute return: the beta term
+#: is exactly the exposure-earned part that the absolute-Sharpe trap above rewards.
 OBJECTIVES = ("excess_cagr", "volatility")
 #: Optuna direction of each :data:`OBJECTIVES` entry, in the same order.
 DIRECTIONS = ("maximize", "minimize")
-#: Admissibility floor on ``excess_cagr`` inside :func:`pick_from_front`: only front rows that
-#: beat buy-and-hold may be picked. Minimizing risk makes the LOW end of the front a row of
-#: timid books — mostly in cash, or holding the calmest names — that are "optimal" on that
-#: axis while earning less than simply owning the market (v23's re-run front reached down to
-#: −3%/yr), and a balanced pick could land on one. The front keeps those rows, because they
-#: are the honest shape of the trade-off; the pick just never chooses one.
+#: Every metric a study may score, with the direction it is optimized in. A strategy picks
+#: one or two in ``optuna.objectives`` (e.g. ``[excess_cagr]``); without it, it scores
+#: :data:`OBJECTIVES`. The direction lives here, not in the config, because it belongs to
+#: the metric: nobody minimizes excess return, and a sign slip in YAML would optimize a
+#: strategy backwards without an error. ``max_drawdown`` is negative (−0.25 = a 25% fall),
+#: so it is maximized. Absolute ``sharpe`` / ``cagr`` / ``total_return`` are left out on
+#: purpose: they reward market exposure, not skill (see :data:`OBJECTIVES`); ``alpha_cagr``
+#: is in because its beta term charges for exactly that exposure.
+SCOREABLE = {"excess_cagr": "maximize", "info_ratio": "maximize", "volatility": "minimize",
+             "tracking_error": "minimize", "max_drawdown": "maximize",
+             "alpha_cagr": "maximize"}
+#: The return-like objectives a study may lead with; :func:`pick_from_front` applies its
+#: admissibility floor to whichever one the study scored first (``excess_cagr`` otherwise).
+HURDLES = ("excess_cagr", "alpha_cagr")
+#: Admissibility floor on the study's hurdle metric (:data:`HURDLES`) inside
+#: :func:`pick_from_front`: only front rows that beat buy-and-hold — or, for an alpha study,
+#: earn a positive return after their beta — may be picked. Minimizing risk makes the LOW end
+#: of the front a row of timid books — mostly in cash, or holding the calmest names — that are
+#: "optimal" on that axis while earning less than simply owning the market (v23's re-run front
+#: reached down to −3%/yr), and a balanced pick could land on one. The front keeps those rows,
+#: because they are the honest shape of the trade-off; the pick just never chooses one.
 MIN_PICK_EXCESS = 0.0
-#: Secondary metrics attached to each trial as user attributes. ``years`` and
+#: Secondary metrics attached to each trial as user attributes — along with whichever
+#: :data:`OBJECTIVES` entry a strategy's study does not score. ``years`` and
 #: ``trades_per_year`` are the sample size behind the objectives: annualizing makes a
 #: one-month backtest *comparable*, it does not make it *trustworthy*, so the evidence
 #: rides along with the claim. ``info_ratio`` and ``tracking_error`` ride here too — the
 #: benchmark-relative risk view, no longer scored (the deflated-Sharpe check still reads
 #: ``info_ratio`` off every trial).
-EXTRA_METRICS = ("info_ratio", "tracking_error", "sharpe", "cagr", "total_return",
-                 "max_drawdown", "win_rate", "pct_profitable", "n_trades", "trades_per_year",
-                 "years")
+EXTRA_METRICS = ("info_ratio", "tracking_error", "alpha_cagr", "beta", "sharpe", "cagr",
+                 "total_return", "max_drawdown", "win_rate", "pct_profitable", "n_trades",
+                 "trades_per_year", "years")
 
 #: The ONE preference used to reduce a Pareto front to a single strategy, in
-#: :data:`OBJECTIVES` order. Balanced on purpose: a Pareto front exists precisely because
+#: objective order (a one-objective study uses only the first entry, i.e. simply takes its
+#: best row). Balanced on purpose: a Pareto front exists precisely because
 #: the two objectives trade off, and any lopsided weighting quietly discards that.
 #:
 #: It is a constant rather than a per-notebook literal because it used to be a
@@ -160,7 +191,12 @@ def storage_for(strategy: LoadedStrategy, study_name: str) -> optuna.storages.Jo
 
 
 def make_sampler(cfg: dict) -> optuna.samplers.BaseSampler:
-    """Build the configured sampler (``nsga2`` | ``tpe`` | ``random``), seeded.
+    """Build the configured sampler (``nsga2`` | ``tpe`` | ``random`` | ``grid``), seeded.
+
+    ``grid`` evaluates EVERY point of the searched space exactly once (``categorical`` choices;
+    an ``int`` with a ``step`` is expanded), so its optimum is exact on that grid and
+    ``n_trials`` must equal the grid size — the honest search for a knob with a handful of
+    meaningful values, where a sampler would only re-draw the same few points.
 
     Args:
         cfg: The strategy's ``optuna:`` block.
@@ -178,12 +214,41 @@ def make_sampler(cfg: dict) -> optuna.samplers.BaseSampler:
         "nsga2": lambda: optuna.samplers.NSGAIISampler(seed=seed),
         "tpe": lambda: optuna.samplers.TPESampler(seed=seed, multivariate=True),
         "random": lambda: optuna.samplers.RandomSampler(seed=seed),
+        "grid": lambda: optuna.samplers.GridSampler(grid_space(cfg.get("space", {})), seed=seed),
     }
     name = cfg.get("sampler", "nsga2")
     try:
         return samplers[name]()
     except KeyError:
         raise KeyError(f"Unknown sampler {name!r}. Choices: {sorted(samplers)}") from None
+
+
+def grid_space(space: dict[str, dict]) -> dict[str, list]:
+    """Every point of a searched space, for the exhaustive ``grid`` sampler.
+
+    Args:
+        space: ``optuna.space`` mapping of parameter name to spec.
+
+    Returns:
+        ``{param: [values]}``: categorical choices as declared, an ``int`` or ``float`` with a
+        ``step`` expanded from ``low`` to ``high``.
+
+    Raises:
+        ValueError: For a continuous spec with no ``step`` (a grid needs finite points).
+    """
+    grid = {}
+    for name, spec in space.items():
+        if spec.get("type") == "categorical":
+            grid[name] = list(spec["choices"])
+        elif spec.get("step") or spec.get("type") == "int":
+            step = spec.get("step") or 1
+            n = int(np.floor((spec["high"] - spec["low"]) / step + 1e-9)) + 1   # never past high
+            values = [spec["low"] + i * step for i in range(n)]
+            grid[name] = [int(v) for v in values] if spec["type"] == "int" else [
+                round(v, 10) for v in values]
+        else:
+            raise ValueError(f"grid sampler: {name!r} has no step and no choices")
+    return grid
 
 
 def suggest_params(trial: optuna.Trial, space: dict[str, dict]) -> dict:
@@ -219,9 +284,30 @@ def suggest_params(trial: optuna.Trial, space: dict[str, dict]) -> dict:
     return params
 
 
+def objectives_for(strategy: LoadedStrategy) -> tuple[str, ...]:
+    """The metrics one strategy's study scores: its ``optuna.objectives``, else the default.
+
+    Args:
+        strategy: A loaded strategy.
+
+    Returns:
+        One or two :data:`SCOREABLE` metric names, in order (:data:`OBJECTIVES` when the
+        config names none). A bare string reads as a one-item list.
+
+    Raises:
+        ValueError: On an unknown or repeated metric, or on anything but one or two.
+    """
+    raw = strategy.optuna.get("objectives") or OBJECTIVES
+    names = (raw,) if isinstance(raw, str) else tuple(raw)
+    if len(names) not in (1, 2) or len(set(names)) != len(names) or set(names) - set(SCOREABLE):
+        raise ValueError(f"{strategy.name}/config.yaml: optuna.objectives is {list(names)}; "
+                         f"name one or two distinct metrics of {sorted(SCOREABLE)}")
+    return names
+
+
 def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
-              settings: Settings) -> tuple[float, float]:
-    """Evaluate one trial: suggest params, backtest, return the benchmark-relative pair.
+              settings: Settings, score_from=None) -> tuple[float, ...]:
+    """Evaluate one trial: suggest params, backtest, return the strategy's objectives.
 
     Invalid parameter combos and degenerate results (NaN metrics — usually
     zero trades) are pruned rather than scored, so they never pollute the
@@ -237,21 +323,25 @@ def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
         strategy: A loaded strategy.
         panel: The price panel to backtest on (loaded once per process).
         settings: Global settings.
+        score_from: Warm start (see :func:`backtest.evaluate`): signals on the whole panel,
+            book and every metric from this bar on. ``None`` scores the whole panel.
 
     Returns:
-        ``(excess_cagr, volatility)`` — see :data:`OBJECTIVES` for why these and not
-        the absolute Sharpe, and why per-year and not cumulative.
+        The :func:`objectives_for` metrics in order — ``(excess_cagr, volatility)`` by
+        default; see :data:`OBJECTIVES` for why those and not the absolute Sharpe, and why
+        per-year and not cumulative.
 
     Raises:
         optuna.TrialPruned: For invalid or degenerate parameter sets.
     """
     import optuna
 
+    names = objectives_for(strategy)
     params = suggest_params(trial, strategy.optuna.get("space", {}))
     if not strategy.valid({**strategy.params, **params}):
         raise optuna.TrialPruned("invalid parameter combination")
-    stats = bt.evaluate(strategy, panel, params, settings=settings)
-    if any(pd.isna(stats[m]) for m in OBJECTIVES):
+    stats = bt.evaluate(strategy, panel, params, settings=settings, score_from=score_from)
+    if any(pd.isna(stats[m]) for m in names):
         raise optuna.TrialPruned("degenerate result (no trades?)")
     min_rate = strategy.optuna.get("min_trades_per_year", 0)
     if stats["trades_per_year"] < min_rate:
@@ -261,9 +351,12 @@ def objective(trial: optuna.Trial, strategy: LoadedStrategy, panel: Panel,
         # short backtest window than a long one, for the exact same trading style.
         raise optuna.TrialPruned(
             f"only {stats['trades_per_year']:.1f} trades/year (< min_trades_per_year={min_rate})")
-    for name in EXTRA_METRICS:
-        trial.set_user_attr(name, stats[name])
-    return tuple(stats[m] for m in OBJECTIVES)
+    # Every metric the study does not score rides along: a one-objective study still shows
+    # what risk its winner took, and the pick can still hold it to the benchmark.
+    for name in (*OBJECTIVES, *EXTRA_METRICS):
+        if name not in names:
+            trial.set_user_attr(name, stats[name])
+    return tuple(stats[m] for m in names)
 
 
 def progress_callback():
@@ -286,15 +379,16 @@ def progress_callback():
         # Print the objectives by their real names. Hard-coding "sharpe=" here once meant
         # the live log claimed to show a metric the study had long since stopped using.
         scored = " ".join(f"{name}={value:+.3f}"
-                          for name, value in zip(OBJECTIVES, trial.values, strict=True))
+                          for name, value in zip(study.metric_names or OBJECTIVES,
+                                                 trial.values, strict=True))
         print(f"trial {trial.number:>4}: {scored} front={len(study.best_trials)} | {params}",
               flush=True)
 
     return report
 
 
-def _check_objectives(study: optuna.Study) -> optuna.Study:
-    """Stamp a new study with :data:`OBJECTIVES`; refuse one scored on anything else.
+def _check_objectives(study: optuna.Study, names: tuple[str, ...]) -> optuna.Study:
+    """Stamp a new study with its objectives; refuse one scored on anything else.
 
     A journal stores objective *values* only by position. Read under different labels, a
     v22 journal — scored ``(info_ratio, excess_cagr)``, both maximized — would silently
@@ -302,10 +396,12 @@ def _check_objectives(study: optuna.Study) -> optuna.Study:
     the wrong directions, and nothing downstream could notice. So a fresh study is stamped
     with its objective names (Optuna's ``metric_names``) and directions on first use, and a
     study carrying other names, other directions, or no names at all while holding trials
-    (i.e. one that predates the stamp) is refused.
+    (i.e. one that predates the stamp) is refused. So is a journal whose config changed its
+    ``optuna.objectives`` without bumping ``optuna.study``.
 
     Args:
         study: A just-created or just-loaded study.
+        names: The objectives it must be scored on (:func:`objectives_for`).
 
     Returns:
         The same study, stamped.
@@ -317,22 +413,52 @@ def _check_objectives(study: optuna.Study) -> optuna.Study:
 
     import optuna
 
-    names, directions = list(OBJECTIVES), [d.name.lower() for d in study.directions]
-    if study.metric_names is None and not study.trials and directions == list(DIRECTIONS):
+    names, want = list(names), [SCOREABLE[n] for n in names]
+    found = [d.name.lower() for d in study.directions]
+    if study.metric_names is None and not study.trials and found == want:
         with warnings.catch_warnings():   # "experimental" since Optuna 3.2 — stable in practice
             warnings.simplefilter("ignore", optuna.exceptions.ExperimentalWarning)
             study.set_metric_names(names)
-    if study.metric_names != names or directions != list(DIRECTIONS):
+    if study.metric_names != names or found != want:
         raise ValueError(
             f"study {study.study_name!r} was scored on {study.metric_names or 'unnamed'} "
-            f"{directions}, but the engine scores {names} {list(DIRECTIONS)} — its trials "
-            "cannot be read under these labels. Bump `optuna.study` to start a fresh journal.")
+            f"{found}, but optuna.objectives asks for {names} {want} — its trials cannot be "
+            "read under these labels. Bump `optuna.study` to start a fresh journal.")
     return study
+
+
+def _check_window(study: optuna.Study, score_from) -> str:
+    """Stamp a study with the window it scores; refuse a resume under another window.
+
+    A journal scored warm from one date and topped up from another mixes two experiments
+    that nothing downstream can separate — the same failure the objective stamp guards
+    against, one axis over. A pre-stamp journal counts as "the panel start".
+
+    Args:
+        study: A just-created or just-loaded study.
+        score_from: The window start requested now (``None`` = the panel start).
+
+    Returns:
+        The stamp written (``""`` for the panel start, else the ISO date).
+
+    Raises:
+        ValueError: If the study already holds trials scored from another window.
+    """
+    stamp = "" if score_from is None else str(pd.Timestamp(score_from).date())
+    if study.trials and study.user_attrs.get("score_from", "") != stamp:
+        raise ValueError(
+            f"study {study.study_name!r} was scored from "
+            f"{study.user_attrs.get('score_from') or 'the panel start'!r}, not "
+            f"{stamp or 'the panel start'!r} — two windows are two experiments. "
+            "Bump `optuna.study` to start a fresh journal.")
+    study.set_user_attr("score_from", stamp)
+    return stamp
 
 
 def run_study(strategy: LoadedStrategy, panel: Panel, *, settings: Settings,
               study_name: str | None = None, n_trials: int | None = None,
-              timeout_s: float | None = None, verbose: bool = False) -> optuna.Study:
+              timeout_s: float | None = None, verbose: bool = False,
+              score_from=None) -> optuna.Study:
     """Run — or RESUME — a strategy's optimization study.
 
     Re-running with the same study name continues exactly where the journal
@@ -346,31 +472,43 @@ def run_study(strategy: LoadedStrategy, panel: Panel, *, settings: Settings,
         n_trials: Trials to run now (default: config ``n_trials``).
         timeout_s: Stop after this many seconds (default: config ``timeout_s``).
         verbose: Print one line per finished trial (see :func:`progress_callback`).
+        score_from: Warm start (see :func:`backtest.run_strategy`): every trial runs its
+            signals on the whole panel and is scored — book, benchmark, trade floor — only
+            from this date on. Default: the config's ``optuna.score_from``, else the panel
+            start. This is what lets a study skip a strategy's indicator warm-up (a level
+            window that needs twenty sessions would otherwise sit flat against an invested
+            benchmark for every trial) and what a walk-forward fold trains on. The journal
+            is stamped with the window and refuses a resume under another one
+            (:func:`_check_window`).
 
     Returns:
         The (re)loaded study, including all previous trials.
 
     Raises:
-        ValueError: If the named journal was scored on other objectives
-            (see :func:`_check_objectives`).
+        ValueError: If the named journal was scored on other objectives than the
+            configured ones (see :func:`_check_objectives`, :func:`objectives_for`) or
+            from another window.
     """
     import optuna
 
     cfg = strategy.optuna
     name = study_name or cfg.get("study", f"{strategy.name}-v1")
+    names = objectives_for(strategy)
+    score_from = cfg.get("score_from") if score_from is None else score_from
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = _check_objectives(optuna.create_study(
         study_name=name,
         storage=storage_for(strategy, name),
-        directions=list(DIRECTIONS),
+        directions=[SCOREABLE[n] for n in names],
         sampler=make_sampler(cfg),
         load_if_exists=True,
-    ))
+    ), names)
+    _check_window(study, score_from)
     done = len(study.trials)
     if done:
         log.info("study %s: resuming with %d existing trials", name, done)
     study.optimize(
-        lambda t: objective(t, strategy, panel, settings),
+        lambda t: objective(t, strategy, panel, settings, score_from),
         n_trials=n_trials if n_trials is not None else cfg.get("n_trials", 100),
         timeout=timeout_s if timeout_s is not None else cfg.get("timeout_s"),
         show_progress_bar=False,
@@ -390,14 +528,14 @@ def load_study(strategy: LoadedStrategy, study_name: str | None = None) -> optun
         The study with all persisted trials.
 
     Raises:
-        ValueError: If the journal was scored on other objectives
-            (see :func:`_check_objectives`).
+        ValueError: If the journal was scored on other objectives than the configured
+            ones (see :func:`_check_objectives`, :func:`objectives_for`).
     """
     import optuna
 
     name = study_name or strategy.optuna.get("study", f"{strategy.name}-v1")
-    return _check_objectives(optuna.load_study(study_name=name,
-                                               storage=storage_for(strategy, name)))
+    study = optuna.load_study(study_name=name, storage=storage_for(strategy, name))
+    return _check_objectives(study, objectives_for(strategy))
 
 
 def trials_frame(study: optuna.Study) -> pd.DataFrame:
@@ -407,17 +545,21 @@ def trials_frame(study: optuna.Study) -> pd.DataFrame:
         study: An Optuna study.
 
     Returns:
-        One row per completed trial with a ``trial`` number column.
+        One row per completed trial with a ``trial`` number column;
+        ``attrs["objectives"]`` names the objectives the study scored.
     """
     import optuna
 
+    names = tuple(study.metric_names or OBJECTIVES)
     rows = [
         {"trial": t.number, **t.params,
-         **dict(zip(OBJECTIVES, t.values, strict=True)), **t.user_attrs}
+         **dict(zip(names, t.values, strict=True)), **t.user_attrs}
         for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE and t.values is not None
     ]
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    frame.attrs["objectives"] = names
+    return frame
 
 
 def pareto_frame(study: optuna.Study) -> pd.DataFrame:
@@ -431,20 +573,40 @@ def pareto_frame(study: optuna.Study) -> pd.DataFrame:
         study: An Optuna study.
 
     Returns:
-        One row per distinct Pareto trial, sorted by the first objective descending.
+        One row per distinct Pareto trial, best first on the first objective — for a
+        one-objective study just its best trial (more on a tie). ``attrs["objectives"]``
+        names the study's objectives; filtering keeps it, and :func:`pick_from_front`,
+        :func:`distinct_front` and ``plots.plot_pareto`` read it.
     """
+    names = tuple(study.metric_names or OBJECTIVES)
     rows = [
         {"trial": t.number, **t.params,
-         **dict(zip(OBJECTIVES, t.values, strict=True)), **t.user_attrs}
+         **dict(zip(names, t.values, strict=True)), **t.user_attrs}
         for t in study.best_trials
     ]
     frame = pd.DataFrame(rows).sort_values("trial")
     frame = frame.drop_duplicates(subset=[c for c in frame.columns if c != "trial"])
-    return frame.sort_values(OBJECTIVES[0], ascending=False).reset_index(drop=True)
+    frame = frame.sort_values(names[0], ascending=SCOREABLE.get(names[0]) == "minimize")
+    frame.attrs["objectives"] = names
+    return frame.reset_index(drop=True)
 
 
-def distinct_front(front: pd.DataFrame, *, decimals: int = 9) -> pd.DataFrame:
-    """One row per distinct **objective pair** — how many genuinely different outcomes.
+def _objectives_of(front: pd.DataFrame, objectives: tuple[str, ...] | None) -> tuple[str, ...]:
+    """The objectives a front was scored on: explicit, else its ``attrs``, else the default.
+
+    Args:
+        front: A :func:`pareto_frame` / :func:`trials_frame` result, or a filtered copy.
+        objectives: Explicit objective names, overriding the frame's own.
+
+    Returns:
+        The objective names, in order.
+    """
+    return tuple(objectives or front.attrs.get("objectives") or OBJECTIVES)
+
+
+def distinct_front(front: pd.DataFrame, *, objectives: tuple[str, ...] | None = None,
+                   decimals: int = 9) -> pd.DataFrame:
+    """One row per distinct **objective value(s)** — how many genuinely different outcomes.
 
     :func:`pareto_frame` already drops rows that are duplicates in *every* column, which
     catches NSGA-II re-sampling the same parameters. It cannot catch the more common and
@@ -474,17 +636,19 @@ def distinct_front(front: pd.DataFrame, *, decimals: int = 9) -> pd.DataFrame:
 
     Args:
         front: A :func:`pareto_frame` result.
+        objectives: Objectives to compare on; default ``front.attrs["objectives"]``, else
+            :data:`OBJECTIVES`.
         decimals: Rounding applied to the objectives before comparing, so two trials that
             differ only in float noise count as one outcome.
 
     Returns:
-        The subset of ``front`` with one row per distinct objective pair, keeping the
+        The subset of ``front`` with one row per distinct objective value(s), keeping the
         **earliest** trial of each tie (first discovery, so the choice is deterministic
         and does not depend on row order), in ``front``'s original ordering.
     """
     if front.empty:
         return front
-    keys = [c for c in OBJECTIVES if c in front.columns]
+    keys = [c for c in _objectives_of(front, objectives) if c in front.columns]
     if not keys:
         return front
     rounded = front[keys].round(decimals)
@@ -494,8 +658,8 @@ def distinct_front(front: pd.DataFrame, *, decimals: int = 9) -> pd.DataFrame:
     return front.loc[front.index.isin(first)]
 
 
-def pick_from_front(front: pd.DataFrame, *, weights: tuple[float, float] = PICK_WEIGHTS
-                    ) -> pd.Series:
+def pick_from_front(front: pd.DataFrame, *, weights: tuple[float, ...] | None = None,
+                    objectives: tuple[str, ...] | None = None) -> pd.Series:
     """Reduce an already-admissible Pareto front to the ONE row to trade.
 
     The single implementation of the picking rule, so a strategy notebook and its
@@ -504,9 +668,10 @@ def pick_from_front(front: pd.DataFrame, *, weights: tuple[float, float] = PICK_
     strategy nobody ran, twice. Callers apply their own admissibility filter (a trades-per
     -year floor, typically) and hand in what survives.
 
-    Only rows that beat buy-and-hold (``excess_cagr >`` :data:`MIN_PICK_EXCESS`) are
-    eligible: the low-volatility end of the front holds timid books that earn less than the
-    index.
+    Only rows that clear the study's hurdle (:data:`HURDLES`: the first objective when it is
+    ``excess_cagr`` or ``alpha_cagr``, else ``excess_cagr``) above :data:`MIN_PICK_EXCESS`
+    are eligible: the low-volatility end of the front holds timid books that earn less than
+    the index.
     When no row qualifies, the pick falls back to the whole front and says so
     (``beats_benchmark = False`` plus a logged warning) rather than raising — a losing study
     must still run top-to-bottom in its notebook, it just must not look like a winner.
@@ -517,12 +682,16 @@ def pick_from_front(front: pd.DataFrame, *, weights: tuple[float, float] = PICK_
 
     Args:
         front: Front rows to choose among — already filtered for admissibility.
-        weights: Preference over :data:`OBJECTIVES`, in that order. Defaults to
-            :data:`PICK_WEIGHTS`; pass something else only with a stated reason.
+        weights: Preference over the objectives, in order. Defaults to
+            :data:`PICK_WEIGHTS` (its first entry alone on a one-objective front, which
+            just takes the best row); pass something else only with a stated reason.
+        objectives: The objectives the front was scored on; default
+            ``front.attrs["objectives"]`` (set by :func:`pareto_frame`, kept through
+            filtering), else :data:`OBJECTIVES`.
 
     Returns:
         The winning row, plus three added fields: ``n_tied`` (eligible rows sharing the
-        winner's objective pair — ``1`` means it won outright), ``front_distinct``
+        winner's objective value(s) — ``1`` means it won outright), ``front_distinct``
         (distinct outcomes the choice was actually made among) and ``beats_benchmark``
         (False only when the fallback above was taken).
 
@@ -531,32 +700,35 @@ def pick_from_front(front: pd.DataFrame, *, weights: tuple[float, float] = PICK_
     """
     if front.empty:
         raise ValueError("cannot pick from an empty front")
-    beats = front[front["excess_cagr"] > MIN_PICK_EXCESS]
+    names = _objectives_of(front, objectives)
+    weights = PICK_WEIGHTS[:len(names)] if weights is None else weights
+    hurdle = names[0] if names[0] in HURDLES else HURDLES[0]
+    beats = front[front[hurdle] > MIN_PICK_EXCESS]
     if beats.empty:
-        log.warning("no front row beats buy-and-hold (excess_cagr > %s): picking from the "
-                    "whole front, flagged beats_benchmark=False", MIN_PICK_EXCESS)
+        log.warning("no front row beats buy-and-hold (%s > %s): picking from the "
+                    "whole front, flagged beats_benchmark=False", hurdle, MIN_PICK_EXCESS)
     pool = front if beats.empty else beats
-    distinct = distinct_front(pool)
-    values = distinct[list(OBJECTIVES)]
+    distinct = distinct_front(pool, objectives=names)
+    values = distinct[list(names)]
     span = (values.max() - values.min()).replace(0, 1.0)
     normalized = (values - values.min()) / span
-    for name, direction in zip(OBJECTIVES, DIRECTIONS, strict=True):
-        if direction == "minimize":           # flip, so 1 is the best end of every column
+    for name in names:
+        if SCOREABLE[name] == "minimize":     # flip, so 1 is the best end of every column
             normalized[name] = 1.0 - normalized[name]
-    score = normalized.mul(pd.Series(dict(zip(OBJECTIVES, weights, strict=True)))).sum(axis=1)
+    score = normalized.mul(pd.Series(dict(zip(names, weights, strict=True)))).sum(axis=1)
     row = distinct.loc[score.idxmax()].copy()
     # Per column, not frame-wide: a front row is a mix of dtypes, so `.round` on the
     # picked Series would raise on the first object column it meets.
     same = np.logical_and.reduce(
         [pool[k].to_numpy(dtype=float).round(9) == round(float(row[k]), 9)
-         for k in OBJECTIVES])
+         for k in names])
     row["n_tied"] = int(same.sum())
     row["front_distinct"] = len(distinct)
     row["beats_benchmark"] = not beats.empty
     return row
 
 
-def pick_best(study: optuna.Study, *, weights: tuple[float, float] = PICK_WEIGHTS):
+def pick_best(study: optuna.Study, *, weights: tuple[float, ...] | None = None):
     """Reduce the Pareto front to ONE trial under an explicit preference.
 
     A thin wrapper over :func:`pick_from_front` — same normalization, same tie
@@ -567,7 +739,7 @@ def pick_best(study: optuna.Study, *, weights: tuple[float, float] = PICK_WEIGHT
 
     Args:
         study: An Optuna study with at least one completed trial.
-        weights: Importance of each entry of :data:`OBJECTIVES`, in that order.
+        weights: Importance of each of the study's objectives, in order.
             Defaults to :data:`PICK_WEIGHTS`.
 
     Returns:
@@ -580,9 +752,7 @@ def pick_best(study: optuna.Study, *, weights: tuple[float, float] = PICK_WEIGHT
     front = study.best_trials
     if not front:
         raise ValueError("study has no completed trials yet")
-    frame = pd.DataFrame([{"trial": t.number,
-                           **dict(zip(OBJECTIVES, t.values, strict=True))} for t in front])
-    number = int(pick_from_front(frame, weights=weights)["trial"])
+    number = int(pick_from_front(pareto_frame(study), weights=weights)["trial"])
     return next(t for t in front if t.number == number)
 
 
@@ -770,7 +940,7 @@ def sensitivity(strategy: LoadedStrategy, panel: Panel, picked: dict, *, setting
 
     One :func:`backtest.sweep` call, so the whole neighborhood costs about what a
     coarse grid does. The metric to read is ``excess_cagr``: benchmark-relative and
-    per-year, i.e. one of the study's own :data:`OBJECTIVES`. (``volatility``, the other
+    per-year, i.e. one of the default :data:`OBJECTIVES`. (``volatility``, the other
     one, is on every sweep row too.)
 
     Args:

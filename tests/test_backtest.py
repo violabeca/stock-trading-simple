@@ -491,6 +491,24 @@ def test_portfolio_mode_shares_one_cash_account(panel):
     assert curve["return"].iloc[0] == pytest.approx(0.0)     # ...and the base is pre-fee
 
 
+def test_whole_shares_round_down_and_never_buy_a_name_priced_above_its_slot(panel):
+    """A real account buys whole shares: each slot's remainder waits in cash, and a name
+    priced above its slot is never bought at all. The default stays fractional."""
+    scale = pd.Series({"AAA": 1.0, "BBB": 10.0})               # BBB trades at ~$1,000
+    p = replace(panel, **{f: getattr(panel, f) * scale for f in ("close", "open_", "high", "low")})
+    weights = pd.DataFrame(0.0, index=p.close.index, columns=p.close.columns)
+    weights.iloc[1:] = 0.5                                     # two $500 slots of $1,000
+    whole = bt.run(p, {"weights": weights}, fees=0.0, slippage=0.0, init_cash=1_000,
+                   whole_shares=True)
+    held = whole.assets()
+    assert (held == held.round()).all().all()                  # whole shares only
+    assert held["AAA"].iloc[-1] == 4                           # $500 buys 4 shares at ~$100
+    assert (held["BBB"] == 0).all()                            # $500 cannot buy one $1,000 share
+    assert whole.cash().iloc[-1] > 500                         # BBB's slot and AAA's remainder
+    frac = bt.run(p, {"weights": weights}, fees=0.0, slippage=0.0, init_cash=1_000)
+    assert frac.assets()["BBB"].iloc[-1] == pytest.approx(0.5, rel=0.01)   # fractional: bought
+
+
 def test_portfolio_stats_are_not_nan_under_grouping(panel):
     """Regression guard: grouped metrics used to fail SILENTLY, not loudly.
 
@@ -795,6 +813,98 @@ def test_cash_frac_short_entry_consumes_the_wallet(panel):
     assert (gross <= pf.value() + 1e-9).all()            # exposure never exceeds the book
 
 
+def test_cash_frac_short_proceeds_never_fund_a_long_and_a_stop_covers_whole():
+    """THE regression (2026-09-27): short proceeds are locked for the cover (lock_cash).
+
+    Short B for 95% of the wallet, then go long A for 95% of what is free, then B rallies
+    through its 10% stop. Without lock_cash vectorbt counted B's $9,500 of proceeds as cash:
+    A was bought for $18,525 (the $10k wallet ran 280% invested) and B's stop could buy back
+    only 8.9 of its 95 shares — the other 86 stayed short past their stop. burst_scan found it
+    on a real book (free cash negative on 11% of bars, covers split, entries skipped).
+    """
+    n = 8
+    idx = pd.date_range("2026-06-01 13:30", periods=n, freq="1min", tz="UTC")
+    flat = pd.DataFrame(100.0, index=idx, columns=["A", "B"])
+    high = flat.copy()
+    high.iloc[4, 1] = 115.0                               # bar 4: through B's stop at 110
+    p = Panel(close=flat, open_=flat.copy(), high=high, low=flat.copy(),
+              volume=pd.DataFrame(1_000.0, index=idx, columns=["A", "B"]), bar="1m")
+    none = pd.DataFrame(False, index=idx, columns=["A", "B"])
+    entries, short_entries = none.copy(), none.copy()
+    short_entries.iloc[1, 1] = True                       # short B first: its sale brings in cash
+    entries.iloc[2, 0] = True                             # then long A
+    stop = pd.DataFrame(np.nan, index=idx, columns=["A", "B"])
+    stop.iloc[1, 1] = 0.10
+    pf = bt.run(p, {"entries": entries, "exits": none, "short_entries": short_entries,
+                    "short_exits": none, "sl_stop": stop, "cash_frac": 0.95},
+                fees=0.0, slippage=0.0, init_cash=10_000)
+    trades = bt.trade_records(pf)
+    b = trades[trades["symbol"] == "B"]
+    assert len(b) == 1                                    # ONE cover, not split in pieces
+    assert b.iloc[0]["size"] == pytest.approx(95.0)
+    assert b.iloc[0]["exit_ts"] == idx[4] and b.iloc[0]["exit_price"] == pytest.approx(110.0)
+    a = trades[trades["symbol"] == "A"].iloc[0]
+    assert a["size"] * a["entry_price"] == pytest.approx(0.95 * 500.0)   # only the FREE cash
+    gross = pf.asset_value(group_by=False).abs().sum(axis=1)
+    assert (gross <= pf.value() + 1e-9).all()             # never above 100%, shorts included
+    assert (pf.cash(free=True) >= -1e-9).all()
+
+
+def _flat_daily(n=14, symbols=("A", "B")):
+    idx = pd.date_range("2026-01-05", periods=n, freq="D", tz="UTC")
+    flat = pd.DataFrame(100.0, index=idx, columns=list(symbols))
+    return Panel(close=flat, open_=flat.copy(), high=flat.copy(), low=flat.copy(),
+                 volume=pd.DataFrame(1_000.0, index=idx, columns=list(symbols)), bar="1d")
+
+
+def test_portfolio_short_proceeds_never_fund_a_long():
+    """Portfolio mode locks a short's sale proceeds too (pending proposal #31, approved
+    2026-10-19). Short B at 95% of the book, then ask for 95% long A: only the FREE cash may
+    buy A, so gross exposure stays at the book and free cash never goes negative."""
+    p = _flat_daily(6)
+    w = pd.DataFrame(0.0, index=p.close.index, columns=["A", "B"])
+    w.iloc[1:, 1] = -0.95
+    w.iloc[2:, 0] = 0.95
+    pf = bt.run(p, {"weights": w}, fees=0.0, slippage=0.0, init_cash=10_000)
+    gross = pf.asset_value(group_by=False).abs().sum(axis=1)
+    assert (gross <= pf.value() + 1e-6).all()
+    assert (pf.cash(free=True) >= -1e-6).all()
+    assert pf.asset_value(group_by=False)["A"].iloc[-1] == pytest.approx(500.0, rel=1e-6)
+
+
+def test_borrow_charges_a_short_its_yearly_rate_for_the_days_it_was_held():
+    """36.5%/yr on a $5,000 short held 10 calendar days costs 0.1% a day: $50, charged on
+    the buy-back; a long pays nothing, and the same short without ``borrow`` pays nothing."""
+    p = _flat_daily(14)
+    w = pd.DataFrame(0.0, index=p.close.index, columns=["A", "B"])
+    w.iloc[1:11, 1] = -0.5                                # short B on bar 1, buy back on bar 11
+    w.iloc[1:, 0] = 0.3                                   # a long, never charged
+    free = bt.run(p, {"weights": w}, fees=0.0, slippage=0.0, init_cash=10_000)
+    paid = bt.run(p, {"weights": w, "borrow": 0.365}, fees=0.0, slippage=0.0,
+                  init_cash=10_000)
+    assert free.value().iloc[-1] == pytest.approx(10_000.0)
+    assert free.value().iloc[-1] - paid.value().iloc[-1] == pytest.approx(50.0, rel=1e-6)
+
+
+def test_borrow_of_a_short_open_on_the_last_bar_is_still_charged():
+    """No buy-back inside the window: the accrual (12 days at 0.1%/day on $5,000 = $60) is
+    charged on the order that opened the short, so a window cut short skips nothing; a
+    per-name rate frame is read bar by bar (NaN = free)."""
+    p = _flat_daily(14)
+    w = pd.DataFrame(0.0, index=p.close.index, columns=["A", "B"])
+    w.iloc[1:, 1] = -0.5
+    rate = pd.DataFrame({"A": np.nan, "B": 0.365}, index=p.close.index)
+    paid = bt.run(p, {"weights": w, "borrow": rate}, fees=0.0, slippage=0.0, init_cash=10_000)
+    assert 10_000.0 - paid.value().iloc[-1] == pytest.approx(60.0, rel=1e-6)
+
+
+def test_borrow_needs_portfolio_mode():
+    p = _flat_daily(5)
+    none = pd.DataFrame(False, index=p.close.index, columns=["A", "B"])
+    with pytest.raises(ValueError, match="portfolio mode only"):
+        bt.run(p, {"entries": none, "exits": none, "borrow": 0.01}, fees=0.0, slippage=0.0)
+
+
 def test_cash_frac_opposite_entry_closes_not_reverses(panel):
     # Percent sizing cannot reverse a position (vectorbt raises); the wallet mode
     # therefore closes on an opposite entry (upon_opposite_entry="close") instead.
@@ -841,3 +951,88 @@ def test_sweep_cash_frac_matches_evaluate(panel):
         single = bt.evaluate(strat, panel, combo, settings=_settings())
         assert row["total_return"] == pytest.approx(single["total_return"], rel=1e-9)
         assert row["n_trades"] == single["n_trades"]
+
+
+# --- per-entry cash_frac frame: risk-per-trade sizing ---------------------------
+def _cash_frac_frame(panel, a: float = 0.10, b: float = 0.30):
+    """Both symbols enter at bar 5; AAA deploys ``a`` of the free cash, BBB ``b``."""
+    idx, cols = panel.close.index, panel.close.columns
+    entries = pd.DataFrame(False, index=idx, columns=cols)
+    entries.iloc[5] = True
+    frac = pd.DataFrame(0.25, index=idx, columns=cols)     # dense: the slot everywhere else
+    frac.iloc[5] = [a, b]
+    return {"entries": entries, "exits": bt.exit_after(entries, 30), "cash_frac": frac}
+
+
+def test_cash_frac_frame_sizes_each_entry_on_its_own(panel):
+    """A per-bar frame is read at the FILL bar: 10% of $10k, then 30% of the $9k left."""
+    pf = bt.run(panel, _cash_frac_frame(panel), fees=0.0, slippage=0.0, init_cash=10_000)
+    assert bt.is_grouped(pf)
+    trades = bt.trade_records(pf)
+    notionals = sorted(trades["size"] * trades["entry_price"])
+    assert notionals == [pytest.approx(1_000.0), pytest.approx(2_700.0)]
+    invested = pf.asset_value(group_by=False).sum(axis=1)
+    assert (invested <= pf.value() + 1e-9).all()             # still one wallet, never over
+
+
+def test_cash_frac_frame_with_nan_is_refused(panel):
+    """A NaN size at a fill bar SKIPS the entry silently — so a sparse frame is an error."""
+    sig = _cash_frac_frame(panel)
+    sig["cash_frac"] = sig["cash_frac"].where(sig["entries"])    # NaN off the entry bars
+    with pytest.raises(ValueError, match="NaN"):
+        bt.run(panel, sig, fees=0.0, slippage=0.0)
+    assert bt.cash_frac_size(0.25) == 0.25                       # scalars pass through
+
+
+def test_sweep_cash_frac_frame_matches_evaluate(panel):
+    """A per-entry frame stacks per combo in the sweep and agrees with evaluate()."""
+    from trading_simple import strategies
+
+    strat = strategies.load("support_bounce")   # host shell; signals get replaced
+
+    def sig(p, *, a: float, **_):
+        return _cash_frac_frame(p, a=a)
+
+    strat = replace(strat, signals=sig, params={"a": 0.10})
+    grid = [{"a": 0.10}, {"a": 0.50}]
+    stats = bt.sweep(strat, panel, grid, settings=_settings(), chunk_size=2)
+    for row, combo in zip(stats.to_dict("records"), grid, strict=True):
+        single = bt.evaluate(strat, panel, combo, settings=_settings())
+        assert row["total_return"] == pytest.approx(single["total_return"], rel=1e-9)
+        assert row["n_trades"] == single["n_trades"]
+    assert stats.iloc[0]["total_return"] != stats.iloc[1]["total_return"]   # the frame mattered
+
+
+# --- alpha after beta -------------------------------------------------------------
+def test_alpha_cagr_is_the_return_after_beta():
+    """The baseline IS the benchmark (beta 1, alpha 0); half of it has beta ~0.5; flat is 0/0.
+
+    On a one-symbol panel, so the benchmark actually moves: the two-symbol fixture's names
+    trend symmetrically and its equal-weight index is flat to 1e-14, which makes beta moot.
+    """
+    from trading_simple import strategies
+
+    panel = make_panel(symbols=("AAA",))
+    baseline = strategies.load("baseline")
+    base = bt.evaluate(baseline, panel, {}, settings=_settings())
+    assert base["beta"] == pytest.approx(1.0, abs=1e-6)
+    assert base["alpha_cagr"] == pytest.approx(0.0, abs=1e-6)
+    assert base["alpha_cagr"] == pytest.approx(base["excess_cagr"], abs=1e-6)
+
+    def half(p, **_):
+        return {"weights": baseline.signals(p)["weights"] * 0.5}   # 50% cash, 50% the index
+
+    stats = bt.evaluate(replace(baseline, signals=half), panel, {}, settings=_settings())
+    assert 0.4 < stats["beta"] < 0.6
+    assert stats["alpha_cagr"] == pytest.approx(stats["cagr"] - stats["beta"] * base["cagr"],
+                                                abs=1e-4)
+    assert stats["excess_cagr"] < stats["alpha_cagr"] < 0.0    # charged only for the beta it ran
+
+    def flat(p, **_):
+        entries = pd.DataFrame(False, index=p.close.index, columns=p.close.columns)
+        return {"entries": entries, "exits": entries, "cash_frac": 0.25}
+
+    pf = bt.run_strategy(replace(baseline, signals=flat), panel, settings=_settings())
+    fees, slip = bt.panel_costs(_settings().costs, panel)
+    flat_stats = bt.active_stats(pf, panel, fees=fees, slippage=slip, total_return=0.0)
+    assert flat_stats["beta"] == 0.0 and flat_stats["alpha_cagr"] == 0.0

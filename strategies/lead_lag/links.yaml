@@ -1,0 +1,122 @@
+# Pre-registered directed links for lead_lag's §6 (leader -> follower).
+#
+# Written 2026-09-28 BEFORE any lead-lag map was computed on real data, and frozen: the notebook
+# stamps this file's sha1 into its SCORECARD. Editing it is a NEW experiment (a new sha1), not a
+# correction of the old one.
+#
+# customer_supplier: the customer leads its supplier (Cohen & Frazzini 2008, "Economic links and
+#   predictable returns": customer news reaches the supplier's price late). Curated from memory
+#   of 10-K / 20-F / 40-F "major customer" notes (a customer >= 10% of revenue, or named as a
+#   largest customer); the shares quoted are approximate and from recent fiscal years, not
+#   point-in-time. Only pairs with daily bars for both names in the shared DB are listed.
+#   Candidates dropped for having no daily bars: UPS (AMZN), K, KLG, NWL, THS (WMT), SPR, HWM
+#   (BA), AXL (GM).
+# commodity_producer: cross-asset — the metal ETF leads the miners (the only non-equity daily
+#   series in the DB besides SPY). Dropped for no daily bars: GFI, EGO, BTG, MAG.
+#
+# At 1m/5m most customers have no bars (AAPL, WMT, HD, ... are not in the 1m pool), so the
+# links are TESTED at 1d only; the intraday bars report coverage.
+
+customer_supplier:
+  # Apple
+  - {leader: AAPL, follower: SWKS, note: "Apple ~60-70% of revenue"}
+  - {leader: AAPL, follower: QRVO, note: "Apple ~35-45% of revenue"}
+  - {leader: AAPL, follower: CRUS, note: "Apple ~80-90% of revenue"}
+  - {leader: AAPL, follower: AVGO, note: "Apple ~20%, largest customer"}
+  - {leader: AAPL, follower: QCOM, note: "Apple a >10% customer"}
+  - {leader: AAPL, follower: JBL, note: "Apple ~15-20% of revenue"}
+  - {leader: AAPL, follower: AMKR, note: "Apple a >10% customer"}
+  - {leader: AAPL, follower: LITE, note: "Apple a >10% customer (3D sensing) through ~FY2021"}
+  - {leader: AAPL, follower: TSM, note: "Apple ~25% of TSMC revenue"}
+  # Chip designers -> the foundry, and GPU demand -> its suppliers
+  - {leader: NVDA, follower: TSM, note: "NVIDIA a >10% TSMC customer (2024)"}
+  - {leader: AMD, follower: TSM, note: "AMD a major TSMC customer"}
+  - {leader: QCOM, follower: TSM, note: "Qualcomm a major TSMC customer"}
+  - {leader: NVDA, follower: FN, note: "NVIDIA a >10% customer (FY2024-25)"}
+  - {leader: NVDA, follower: MU, note: "largest HBM customer"}
+  - {leader: CSCO, follower: FN, note: "Cisco a >10% customer (historically)"}
+  # Hyperscalers -> network switching
+  - {leader: MSFT, follower: ANET, note: "Microsoft ~15-20% of revenue"}
+  - {leader: META, follower: ANET, note: "Meta ~15-25% of revenue"}
+  # PC makers -> Intel
+  - {leader: DELL, follower: INTC, note: "Dell a >10% customer"}
+  - {leader: HPQ, follower: INTC, note: "HP a >10% customer"}
+  # The foundry -> wafer-fab equipment
+  - {leader: TSM, follower: AMAT, note: "TSMC a >10% customer"}
+  - {leader: TSM, follower: LRCX, note: "TSMC a >10% customer"}
+  - {leader: TSM, follower: KLAC, note: "TSMC a >10% customer"}
+  # Walmart -> consumer staples and toys
+  - {leader: WMT, follower: PG, note: "Walmart ~15% of net sales"}
+  - {leader: WMT, follower: CLX, note: "Walmart ~25%"}
+  - {leader: WMT, follower: GIS, note: "Walmart ~20-22%"}
+  - {leader: WMT, follower: KMB, note: "Walmart ~14%"}
+  - {leader: WMT, follower: CHD, note: "Walmart ~25%"}
+  - {leader: WMT, follower: CPB, note: "Walmart ~20%"}
+  - {leader: WMT, follower: SJM, note: "Walmart ~30%"}
+  - {leader: WMT, follower: CAG, note: "Walmart ~25%"}
+  - {leader: WMT, follower: HRL, note: "Walmart ~13%"}
+  - {leader: WMT, follower: MKC, note: "Walmart ~11%"}
+  - {leader: WMT, follower: ENR, note: "Walmart ~20%"}
+  - {leader: WMT, follower: SPB, note: "Walmart ~15%"}
+  - {leader: WMT, follower: HAS, note: "Walmart ~18%"}
+  - {leader: WMT, follower: MAT, note: "Walmart ~17%"}
+  - {leader: WMT, follower: TSN, note: "Walmart ~17%"}
+  - {leader: WMT, follower: KHC, note: "Walmart ~21%"}
+  - {leader: WMT, follower: PEP, note: "Walmart ~14%"}
+  - {leader: WMT, follower: CL, note: "Walmart ~11%"}
+  - {leader: WMT, follower: KDP, note: "Walmart ~15%"}
+  - {leader: WMT, follower: POST, note: "Walmart ~20%"}
+  - {leader: WMT, follower: FLO, note: "Walmart ~20%"}
+  - {leader: WMT, follower: SMG, note: "Walmart ~15%"}
+  # Target -> toys
+  - {leader: TGT, follower: HAS, note: "Target ~10%"}
+  - {leader: TGT, follower: MAT, note: "Target ~10%"}
+  # Home improvement retailers -> building products and lawn & garden
+  - {leader: HD, follower: MAS, note: "Home Depot ~35%"}
+  - {leader: LOW, follower: MAS, note: "Lowe's ~10%"}
+  - {leader: LOW, follower: SWK, note: "Lowe's ~15%"}
+  - {leader: HD, follower: SWK, note: "Home Depot ~10%"}
+  - {leader: LOW, follower: WHR, note: "Lowe's ~10-12%"}
+  - {leader: HD, follower: SMG, note: "Home Depot ~25-30%"}
+  - {leader: LOW, follower: SMG, note: "Lowe's ~15-20%"}
+  - {leader: HD, follower: FBIN, note: "a largest customer"}
+  - {leader: LOW, follower: FBIN, note: "a largest customer"}
+  # Aerospace
+  - {leader: BA, follower: HXL, note: "Boeing ~20-30%"}
+  # Autos -> parts
+  - {leader: GM, follower: LEA, note: "GM ~15%"}
+  - {leader: F, follower: LEA, note: "Ford ~10-13%"}
+  - {leader: F, follower: DAN, note: "Ford ~20%"}
+  - {leader: F, follower: BWA, note: "Ford ~13%"}
+  - {leader: GM, follower: MGA, note: "GM ~15%"}
+  # Wireless carriers -> tower REITs (each carrier ~15-35% of site leasing revenue)
+  - {leader: T, follower: AMT, note: "AT&T ~15-20% of US property revenue"}
+  - {leader: VZ, follower: AMT, note: "Verizon ~15%"}
+  - {leader: TMUS, follower: AMT, note: "T-Mobile ~15-20%"}
+  - {leader: T, follower: CCI, note: "AT&T ~20-25%"}
+  - {leader: VZ, follower: CCI, note: "Verizon ~20%"}
+  - {leader: TMUS, follower: CCI, note: "T-Mobile ~35%"}
+  - {leader: T, follower: SBAC, note: "AT&T ~20-25% of site leasing"}
+  - {leader: VZ, follower: SBAC, note: "Verizon ~15-20%"}
+  - {leader: TMUS, follower: SBAC, note: "T-Mobile ~35%"}
+
+commodity_producer:
+  - {leader: GLD, follower: NEM, note: "gold miner"}
+  - {leader: GLD, follower: AEM, note: "gold miner"}
+  - {leader: GLD, follower: GOLD, note: "gold miner"}
+  - {leader: GLD, follower: KGC, note: "gold miner"}
+  - {leader: GLD, follower: AU, note: "gold miner"}
+  - {leader: GLD, follower: FNV, note: "gold royalty/streaming"}
+  - {leader: GLD, follower: WPM, note: "precious-metals streaming"}
+  - {leader: GLD, follower: RGLD, note: "gold royalty"}
+  - {leader: GLD, follower: AGI, note: "gold miner"}
+  - {leader: GLD, follower: IAG, note: "gold miner"}
+  - {leader: GLD, follower: HMY, note: "gold miner"}
+  - {leader: GLD, follower: SSRM, note: "gold miner"}
+  - {leader: SLV, follower: PAAS, note: "silver miner"}
+  - {leader: SLV, follower: AG, note: "silver miner"}
+  - {leader: SLV, follower: HL, note: "silver miner"}
+  - {leader: SLV, follower: CDE, note: "silver/gold miner"}
+  - {leader: SLV, follower: EXK, note: "silver miner"}
+  - {leader: SLV, follower: FSM, note: "silver/gold miner"}
+  - {leader: SLV, follower: SVM, note: "silver miner"}

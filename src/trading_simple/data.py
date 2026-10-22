@@ -22,6 +22,25 @@ _FREQ = {"1d": "1D", "1h": "1h", "5m": "5min", "1m": "1min"}
 _SESSION_FILTER = {"regular": "AND rth", "extended": "AND NOT rth", "both": ""}
 
 
+def bar_freq(bar: str) -> str:
+    """Pandas frequency string for a bar size: ``"1d"``, ``"1h"`` or any ``"<n>m"``.
+
+    Args:
+        bar: Bar size as stored (``"1m"``, ``"1d"``) or derived (``"5m"``, ``"15m"``).
+
+    Returns:
+        The frequency alias (``"5min"`` for ``"5m"``).
+
+    Raises:
+        KeyError: On a bar size that is neither known nor ``<n>m``.
+    """
+    if bar in _FREQ:
+        return _FREQ[bar]
+    if bar.endswith("m") and bar[:-1].isdigit():
+        return f"{int(bar[:-1])}min"
+    raise KeyError(f"unknown bar size {bar!r}; expected '1d', '1h' or '<n>m'")
+
+
 @dataclass(slots=True)
 class Panel:
     """Wide price matrices for one bar size, ready for the backtest engine.
@@ -56,7 +75,7 @@ class Panel:
     @property
     def freq(self) -> str:
         """Pandas frequency string for this bar size (Sharpe annualization)."""
-        return _FREQ[self.bar]
+        return bar_freq(self.bar)
 
     @property
     def symbols(self) -> list[str]:
@@ -73,6 +92,7 @@ def load_panel(
     *,
     session: str = "regular",
     exchanges: dict[str, str] | None = None,
+    resample: int | None = None,
 ) -> Panel:
     """Load a :class:`Panel` from the shared database in one query.
 
@@ -86,12 +106,17 @@ def load_panel(
             market only), or ``"both"`` (sets ``Panel.rth`` so indicators can
             stay session-aware).
         exchanges: Optional per-symbol venue overrides (for ``Panel.tz``).
+        resample: Candle length in minutes to derive from a ``"1m"`` load
+            (:func:`resample_panel`) — a strategy's ``data.resample``. The repo stores
+            one intraday history (1m) and derives every coarser bar from it at load
+            time, never by backfilling 5m/15m separately.
 
     Returns:
         A :class:`Panel` with adjusted OHLC, volume, and a sorted UTC index.
 
     Raises:
-        ValueError: On an unknown ``session`` or when no data matches.
+        ValueError: On an unknown ``session``, when no data matches, or when
+            ``resample`` is asked of a non-1m load.
     """
     if session not in _SESSION_FILTER:
         raise ValueError(f"session must be one of {sorted(_SESSION_FILTER)}, got {session!r}")
@@ -115,7 +140,7 @@ def load_panel(
     wide = lambda col: long.pivot_table(index="ts", columns="symbol", values=col, aggfunc="first")  # noqa: E731
     close_raw, adj = wide("close"), wide("adj_close")
     ratio = (adj / close_raw).fillna(1.0)  # adjustment factor; 1.0 where close is missing
-    return Panel(
+    panel = Panel(
         close=adj,
         open_=wide("open") * ratio,
         high=wide("high") * ratio,
@@ -124,6 +149,59 @@ def load_panel(
         bar=bar,
         tz=resolve_exchange(symbols[0], exchanges).tz,
         rth=wide("rth").astype(bool) if session == "both" else None,
+    )
+    return resample_panel(panel, resample) if resample else panel
+
+
+def resample_panel(panel: Panel, minutes: int) -> Panel:
+    """Derive coarser intraday candles from a 1-minute panel, session by session.
+
+    Buckets are aligned to each exchange-local session's FIRST stored bar (09:30–09:34 is
+    one 5-minute candle; a half-day's last partial bucket stays inside its day), so the
+    derived bars are the ones a chart draws, never clock slices that straddle the open.
+    Each candle keeps its first bar's timestamp (bar OPEN time, the database convention):
+    open = first open, high = max, low = min, close = last close, volume = sum. Everything
+    downstream is bar-agnostic — session helpers work in minutes or by clock, metrics
+    annualize on the actual bars per year — so a strategy can run on 1m, 5m or 15m
+    execution from the same stored history.
+
+    Args:
+        panel: A ``bar == "1m"`` panel.
+        minutes: Candle length in minutes (> 1).
+
+    Returns:
+        A new :class:`Panel` with ``bar == f"{minutes}m"``; ``features`` carried over.
+
+    Raises:
+        ValueError: If the panel is not 1-minute or ``minutes`` is not > 1.
+    """
+    if panel.bar != "1m" or int(minutes) <= 1:
+        raise ValueError(f"resample_panel needs a 1m panel and minutes > 1, "
+                         f"got bar={panel.bar!r}, minutes={minutes}")
+    index = panel.close.index
+    day = pd.Series(index.tz_convert(panel.tz).date, index=index)
+    keys = [day.to_numpy(), (day.groupby(day).cumcount() // int(minutes)).to_numpy()]
+    stamps = pd.DatetimeIndex(pd.Series(index, index=index).groupby(keys).first().to_numpy(),
+                              name=index.name)
+
+    def agg(frame: pd.DataFrame | None, how: str) -> pd.DataFrame | None:
+        if frame is None:
+            return None
+        out = (frame.groupby(keys).sum(min_count=1) if how == "sum"
+               else frame.groupby(keys).agg(how))
+        out.index = stamps
+        return out
+
+    return Panel(
+        close=agg(panel.close, "last"),
+        open_=agg(panel.open_, "first"),
+        high=agg(panel.high, "max"),
+        low=agg(panel.low, "min"),
+        volume=agg(panel.volume, "sum"),
+        bar=f"{int(minutes)}m",
+        tz=panel.tz,
+        rth=None if panel.rth is None else agg(panel.rth, "first").astype(bool),
+        features=panel.features,
     )
 
 

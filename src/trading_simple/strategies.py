@@ -24,8 +24,11 @@ A strategy is a folder ``strategies/<name>/`` containing:
   strategy nobody runs, and reports no error at all while doing it.
 
 An optional fourth block, ``backtest:``, holds per-strategy execution rules the engine
-applies — today only ``fill`` (``open`` | ``pessimistic``, see
-:func:`trading_simple.backtest.fill_prices`), exposed as ``LoadedStrategy.fill``.
+applies: ``fill`` (``open`` | ``pessimistic``, see
+:func:`trading_simple.backtest.fill_prices`), exposed as ``LoadedStrategy.fill``, and
+``order_notional`` (the strategy's typical REAL order in dollars, which prices the minimum
+commission — see :func:`trading_simple.backtest.leg_costs`), exposed as
+``LoadedStrategy.order_notional``.
 
 :class:`LoadedStrategy` still exposes the three flat views the engine consumes —
 ``params`` / ``sweep`` / ``optuna["space"]`` — so this declaration style is the only
@@ -65,6 +68,14 @@ class LoadedStrategy:
             parameter's ``search``.
         docs: Each parameter's ``doc`` string, for the ones that carry one.
         fill: Fill model from ``backtest.fill`` (``"open"`` when absent).
+        order_notional: Typical real order size in dollars from ``backtest.order_notional``
+            (``None`` when absent = the engine's $10,000 default). A portfolio book's orders
+            are ``account / max_positions``, not the whole wallet, and the $1 minimum
+            commission is 1 bp on $10,000 but 10 bp on $1,000.
+        whole_shares: Size every order in whole shares instead of fractional ones — a
+            STRESS set by notebooks (``dataclasses.replace``), never by a config: it only
+            means something with ``init_cash`` at the real account size, and the stored
+            prices are split-adjusted, so before a split it under-counts the rounding.
     """
 
     name: str
@@ -78,11 +89,13 @@ class LoadedStrategy:
     optuna: dict = field(default_factory=dict)
     docs: dict = field(default_factory=dict)
     fill: str = "open"
+    order_notional: float | None = None
+    whole_shares: bool = False
 
 
 #: Keys the optional ``backtest:`` block may declare. Same reason as :data:`_PARAM_KEYS`: a
 #: typo (``fil: pessimistic``) would otherwise silently run the default fills.
-_BACKTEST_KEYS = {"fill"}
+_BACKTEST_KEYS = {"fill", "order_notional"}
 
 #: Keys a long-form parameter entry may declare. Anything else is a typo, and a typo in
 #: ``serach:`` would otherwise mean "not searched" — silently, and only visible as a study
@@ -182,7 +195,7 @@ def load(name: str) -> LoadedStrategy:
         AttributeError: If ``strategy.py`` defines no ``signals`` function.
         ValueError: If the config declares a parameter the search or the grid
             contradicts (see :func:`_unpack`), or a ``backtest:`` block with an unknown
-            key or fill model.
+            key, an unknown fill model or a non-positive ``order_notional``.
     """
     folder = STRATEGIES_DIR / name
     module_file, config_file = folder / "strategy.py", folder / "config.yaml"
@@ -205,6 +218,10 @@ def load(name: str) -> LoadedStrategy:
     fill = run_cfg.get("fill", "open")
     if fill not in FILLS:
         raise ValueError(f"{name}/config.yaml: backtest.fill is {fill!r}; choose one of {FILLS}")
+    order_notional = run_cfg.get("order_notional")
+    if order_notional is not None and not float(order_notional) > 0:
+        raise ValueError(f"{name}/config.yaml: backtest.order_notional must be > 0, "
+                         f"got {order_notional!r}")
     return LoadedStrategy(
         name=name,
         dir=folder,
@@ -219,4 +236,5 @@ def load(name: str) -> LoadedStrategy:
         optuna={**cfg.get("optuna", {}), "space": space},
         docs=docs,
         fill=fill,
+        order_notional=None if order_notional is None else float(order_notional),
     )

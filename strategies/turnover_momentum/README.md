@@ -170,7 +170,6 @@ shares ×1,000,000 for two quarters in 2020, BALL a literal 0 on 2022-02-14, RMD
 ÷1,000 for one quarter each, CCL ×1,000 — and the `fundamentals` table holds **124 rows with
 a non-positive share count across 87 symbols**. `_in_volume_units` treats those as splits and
 restates a name's history by 1,000×, so the affected names drop out of the turnover ranking;
-the fix is an engine proposal (see `IDEAS.md`: a one-sided read-time repair plus a
-per-period tag fallback in the SEC provider). The verdict does not depend on it: with
-the repair and a staleness cutoff applied, the top-tercile IC moves from −0.023 to
-−0.019 and the gate still fails.
+that was fixed on 2026-09-14 in the SEC parser and the feature layer (see `IDEAS.md`). The
+verdict does not depend on it: on repaired share counts the top-tercile IC is −0.017
+instead of −0.023, and the gate still fails.

@@ -1,0 +1,184 @@
+# darts_forecast — a Darts forecast of the next grid bars' return (gbm | gbm_clf | tide | tft), walk-forward,
+# retrained every `retrain_minutes`, traded long/short and flat by the close. See README.md.
+#
+# THE DATA SPLIT (one place; the notebooks print it as a timeline):
+#   TUNE     data.start .. data.end (2025-06-18 .. 2026-01-31). Everything a knob may be chosen on.
+#            - warm-up: the first 21 sessions only build the daily inputs and the volatility scale;
+#            - then each retrain point FITS the model on the last `train_days` sessions before it (TRAIN),
+#              tide / tft hold out the last `val_days` of those for early stopping (VALIDATION),
+#            - and FORECASTS the bars until the next retrain point: every scored forecast is out of sample.
+#            Scoring starts at optuna.score_from (first session with a fitted model).
+#   TEST     2026-02-01 .. 2026-04-30: the frozen config scored ONCE (darts_forecast_diagnostics.ipynb). The
+#            walk-forward simply continues into it (warm), on a panel loaded through 2026-04-30.
+#   HOLDOUT  2026-05-01 .. last bar: read only with READ_HOLDOUT = True, once.
+
+data:
+  universe: DirectionFive  # MU COIN CSCO AAL ANET: the direction study's names, with free options data
+  bar: 1m                  # the STORED bar: the inputs need the 1-minute detail and fills stay 1-minute;
+                           # the forecast grid is the `bar_minutes` param, not a resample
+  resample: null           # keep null (see above)
+  start: "2025-06-18"      # the first stored 1m session
+  end: "2026-01-31"        # TUNE cutoff (see the split above)
+  session: regular
+  max_symbols: 5
+
+optuna:
+  study: darts_forecast-gbm-5m-v3   # one study per FORECAST config (model, grid, horizon, cadence, inputs):
+                           # the study only searches the trading rule on cached forecasts. Bump it when a
+                           # forecast knob, a `search:` bound, the objective or the window changes.
+                           # v2: one objective, the audited forecast path; v3: a decision re-enters after a
+                           # stop, holiday-copy option files dropped, empty buckets blank (2026-10-03)
+  sampler: tpe             # one objective
+  seed: 42
+  n_trials: 60
+  objectives: [alpha_cagr] # a long/short book flat most of the time and overnight: alpha after beta, as
+                           # level_flow (excess vs a fully invested basket is unreachable). ALONE: edge_bp and
+                           # health_min are exposure knobs, and alpha + volatility turns the front into an
+                           # exposure dial (informed_flow v26)
+  score_from: "2025-09-16" # first session with a fitted model: 21 warm-up + 40 train_days sessions
+  min_trades_per_year: 300 # an intraday scanner on 5 names; fewer is a handful of lucky fills
+
+backtest:
+  fill: open
+  order_notional: 2000     # $10k wallet / 5 slots: the $1 minimum commission is 5 bp per side here,
+                           # 14 bp round trip with spread and slippage (research.round_trip_bp)
+
+params:
+  # --- the forecaster (NOT searched: each value is its own study; compare them in the model notebook) ---
+  model:
+    doc: >-
+      gbm = histogram gradient boosting regressor (the LightGBM algorithm, scikit-learn) | gbm_clf = the same as
+      an up/down classifier | tide = TiDE (MLP encoder-decoder) | tft = Temporal Fusion Transformer | linear =
+      ridge regression on the same lagged inputs | tsmixer = TSMixer (all-MLP mixer).
+    value: gbm
+  bar_minutes:
+    doc: >-
+      Forecast grid in minutes (5 = predict 5-minute bars): 1, 5, 10, 15, 30 or 60 (60: a session's last bucket is
+      30 minutes). The inputs are put on this grid.
+    value: 5
+  horizon:
+    doc: Grid bars ahead the forecast covers (1 = the next bar). Also the default hold.
+    value: 1
+  lookback:
+    doc: Target lags (gbm, gbm_clf, linear) / input window (tide, tft, tsmixer), in grid bars.
+    value: 12
+  cov_lags:
+    doc: >-
+      Lags of the intraday and market inputs (gbm, gbm_clf, linear). Daily, option and seasonal inputs enter with
+      their latest value.
+    value: 6
+  train_days:
+    doc: Sessions in each rolling training window (the TRAIN slice).
+    value: 40
+  val_days:
+    doc: >-
+      tide / tft / tsmixer only - last sessions of each window held out for early stopping (the VALIDATION
+      slice).
+    value: 0
+  retrain_minutes:
+    doc: >-
+      Retrain every this many minutes of trading time: 390 = before every session, 1950 = weekly, 60 = hourly
+      (intraday), 0 = train ONCE (a static model - the control for "does retraining help").
+    value: 390
+  n_epochs:
+    doc: tide / tft / tsmixer - epochs of a full fit.
+    value: 10
+  finetune_epochs:
+    doc: >-
+      tide / tft / tsmixer - after the first fit, continue the previous weights this many epochs (0 = refit from
+      scratch).
+    value: 0
+  recency_half_life:
+    doc: Sessions after which a training sample's weight halves (0 = all equal). Encodes "the regime persists".
+    value: 0.0
+  options:
+    doc: >-
+      none | iv (implied vol, skew, term, IV-HV, OCC customer put/call and volume surge - free history since
+      2023 / Oct 2024) | all (+ open interest, put/call volume, OI change, dealer gamma - MarketData.app, last
+      year only). Attached by research.attach_options; absent data is missing, not zero.
+    value: all
+  use_daily:
+    doc: Include the daily inputs (multi-day returns, volatility, range position, gap ...).
+    value: true
+  use_market:
+    doc: Include the other names' average return (a market proxy).
+    value: true
+  vol_days:
+    doc: Sessions behind the causal volatility scale that makes returns comparable across names.
+    value: 20
+  overnight:
+    doc: >-
+      The horizon may span sessions: the target is the close-to-close return over it, overnight gaps included, in
+      typical moves over the horizon (multi-day forecasts, e.g. 60-minute bars with a 35-bar = 5-day horizon). The
+      trading rule is flat by the close, so it cannot trade them yet.
+    value: false
+  expanding:
+    doc: Train on ALL history before each retrain point; train_days is then the history required before the first fit.
+    value: false
+  seasonal:
+    doc: >-
+      Add the seasonality input: the name's mean realized forward return from the same clock time over the previous
+      20 sessions whose outcome is complete (Heston, Korajczyk & Sadka 2010). Off in the shipped 5-minute config.
+    value: false
+  lag_history:
+    doc: >-
+      Let each training window's first labels read their lagged target from before the window. Off, the first
+      lookback + horizon - 1 labels of every window are dropped (the behaviour the shipped study was run with);
+      the explorer turns it on so long input horizons lose no training outcomes.
+    value: false
+  gbm_iter:
+    doc: Boosting iterations (gbm, gbm_clf), fixed (no internal early stopping on an autocorrelated series).
+    value: 100
+  device:
+    doc: cpu | mps (Apple GPU) for tide / tft / tsmixer.
+    value: cpu
+  seed:
+    doc: Model seed (a deep model's seed-to-seed spread is part of its null - see the model notebook).
+    value: 0
+  # --- the trading rule (searched: cheap, the forecasts are cached in-process) ---------------------
+  sides:
+    doc: both | long | short.
+    value: both
+  edge_bp:
+    doc: Trade when the forecast return over the hold exceeds this many bp (costs are 14 bp round trip here).
+    value: 10.0
+    search: { type: float, low: 0.0, high: 60.0 }
+    grid: [5.0, 10.0, 20.0]
+  p_min:
+    doc: Minimum P(direction) for models that give one (gbm_clf, tide, tft); 0.5 = off.
+    value: 0.5
+  hold_bars:
+    doc: Grid bars to hold (0 = horizon).
+    value: 0
+    search: { type: categorical, choices: [0, 2, 3, 6] }
+  stop_vol:
+    doc: Stop at this many typical moves over the hold (scale x sqrt(hold)); 0 = no stop.
+    value: 2.0
+    search: { type: float, low: 0.5, high: 4.0 }
+    grid: [1.5, 2.0, 3.0]
+  risk_per_trade:
+    doc: >-
+      Fraction of the wallet lost if the stop is hit; size = min(1 / max_positions, risk / stop). 0.001 binds
+      for these names (a 2-move stop on a 5-minute bar is ~0.5%, so ~20% of the wallet = one slot or less).
+    value: 0.001
+  max_positions:
+    doc: Slots - one entry deploys at most 1 / max_positions of the free cash.
+    value: 5
+  skip_open:
+    doc: No decisions in the first N minutes of the session.
+    value: 15
+  skip_close:
+    doc: No decisions in the last N minutes; a hold never crosses the close either way.
+    value: 15
+  eod_exit:
+    doc: Flat at the session's last bar.
+    value: true
+  health_days:
+    doc: >-
+      Model-health gate: trade a session only if the model's forecasts over the previous N sessions ranked the
+      realized returns better than health_min (completed outcomes only). The regime-change brake. 0 = off.
+    value: 5
+  health_min:
+    doc: Minimum trailing forecast/outcome rank correlation for the health gate.
+    value: 0.0
+    search: { type: float, low: -0.1, high: 0.15 }

@@ -1,0 +1,52 @@
+# 24/7 market-data collection: one TimescaleDB and the collectors that write into it.
+# The same file runs locally (DB_PORT=5433 keeps it off the main cluster's 5432) and on the VM.
+#
+#   cp .env.example .env            # first time: set POSTGRES_PASSWORD (and DB_PORT locally)
+#   docker compose up -d            # start; both services restart on crash and on reboot
+#   docker compose logs -f binance_depth
+#   docker compose down             # stop; the data stays in the `tsdb` volume
+#   docker compose down -v          # DANGER: also deletes the volume and every row collected
+name: collectors
+
+x-logs: &logs  # docker keeps container logs forever by default: cap them on a 24/7 box
+  driver: json-file
+  options: {max-size: 20m, max-file: "3"}
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:2.28.1-pg18
+    restart: unless-stopped
+    shm_size: 1gb
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: market_depth_db
+    ports:
+      - "127.0.0.1:${DB_PORT:-5432}:5432"  # loopback only: from elsewhere, use an SSH tunnel
+    volumes:
+      - tsdb:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    logging: *logs
+
+  binance_depth:
+    image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+    command: ["uv", "run", "--script", "/app/binance_depth.py"]
+    restart: unless-stopped
+    init: true  # forwards docker stop's SIGTERM so the collector shuts down cleanly
+    environment:
+      DB_URL_DEPTH: postgresql://postgres:${POSTGRES_PASSWORD}@timescaledb:5432/market_depth_db
+      DEPTH_SYMBOLS: ${DEPTH_SYMBOLS:-}  # empty = the script's default ten pairs
+      UV_CACHE_DIR: /cache
+    volumes:
+      - ./binance_depth.py:/app/binance_depth.py:ro
+      - uv_cache:/cache  # dependencies resolved once, reused on every restart
+    depends_on:
+      timescaledb: {condition: service_healthy}
+    logging: *logs
+
+volumes:
+  tsdb:
+  uv_cache:

@@ -104,7 +104,8 @@ def test_off_defaults_match_informed_flow():
     shared = {k: v for k, v in _PARAMS.items() if k != "displace"}
     w_cf = cf.signals(p, **{**cf.params, **_PARAMS})["weights"]
     w_if = iff.signals(p, **{**iff.params, **shared,
-                             "displace_margin": 1.0, "w_recency": 0.0})["weights"]
+                             "displace_margin": 1.0, "w_recency": 0.0,
+                             "neutral_groups": 0})["weights"]   # a v31 lever the fork lacks
     assert w_cf.equals(w_if)
 
 

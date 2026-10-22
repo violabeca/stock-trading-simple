@@ -1,0 +1,147 @@
+# burst_scan — activity bursts on minute bars; a LONG and a SHORT sub-strategy, each with its
+# own detector, its own walk-forward classifier and its own verdict. Blocks: data, optuna,
+# backtest, params. See README.md for the thesis, the pre-registration and which of the five
+# notebooks answers what.
+# PHASE 1 VERDICT 2026-09-27: both sides FAIL (README "Results") — this config is the record of
+# what was tested, not a shipped strategy. The detector knobs were NOT moved to the G0 grid pick
+# (a failed side does not advance).
+
+data:
+  universe: Morning200     # 200 names ranked POINT-IN-TIME (dollar volume over 2025-01..06,
+                           # before the window) — never HighOctaneTop20 (look-ahead selected)
+  bar: 1m                  # the STORED bar; coarser execution bars are derived, never backfilled
+  resample: 5              # the pre-registered primary cell trades 5-minute bars (README).
+                           # Each execution bar is its own study — bump `study` when changed
+  start: "2025-06-18"      # the first stored 1m session: profiles, ATR and dollar volume warm up
+  end: "2026-04-30"        # TRAIN cutoff — 2026-05-01 .. 2026-06-26 is the one-shot holdout
+  session: regular
+  max_symbols: 200
+
+optuna:
+  study: burst_scan-5m-v2  # v2: 2026-09-27 wallet shorts lock cash — short proceeds
+                           # no longer fund longs; a short's stop covers it whole. v1 not comparable.
+                           # bump on any `search:` bound, objective, fill, window or bar change
+  sampler: random
+  seed: 42
+  n_trials: 1              # PHASE 1 SEARCHES NOTHING: the one trial records the shipped rules.
+                           # A search opens only for a sub-strategy that passes its gates
+  objectives: [alpha_cagr, volatility]   # alpha after beta: a book flat part of the time
+                           # cannot out-earn a fully invested +47%/yr basket by construction
+  score_from: "2025-10-01" # the first walk-forward month: 20 warm-up sessions + 50 sessions of
+                           # training events end in late September. Before it nothing trades
+  min_trades_per_year: 150 # admissibility floor, PER YEAR
+  pick_min_trades_per_year: 150
+
+backtest:
+  fill: open               # the diagnostics notebook re-runs it under `pessimistic`
+  order_notional: 1000     # $10k wallet / 10 slots: the $1 minimum commission is 10 bp a leg
+
+# EVERY PARAMETER IS DECLARED ONCE. Time knobs are in MINUTES (of trading time), so the same
+# config runs on 1m, 5m or 10m execution bars. A sub-strategy's own knobs carry its prefix
+# (long_ / short_); the rest are shared. Nothing is searched in phase 1. The four detector knobs
+# per side are set from notebook burst_scan_events §6 by the pre-registered pick rule, then
+# frozen; they are never refit on classifier or backtest results.
+params:
+  sides:
+    doc: both | long | short — which sub-strategies trade. Each is judged alone first.
+    value: both
+  # --- the long sub-strategy ----------------------------------------------------------------
+  long_trigger:
+    doc: volume | range | both | either — what makes a long burst (both = volume AND range).
+    value: both
+  long_impulse:
+    doc: any | up | down — the burst move a long event needs (up = continuation, down = fade).
+    value: any
+  long_vol_mult:
+    doc: Volume over the burst window / its same-clock median, a long event needs.
+    value: 3.0
+  long_range_mult:
+    doc: High-low range over the burst window / its same-clock median, a long event needs.
+    value: 2.0
+  long_horizon:
+    doc: Long time exit, minutes of trading time; may run past the close (390 = one session).
+    value: 390
+  long_eod_exit:
+    doc: Flat longs at the session's last bar (false = held overnight up to the horizon).
+    value: false
+  long_move_atr:
+    doc: >-
+      Long target = stop distance in session ATRs x sqrt(horizon / 390): one knob fits a
+      30-minute and a 5-day hold (at 1.0: ~0.28 ATR over 30 min, 1 ATR over a session).
+    value: 1.0
+  long_trade_q:
+    doc: Share of the long classifier's most confident events it takes (its fold's own quantile).
+    value: 0.33
+  # --- the short sub-strategy ---------------------------------------------------------------
+  short_trigger:
+    doc: volume | range | both | either — what makes a short burst.
+    value: both
+  short_impulse:
+    doc: any | up | down — the burst move a short event needs (down = continuation, up = fade).
+    value: any
+  short_vol_mult:
+    doc: Volume over the burst window / its same-clock median, a short event needs.
+    value: 3.0
+  short_range_mult:
+    doc: High-low range over the burst window / its same-clock median, a short event needs.
+    value: 2.0
+  short_horizon:
+    doc: Short time exit, minutes of trading time; may run past the close.
+    value: 390
+  short_eod_exit:
+    doc: Flat shorts at the session's last bar. Overnight shorts pay a borrow fee the engine does not model.
+    value: false
+  short_move_atr:
+    doc: Short barrier distance, as long_move_atr.
+    value: 1.0
+  short_trade_q:
+    doc: Share of the short classifier's most confident events it takes.
+    value: 0.33
+  # --- shared: the detector's window and baselines -------------------------------------------
+  burst_minutes:
+    doc: Burst window in minutes — a whole multiple of 1, 5 and 10, so every bar sees one detector.
+    value: 10
+  profile_days:
+    doc: Sessions in the same-clock volume and range baselines (bt.volume_profile).
+    value: 10
+  skip_open:
+    doc: No events in the first N minutes (>= burst_minutes, so a window never straddles the open).
+    value: 15
+  skip_close:
+    doc: No events in the last N minutes.
+    value: 15
+  cooldown:
+    doc: Quiet minutes a burst needs before it counts — the first bar of a cluster only.
+    value: 60
+  # --- shared: context features, floors, warm-up ------------------------------------------------
+  trend_minutes:
+    doc: Length of the pre-burst trend feature, in minutes.
+    value: 60
+  atr_days:
+    doc: Session-ATR smoothing window in sessions — the one distance unit.
+    value: 14
+  dv_days:
+    doc: Sessions of median session dollar volume behind the floor and the dv_rank feature.
+    value: 20
+  warmup_sessions:
+    doc: No events in the first N sessions (>= every session-level window; valid() enforces it).
+    value: 20
+  min_price:
+    doc: Price floor at the event bar.
+    value: 5.0
+  min_dollar_volume:
+    doc: Floor on the prior sessions' median session dollar volume. Written out — YAML reads 1e6 as a STRING.
+    value: 1000000.0
+  # --- shared: the classifier and the book --------------------------------------------------------
+  model:
+    doc: lr (logistic regression, the default) | gbm (gradient boosting, the challenger).
+    value: lr
+  min_train_sessions:
+    doc: Sessions of events before the first predicted month (with the warm-up, October 2025).
+    value: 50
+  max_positions:
+    doc: Wallet slots; each entry deploys 1/max_positions of the FREE cash.
+    value: 10
+  ssr_guard:
+    doc: Never short a name down 10% from its prior close (Reg SHO Rule 201), that day and the next.
+    value: true

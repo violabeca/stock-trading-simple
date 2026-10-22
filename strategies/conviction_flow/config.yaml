@@ -30,7 +30,10 @@ data:
 optuna:
   # v1: the initial study for this strategy. NOT comparable to informed_flow's studies —
   # this one searches five extra selectivity levers on top of the same flow composite.
-  study: conviction-flow-1d-v2  # v2: 2026-07-19 engine realism (panel-priced costs,
+  study: conviction-flow-1d-v3  # v3: 2026-09-14 fundamentals repair — SEC tag fallback per
+                           # filing/period, share-count band, monotone per-day pick, 800-day
+                           # max age; the quality gate's inputs changed. v2: 2026-07-19 engine
+                           # realism (panel-priced costs,
                            # benchmark mask, ffill feature seeding) — v1 journals not comparable
   sampler: nsga2           # nsga2 | tpe | random
   seed: 42

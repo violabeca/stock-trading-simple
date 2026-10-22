@@ -90,43 +90,38 @@ here — monthly rotation of ~half the book against a 1–2% gross spread. A pre
 of the reversal leg on the 2025+ holdout would at least say whether it survived 2023–24's
 fade; run it once, do not tune on it.
 
-### Fundamentals need repairing at read time — ENGINE PROPOSAL (refined 2026-09-14)
+### Fundamentals repair — IMPLEMENTED 2026-09-14
 
-Measured on the whole `fundamentals` table, as the feature builder reads it: 181 thousand-fold
-unit jumps across 80 symbols, confirmed as filed in SEC's own `companyfacts` (AJG reported
-189,621,000,000,000 shares for 2020-Q1); 119 zero share counts and 97 shell stubs of 1–9,999
-shares. The bigger problem is **frozen series**: `providers/sec._first_tagged` locks a concept
-onto the first XBRL tag that ever had data, so the value stops updating when a filer abandons
-that tag. At 2024-12-31, 26 LiquidLeaders ∪ Liquid500 members carry a share count 4–14 years
-old (V, MA, CMCSA, ACN, NKE, SCHW, F, REGN …: multi-class issuers stop filing a
-non-dimensional cover-page count) and 29 have none (META, CRWD …). The same lock-in freezes
-equity (AVGO, QCOM), net income (PH) and gross profit (see `../value_factor/IDEAS.md`).
+Found while building this strategy, measured on the whole `fundamentals` table: thousand-fold
+unit slips in share counts (181 jumps across 80 symbols, filed that way — AJG reported
+189,621,000,000,000 shares for 2020-Q1), 119 zero and 97 stub counts, and FROZEN series: the SEC
+parser locked each concept onto the first XBRL tag that ever had data, so multi-class issuers
+(V, MA, CMCSA) sat on 2010 share counts and AMZN on its 2009 gross profit.
 
-The fix, in three parts:
+What shipped (see the `CLAUDE.md` gotcha and the `features.py` / `providers/sec.py` docstrings):
 
-1. **`features.py`, share-count units, point-in-time.** Walk each symbol's filings in `known_at`
-   order: drop counts below 10,000; a count within 2× of a 1000^k multiple of the last accepted
-   count is divided back; new units are accepted only once that run has persisted more than 365
-   days. It reads past filings only, so a train-only load and a full load agree. All 26 repairs
-   it makes on a universe member since 2018 check out; the 365-day acceptance fires only on nine
-   symbols whose very first filing was wrong (2011–2013), and the longest real error run (AAP,
-   2011–12) stayed under a year.
-2. **`providers/sec.py`, per-period tag fallback.** For each period, the first tag that reports
-   it wins; weighted-average basic shares (`us-gaap` / `ifrs-full`) is the last share-count
-   resort, and gross profit falls back to revenue − COGS period by period. SEC data shows this
-   restores a current share count for 43 of the 54 stale or missing members (not V, F, STZ, TSN,
-   PLNT, BP, BIDU, IBN, PSKY, SNDK, XOM). Re-ingest with `REFRESH = True` in
-   `notebooks/03_altdata_update.ipynb`; the do-nothing upsert only adds rows.
-3. **`features.py`, an 800-day max age on `fund_*` levels.** Domestic filing gaps are 134 days
-   at p99, foreign ones 729; the cap removes only genuinely frozen values that no tag can restore
-   (V). Scoped to `fund_*` so informed_flow's short-interest sleeve stays bit-identical. It must
-   ship with part 2, or value_factor's gross-profit sleeve drops under its coverage floor.
+- **Provider:** tag fallback per filing (instants) and per period with the earliest filing
+  winning (flows); weighted-average basic shares as the last share-count fallback; gross profit
+  synthesized from revenue − COGS wherever the tag stops, matched within ONE filing (the old
+  cross-filing match was a look-ahead leak).
+- **Feature layer:** `_screen_shares` drops counts outside 1e6–2e11 and counts furnished on
+  Form 6-K (RY's 2019 6-Ks tagged its count in thousands, inside the band); `_newest_period`
+  keeps one row per day that never moves a level backwards; `_to_grid` masks fundamentals levels
+  older than 800 days.
+- **Re-ingest:** all 2,303 symbols in 25 minutes, +39k rows. The table is insert-or-ignore, so a
+  dry run on nine filers came first and confirmed zero key collisions.
 
-Rejected: a two-sided "differs from both neighbouring filings" rule — it needs the next filing,
-so a train-only load and a full load would disagree about the last train-window filings (the
-same leak class as loading full history and slicing back). No thousand-fold repair on assets or
-equity either: de-SPACs genuinely grow ~1000× (ACHR, BKSY, CIFR, FUBO, GBTG). Never edit stored
-rows: the table is a point-in-time archive in a shared database.
+Rejected on evidence: a stateful walk that repairs each filing against the previous one (it
+manufactures errors wherever a company's first filing is the bad one), a two-sided repair that
+reads the next filing (breaks train-only vs full-load identity), and priority-first merging of
+flows (loses periods and adopts DEF 14A proxy values).
 
-This strategy's verdict does not depend on any of it: with parts 1 and 3 applied, the
-top-tercile 21d IC moves from −0.023 to −0.019 and the gate still fails.
+| LiquidLeaders ∪ Liquid500 at 2024-12-31 | before | after |
+|---|---|---|
+| share count older than 800 days | 26 | 3 |
+| no share count | 29 | 8 |
+| net income older than 800 days | 32 | 3 |
+| names with a thousand-fold share step since 2018 | AJG, BTI, CCL, CMG, EIX, RMD | none |
+
+This strategy's verdict does not change: on repaired share counts the top-tercile 21d IC is
+−0.017 (t −0.71) against −0.001 in the bottom tercile, and the gate still fails.

@@ -105,6 +105,14 @@ class Settings(BaseSettings):
         except KeyError as exc:
             raise KeyError(f"Unknown universe {name!r}. Known: {sorted(self.universe)}") from exc
 
+    def all_symbols(self) -> list[str]:
+        """Every symbol across every named universe, alphabetically deduplicated.
+
+        Returns:
+            The sorted union of every universe in ``settings.yaml``/``universes.yaml``.
+        """
+        return sorted(set().union(*self.universe.values())) if self.universe else []
+
 
 def load_settings(settings_file: Path | None = None) -> Settings:
     """Load global settings from YAML, merge universes, apply env overrides.

@@ -1,0 +1,135 @@
+# ===========================================================================
+# trend_following — daily, long AND short: enter at the confirmed start of a trend
+# (Donchian breakout + ADX confirmation), admit the strongest 12-1 month relative
+# trends into 20 equal slots, exit on a ratcheting ATR chandelier stop (closing
+# basis) or an opposite start. Layout: data (what panel to load), optuna (study
+# settings), backtest (fill model + real order size), params (every knob: doc +
+# shipped value + optional search and grid).
+# ===========================================================================
+
+data:
+  universe: Liquid500      # 497 names, point-in-time: ranked by median dollar volume over
+                           # 2020-H1, a window that closes before any bar loaded here
+                           # (notebooks/01_universe_screener.ipynb §8b). Survivor-only pool:
+                           # the stocks that later delisted — the best shorts — are missing.
+  bar: 1d                  # daily bars — trends held weeks to months
+  start: "2020-07-01"      # load start: 18 months of warm-up before the study scores (the
+                           # first bar after Liquid500's ranking window; the 12-1 month
+                           # relative strength needs 252 bars)
+  end: "2024-12-31"        # TRAIN cutoff — 2025+ is the untouched holdout. The design
+                           # iterations (README "Study history") trained on 2022-23 and were
+                           # judged on 2024; the shipped study refits the final design on 2022-24
+  session: regular
+  max_symbols: 500         # the whole universe
+
+# Study settings. The search SPACE is not here — each parameter declares its own
+# `search:` next to the value it ships, so the two cannot disagree.
+optuna:
+  study: trend-following-1d-v8   # v8 (2026-10-19): portfolio mode now locks short proceeds
+                                 # (lock_cash, proposal #31) — v7 journals ran a book whose
+                                 # shorts funded longs (gross up to 114%). Bump whenever a `search:` bound, the objective, the fill
+                                 # model or the execution model changes. v7 = the v6 design
+                                 # refit on 2022-24 (entry_window low 10 -> 5: v6's pick sat
+                                 # at 11). v1-v6: the five improvement runs (README).
+  sampler: nsga2
+  seed: 42
+  n_trials: 600
+  score_from: "2022-01-03"  # score every trial WARM from here (signals on the whole panel):
+                            # 2020-07 -> 2021 is warm-up only, so every indicator — the
+                            # 252-bar relative strength included — is defined on day one
+  min_trades_per_year: 25   # admissibility floor (PER YEAR): a 20-slot book whose trends run
+                            # ~3-6 months turns over ~30-80 positions a year; below 25 a front
+                            # row is a few lucky trends, not a strategy
+
+# Execution rules the engine applies to this strategy AND its benchmark.
+backtest:
+  fill: open               # next bar's adjusted open. `pessimistic` (buys at the high, sells
+                           # at the low) cuts the shipped pick's excess from +5.7 to +1.0%/yr
+                           # on train — flip it for the stress and bump optuna.study.
+  order_notional: 2500     # the REAL order: 20 slots of a $50k account. Prices the $1 minimum
+                           # commission at 4 bp a leg instead of the $10k default's 1 bp
+
+# Every parameter declared ONCE: what it means, what ships (`value`), what the
+# study may explore (`search`), and what the coarse sweep varies (`grid`).
+# No `grid` means the sweep pins it at `value`; a bare scalar means value-only.
+params:
+
+  # --- the start of a trend ---------------------------------------------------------
+  entry_window:
+    doc: >-
+      Donchian lookback in bars: a start is a close above the highest high (long) / below
+      the lowest low (short) of the prior entry_window bars. 20 is the Turtles' fast system,
+      55 their slow one. The v7 study ships 9 (a two-week breakout): the 12-1 month relative
+      strength picks WHICH names get a slot, the short channel only times the entry — and,
+      through opposite starts, most of the exits.
+    value: 9
+    search: { type: int, low: 5, high: 300, log: true }   # 252 = the 52-week high; v7: low
+                                                          # 10 -> 5 (v6's pick sat at 11)
+  adx_window:
+    doc: Wilder smoothing window of the ADX and the directional indicators (Wilder's 14).
+    value: 14
+  adx_min:
+    doc: >-
+      ADX floor a breakout needs to count as a start, with +DI/−DI agreeing on the
+      direction. ~20-25 is Wilder's "trending" line; 0 switches the confirmation off (the
+      grid runs both, so the sweep is its ablation). The study ships 34: only strongly
+      directional breakouts start a trend.
+    value: 34.0
+    search: { type: float, low: 0.0, high: 60.0, step: 1.0 }   # v2: v1's top trials sat at 38-39 of 40
+    grid: [0.0, 34.0]
+
+  # --- the stop ---------------------------------------------------------------------
+  atr_window:
+    doc: ATR window of the stop (Wilder smoothing). LeBeau's chandelier uses 22.
+    value: 37
+    search: { type: int, low: 5, high: 60, log: true }
+  atr_mult:
+    doc: >-
+      Stop distance in ATRs: at entry from the signal close, then trailing behind the best
+      price since entry on the CURRENT ATR, never loosened. LeBeau's chandelier uses 3 —
+      but here every tight stop lost (2-5 ATRs: −7 to −22%/yr of excess on train, v3), and
+      a wide stop scored about the same as none. So the study ships 14: a disaster stop,
+      with opposite starts doing ~3 of 4 exits. The grid keeps a tight and a mid value, so
+      the sweep shows it.
+    value: 14.0
+    search: { type: float, low: 1.0, high: 16.0, step: 0.25 }  # v2: v1's top 10 all at 7.25-8 of 8
+    grid: [3.0, 8.0, 14.0]
+
+  # --- the book ---------------------------------------------------------------------
+  direction:
+    doc: >-
+      long | short | both. Ships both; the grid runs each side alone, so the sweep says
+      which side carries the result. Not searched.
+    value: both
+    grid: [long, short, both]
+  max_positions:
+    doc: >-
+      Equal slots in ONE shared book (engine portfolio mode): each open position targets
+      1/max_positions of the book's value at entry and drifts until it exits. When more
+      names start than slots are free, the strongest relative trend (rs_window / rs_skip)
+      goes first. Never searched — it is the book's concentration, a risk decision, and a
+      dial the optimizer would turn (40 slots were tried and rejected, v4).
+    value: 20
+  rs_window:
+    doc: >-
+      Relative-strength lookback in bars that ranks starts competing for a free slot: the
+      name's return from rs_window to rs_skip bars ago minus the average name's. 252 = the
+      12-month momentum horizon of the literature. Not searched: v5 ranked on the entry
+      window's own return, and short horizons fitted 2022-23 and collapsed in 2024.
+    value: 252
+  rs_skip:
+    doc: >-
+      Most recent bars left out of the relative strength — one-month returns reverse
+      (Jegadeesh 1990), so the classic 12-1 momentum skips them. Not searched.
+    value: 21
+
+  # --- intraday only (ignored on these daily bars; trend_following_1m sets them) -------
+  skip_open:
+    doc: Intraday only — no starts within the first N minutes of a session.
+    value: 0
+  skip_close:
+    doc: Intraday only — no starts within the last N minutes of a session.
+    value: 0
+  eod_exit:
+    doc: Intraday only — flat before each session's final bar, nothing held overnight.
+    value: false

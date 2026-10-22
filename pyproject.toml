@@ -11,7 +11,7 @@ dependencies = [
     "pandas>=2.2,<3.0",        # vectorbt 1.0 breaks on pandas 3.0
     "numpy>=1.26,<2.5",        # numba (vectorbt's JIT engine) caps at numpy 2.4
     "vectorbt[rust]>=1.0",     # the backtest engine; [rust] enables engine='auto' Rust dispatch
-    "optuna>=4.0",             # multi-objective optimization with resumable journal storage
+    "optuna>=5.0",             # multi-objective optimization with resumable journal storage
     "plotly>=6.0",             # all visualization
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.1",
@@ -21,12 +21,23 @@ dependencies = [
     "typer>=0.12",
     "requests>=2.31",
     "yfinance>=0.2.40",
+    "scikit-learn>=1.5",       # burst_scan's walk-forward classifiers (already a vectorbt dependency)
+    "lxml>=5.0",               # yfinance's earnings dates (pandas.read_html): classic_signals' reports
 ]
 
 [project.optional-dependencies]
 ibkr = ["ib_async>=1.0"]                            # 1-minute history needs a running IB Gateway
-notebook = ["jupyterlab>=4.0", "ipykernel>=6.29", "nbformat>=5.9", "nbclient>=0.9"]
+notebook = [
+    "jupyterlab>=4.0",
+    "ipykernel>=6.29",
+    "nbformat>=5.9",
+    "nbclient>=0.9",
+    "marimo>=0.25.1",
+]
 dev = ["pytest>=8.0", "ruff>=0.5"]
+# darts_forecast strategy: Darts forecasting models (scikit-learn GBM, TiDE, TFT) + torch;
+# W&B (one run per Optuna trial, via OptunaHub's W&B callback) for the day-start notebook's tuning.
+darts = ["darts[torch]>=0.48", "wandb>=0.19", "optunahub>=0.3"]
 
 [project.scripts]
 tsim = "trading_simple.cli:app"
@@ -52,3 +63,4 @@ select = ["E", "F", "I", "W", "UP", "B", "SIM"]
 testpaths = ["tests"]
 addopts = "-q"
 pythonpath = ["."]
+

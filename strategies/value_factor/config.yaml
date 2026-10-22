@@ -8,7 +8,7 @@
 data:
   universe: LiquidLeaders  # ~100 liquid US names — breadth for cross-sectional ranking
   bar: 1d                  # daily bars (value/quality act over quarters)
-  # History is ingested from 2020 (see notebooks/03_altdata_update.ipynb) but we TRAIN
+  # History is ingested from 2020 (see notebooks/03_altdata_update.py) but we TRAIN
   # from 2021: fundamentals forward-fill from each filing, so allow a couple of quarters
   # for the first in-window 10-Q/10-K to land per name (20-F annual filers take longer).
   start: "2021-01-01"
@@ -28,7 +28,10 @@ optuna:
   # buy-and-hold of the SAME panel (backtest.benchmark). A long-only ranker in a rising
   # market earns a positive absolute Sharpe just by being invested, so only the
   # benchmark-relative pair separates stock selection from market exposure.
-  study: value-factor-1d-v2  # v2: 2026-07-19 engine realism (panel-priced costs,
+  study: value-factor-1d-v3  # v3: 2026-09-14 fundamentals repair — SEC tag fallback per
+                           # filing/period, share-count band, monotone per-day pick, 800-day
+                           # max age; every fund_* input changed. v2: 2026-07-19 engine
+                           # realism (panel-priced costs,
                            # benchmark mask, ffill feature seeding — the warm-up dead zone
                            # is materially shorter now) — v1 journals not comparable
   sampler: nsga2           # nsga2 | tpe | random

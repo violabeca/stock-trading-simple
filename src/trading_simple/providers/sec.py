@@ -17,7 +17,11 @@ The same EDGAR machinery also serves company **fundamentals**
 company's entire as-reported financial history in one request, from which
 :func:`_parse_companyfacts` (pure) derives point-in-time balance-sheet levels
 (equity, assets, shares) and trailing-twelve-month income flows (net income,
-gross profit) — the raw material for cross-sectional value/quality factors. Both
+gross profit) — the raw material for cross-sectional value/quality factors. Filers'
+own mistakes (thousand-fold unit errors, zero share counts) are stored as filed, as a
+point-in-time archive must; the parser owns only the choice of XBRL tag, which it makes
+per filing or per period so a concept never freezes when a filer changes tags, and
+:mod:`trading_simple.features` screens implausible values at read time. Both
 network fetches are separated from their pure parsers so the parsers are
 unit-testable offline on saved fixtures. EDGAR's fair-access policy caps requests
 at 10/s and requires a ``User-Agent`` that identifies the caller — both are
@@ -56,9 +60,11 @@ _DOC_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{doc}"
 _COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 _FUND_KNOWN_HOUR = 21  # a filing acts from 21:00 UTC (after the US close), like short interest
 
-# Logical fundamental concept -> ordered (taxonomy, tag) fallbacks; first present
-# wins. INSTANT concepts (balance-sheet levels) are matched here; FLOW concepts
-# (income statement, rolled to trailing-twelve-months) are below.
+# Logical fundamental concept -> ordered (taxonomy, tag) fallbacks, highest priority
+# first. EVERY tag is read, and the order is resolved per filing (instants) or per period
+# (flows) — see _parse_companyfacts — never once for the whole history. INSTANT concepts
+# (balance-sheet levels) are matched here; FLOW concepts (income statement, rolled to
+# trailing-twelve-months) are below.
 _FUND_INSTANT_TAGS = {
     "equity": [
         ("us-gaap", "StockholdersEquity"),
@@ -66,13 +72,20 @@ _FUND_INSTANT_TAGS = {
         ("ifrs-full", "Equity"),
     ],
     "assets": [("us-gaap", "Assets"), ("ifrs-full", "Assets")],
+    # A point-in-time count first; a filing's weighted-average basic count only when it
+    # reports none (multi-class issuers stopped filing a non-dimensional cover-page count).
     "shares": [("dei", "EntityCommonStockSharesOutstanding"),
-               ("us-gaap", "CommonStockSharesOutstanding")],
+               ("us-gaap", "CommonStockSharesOutstanding"),
+               ("us-gaap", "WeightedAverageNumberOfSharesOutstandingBasic"),
+               ("ifrs-full", "WeightedAverageShares")],
 }
+#: Share-count tags reported as DURATION facts; :func:`_as_instants` converts them.
+_FUND_DURATION_SHARES = frozenset({"us-gaap:WeightedAverageNumberOfSharesOutstandingBasic",
+                                   "ifrs-full:WeightedAverageShares"})
 _FUND_INSTANT_UNIT = {"equity": "USD", "assets": "USD", "shares": "shares"}
 _FUND_NI_TAGS = [("us-gaap", "NetIncomeLoss"), ("us-gaap", "ProfitLoss"),
                  ("ifrs-full", "ProfitLoss")]
-_FUND_GP_TAGS = [("us-gaap", "GrossProfit")]  # else computed revenue - cogs
+_FUND_GP_TAGS = [("us-gaap", "GrossProfit")]  # merged with revenue - cogs, period by period
 _FUND_REV_TAGS = [("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"),
                   ("us-gaap", "Revenues"), ("us-gaap", "SalesRevenueNet"),
                   ("ifrs-full", "Revenue")]
@@ -386,6 +399,23 @@ def _form345_urls() -> dict[str, str]:
     return _form345_url_cache
 
 
+def bulk_published_until() -> date | None:
+    """Return the last day SEC's newest published Form 345 data set covers (or None).
+
+    The data sets are published per calendar quarter of filing date, some weeks after
+    it ends; :func:`iter_insider_bulk` serves every day up to this one, the per-filing
+    :func:`fetch_insider` the days after it.
+
+    Returns:
+        The newest published quarter's last day, or ``None`` when none is listed.
+    """
+    quarters = _form345_urls()
+    if not quarters:
+        return None
+    year, q = map(int, max(quarters).split("q"))
+    return date(year + q // 4, q * 3 % 12 + 1, 1) - timedelta(days=1)
+
+
 def _quarters_since(since: date, until: date) -> list[str]:
     """List ``YYYYqN`` quarter labels spanning ``since``..``until`` inclusive."""
     out, y, q = [], since.year, (since.month - 1) // 3 + 1
@@ -653,12 +683,24 @@ def fetch_fundamentals(symbol: str, since: date) -> list[Fundamental]:
 def _parse_companyfacts(facts: dict, symbol: str) -> list[Fundamental]:
     """Derive point-in-time fundamental rows from a ``companyfacts`` document (pure).
 
-    For each logical concept, the first XBRL tag with data wins (see the
-    ``_FUND_*_TAGS`` fallback lists). Balance-sheet **instants** (equity, assets,
-    shares) yield one row per successively-newer reporting period, at the filing
-    that first disclosed it. Income-statement **flows** (net income, gross profit)
-    are rolled to trailing-twelve-months by :func:`_flow_rows`. Gross profit falls
-    back to ``revenue - cogs`` (Novy-Marx's definition) when untagged.
+    Every tag in a concept's ``_FUND_*_TAGS`` fallback list is read, and the fallback
+    order is resolved per FILING (instants) or per PERIOD (flows) — never once for the
+    whole history. Locking a concept onto the first tag that ever had data froze it the
+    day a filer abandoned that tag: multi-class issuers stopped filing a non-dimensional
+    cover-page share count (V, MA and CMCSA sat on 2010 counts for fourteen years),
+    AVGO and QCOM moved to the incl.-noncontrolling equity tag, and AMZN stopped tagging
+    ``GrossProfit`` after its 2009 annual report.
+
+    * Balance-sheet **instants** (equity, assets, shares): each filing contributes the
+      facts of the highest-priority tag it reports (:func:`_by_filing`), then
+      :func:`_instant_rows` keeps one row per successively-newer period at first
+      disclosure. Shares fall back to the filing's weighted-average basic count
+      (:func:`_as_instants`) when it reports no point-in-time count.
+    * Income-statement **flows** (net income, gross profit) are rolled to
+      trailing-twelve-months per tag by :func:`_flow_rows` and merged earliest filing
+      first (:func:`_earliest`). Gross profit merges the tagged ``GrossProfit`` with
+      ``revenue - cogs`` (Novy-Marx's definition), so synthesis fills the periods the tag
+      does not cover.
 
     Args:
         facts: The parsed ``companyfacts`` JSON (``{"facts": {taxonomy: {tag: ...}}}``).
@@ -670,34 +712,111 @@ def _parse_companyfacts(facts: dict, symbol: str) -> list[Fundamental]:
     data = facts.get("facts", {})
     rows: list[Fundamental] = []
     for concept, tags in _FUND_INSTANT_TAGS.items():
-        raw = _first_tagged(data, tags, _FUND_INSTANT_UNIT[concept])
-        rows += _instant_rows(symbol, concept, raw)
-    rows += _flow_rows(symbol, "ni_ttm", _first_tagged(data, _FUND_NI_TAGS, "USD"))
-    gp = _first_tagged(data, _FUND_GP_TAGS, "USD")
-    if not gp:
-        gp = _synth_gross_profit(_first_tagged(data, _FUND_REV_TAGS, "USD"),
-                                 _first_tagged(data, _FUND_COGS_TAGS, "USD"))
-    rows += _flow_rows(symbol, "gp_ttm", gp)
+        found = _as_instants(_all_tagged(data, tags, _FUND_INSTANT_UNIT[concept]))
+        rows += _instant_rows(symbol, concept, _by_filing(found, tags))
+    rows += _earliest([_flow_rows(symbol, "ni_ttm", _all_tagged(data, [tag], "USD"))
+                       for tag in _FUND_NI_TAGS])
+    # Flows only: a stray instant fact of a higher tag must not hide a filing's usable flow.
+    rev = _by_filing([f for f in _all_tagged(data, _FUND_REV_TAGS, "USD") if f["start"]],
+                     _FUND_REV_TAGS)
+    cogs = _by_filing([f for f in _all_tagged(data, _FUND_COGS_TAGS, "USD") if f["start"]],
+                      _FUND_COGS_TAGS)
+    rows += _earliest([_flow_rows(symbol, "gp_ttm", _all_tagged(data, _FUND_GP_TAGS, "USD")),
+                       _flow_rows(symbol, "gp_ttm", _synth_gross_profit(rev, cogs))])
     return rows
 
 
-def _first_tagged(data: dict, tags: list[tuple[str, str]], unit: str) -> list[dict]:
-    """Return normalized facts for the first ``(taxonomy, tag)`` with data under ``unit``.
+def _all_tagged(data: dict, tags: list[tuple[str, str]], unit: str) -> list[dict]:
+    """Return normalized facts for EVERY ``(taxonomy, tag)`` in ``tags`` under ``unit`` (pure).
+
+    Each fact keeps its ``taxonomy:tag`` label, so the caller resolves the fallback order
+    per filing or per period rather than once for the whole history.
 
     Args:
         data: The ``facts`` sub-object of a companyfacts document.
-        tags: Ordered ``(taxonomy, tag)`` fallbacks; the first present wins.
+        tags: Ordered ``(taxonomy, tag)`` fallbacks, highest priority first.
         unit: The unit key to read (``"USD"`` or ``"shares"``).
 
     Returns:
-        A list of normalized fact dicts (see :func:`_norm_fact`), or empty.
+        A list of normalized fact dicts (see :func:`_norm_fact`), possibly empty.
     """
-    for taxonomy, tag in tags:
-        series = data.get(taxonomy, {}).get(tag, {}).get("units", {}).get(unit)
-        if series:
-            return [_norm_fact(f, taxonomy, tag, unit)
-                    for f in series if f.get("val") is not None and f.get("end") and f.get("filed")]
-    return []
+    return [_norm_fact(f, taxonomy, tag, unit)
+            for taxonomy, tag in tags
+            for f in data.get(taxonomy, {}).get(tag, {}).get("units", {}).get(unit, [])
+            if f.get("val") is not None and f.get("end") and f.get("filed")]
+
+
+def _as_instants(facts: list[dict]) -> list[dict]:
+    """Turn weighted-average share counts into one instant per filing; keep instants (pure).
+
+    A weighted-average count is a DURATION fact, and one filing reports several of them
+    (the quarter, the year to date, prior-year comparatives). The fallback wants the
+    freshest figure the filing knows, so per ``(tag, accession)`` it keeps the latest
+    ``end`` and, at that end, the shortest period — the quarter, not the year to date —
+    stamped as an instant at ``end``. Duration facts of every other tag are dropped: the
+    instant concepts read point-in-time levels only.
+
+    Args:
+        facts: Normalized facts from :func:`_all_tagged`.
+
+    Returns:
+        The instant facts plus one converted weighted-average fact per filing and tag.
+    """
+    best: dict[tuple[str, str | None], dict] = {}
+    for f in facts:
+        if f["tag"] in _FUND_DURATION_SHARES and f["start"] is not None:
+            key = (f["tag"], f["accn"])
+            if key not in best or (f["end"], f["start"]) > (best[key]["end"], best[key]["start"]):
+                best[key] = f
+    return [f for f in facts if f["start"] is None] + [dict(f, start=None) for f in best.values()]
+
+
+def _by_filing(facts: list[dict], tags: list[tuple[str, str]]) -> list[dict]:
+    """Keep, per filing, only the facts of the highest-priority tag that filing reports (pure).
+
+    One definition per filing, and the tag order decides which: a 10-K reporting both
+    ``StockholdersEquity`` and the incl.-noncontrolling tag contributes the former, while
+    a later filing that reports only the latter still contributes a balance sheet.
+
+    Args:
+        facts: Normalized facts carrying ``taxonomy:tag`` labels and accessions.
+        tags: Ordered ``(taxonomy, tag)`` fallbacks, highest priority first.
+
+    Returns:
+        The facts whose tag is the best one reported in their own accession.
+    """
+    rank = {f"{taxonomy}:{tag}": i for i, (taxonomy, tag) in enumerate(tags)}
+    best: dict[str | None, int] = {}
+    for f in facts:
+        best[f["accn"]] = min(best.get(f["accn"], len(tags)), rank[f["tag"]])
+    return [f for f in facts if rank[f["tag"]] == best[f["accn"]]]
+
+
+def _earliest(series: list[list[Fundamental]]) -> list[Fundamental]:
+    """Merge per-tag row series so the earliest filing wins each period (pure).
+
+    Rows are taken in filing order and kept only when their period advances past
+    everything already kept — the monotone rule of :func:`_instant_rows`. Tag priority
+    (the order of ``series``) only breaks a tie between rows filed the same day. Merging
+    by priority instead was measured to lose periods and to adopt a proxy statement's
+    figure: DEF 14A pay-versus-performance tables tag ``NetIncomeLoss``, and MA's FY2025
+    net income came from the proxy filed ~75 days after the 10-K that first disclosed it.
+
+    Args:
+        series: One row list per tag, highest-priority tag first.
+
+    Returns:
+        One row per successively-newer period.
+    """
+    ranked = sorted(((i, r) for i, rows in enumerate(series) for r in rows),
+                    key=lambda item: (item[1].filed, item[0], item[1].period_end))
+    out: list[Fundamental] = []
+    max_end: date | None = None
+    for _, r in ranked:
+        if max_end is None or r.period_end > max_end:
+            max_end = r.period_end
+            out.append(r)
+    return out
 
 
 def _norm_fact(f: dict, taxonomy: str, tag: str, unit: str) -> dict:
@@ -871,25 +990,29 @@ def _ttm_value(a: date, qi: int, cum: dict[tuple[date, int], float],
 
 
 def _synth_gross_profit(rev: list[dict], cogs: list[dict]) -> list[dict]:
-    """Synthesize gross-profit facts as ``revenue - cogs`` per matched period (pure).
+    """Synthesize gross-profit facts as ``revenue - cogs`` per filing and period (pure).
 
-    Used only when no ``GrossProfit`` tag is present. Matches revenue and
-    cost-of-revenue facts on identical ``(start, end)`` so the difference is a
-    like-for-like period figure, then feeds them through the same TTM roll-up.
+    :func:`_parse_companyfacts` merges these with any tagged ``GrossProfit``, so they fill
+    the periods the tag does not cover. Revenue and cost of revenue are matched on an
+    identical ``(accession, start, end)``: a like-for-like figure from ONE filing, then fed
+    through the same TTM roll-up. Matching on the period alone paired an older filing's
+    revenue with the COGS a later 10-K re-presented for that period (discontinued
+    operations, a reclassification) and stamped the result with the older filing date —
+    a look-ahead that, measured on PH, changed 35 of 69 synthesized TTM values by up to 33%.
 
     Args:
         rev: Normalized revenue facts.
         cogs: Normalized cost-of-revenue facts.
 
     Returns:
-        Synthetic gross-profit facts (a subset of the shared period structure).
+        Synthetic gross-profit facts, each stamped with its revenue fact's filing.
     """
     if not rev or not cogs:
         return []
-    cogs_by = {(c["start"], c["end"]): c for c in cogs if c["start"] is not None}
+    cogs_by = {(c["accn"], c["start"], c["end"]): c for c in cogs if c["start"] is not None}
     out: list[dict] = []
     for r in rev:
-        c = cogs_by.get((r["start"], r["end"]))
+        c = cogs_by.get((r["accn"], r["start"], r["end"]))
         if r["start"] is None or c is None:
             continue
         gp = dict(r)

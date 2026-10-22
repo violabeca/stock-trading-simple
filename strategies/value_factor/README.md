@@ -89,3 +89,10 @@ only selection), and an out-of-sample replay on the untouched 2025+ tail.
   lag until the next filing while the adjusted close is already post-split,
   transiently distorting one name's rank. Monthly rebalance + ranking bound the
   impact.
+- **Fundamentals are screened at read time** (`src/trading_simple/features.py`). A share
+  count outside 1e6–2e11, or one furnished on a 6-K, is dropped as a filer error; a day's
+  filings never move a level backwards; and a level no filing has refreshed in 800 days is
+  masked — so V, for which SEC has no usable share tag since 2010, drops out of the
+  market-cap factors instead of being priced on its 2010 count. ADR market caps are still
+  off by the ADS ratio (TSM ×5, TM ×10): SEC reports ordinary shares, the stored price is
+  per ADS.

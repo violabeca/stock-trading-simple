@@ -115,6 +115,11 @@ def fetch_short_interest(symbols: list[str], since: date,
     return rows
 
 
+#: A bulk file matching none of this many requested symbols is a format change, not a quiet
+#: settlement: every listed stock with a FINRA short position appears in every file.
+_MIN_MATCHED = 50
+
+
 def settlement_dates(since: date, until: date | None = None) -> list[date]:
     """List FINRA short-interest settlement dates in ``[since, until]`` (inclusive).
 
@@ -158,6 +163,12 @@ def _parse_bulk_file(text: str) -> list[dict]:
     turns 15,398 rows into 3,881, which is the same quiet-failure mode this repo has
     already shipped once.
 
+    From the 2026-09-15 settlement on, FINRA QUOTES every field (``"AAPL"|"Apple Inc."|…``).
+    Read under ``QUOTE_NONE`` the quotes stay in every key and value, ``symbolCode`` is never
+    found, and every file parses into rows that match no symbol — zero rows, no error (short
+    interest sat on the 2026-08-31 settlement until 2026-10-20). So the convention is read
+    from the header: a quoted file is standard CSV, an unquoted one keeps ``QUOTE_NONE``.
+
     Args:
         text: The downloaded file body.
 
@@ -167,7 +178,9 @@ def _parse_bulk_file(text: str) -> list[dict]:
     import csv
     import io
 
-    return list(csv.DictReader(io.StringIO(text), delimiter="|", quoting=csv.QUOTE_NONE))
+    quoted = text.lstrip("\ufeff").startswith('"')
+    return list(csv.DictReader(io.StringIO(text), delimiter="|",
+                               quoting=csv.QUOTE_MINIMAL if quoted else csv.QUOTE_NONE))
 
 
 def iter_short_interest_bulk(symbols: list[str], since: date, *, until: date | None = None):
@@ -186,6 +199,11 @@ def iter_short_interest_bulk(symbols: list[str], since: date, *, until: date | N
 
     Yields:
         ``(settlement_date, rows)`` per settlement (a missing file is warned and skipped).
+
+    Raises:
+        ValueError: A file without a ``symbolCode`` column, or one that matches none of
+            :data:`_MIN_MATCHED` or more requested symbols (a format change, not a quiet
+            settlement).
     """
     import requests
 
@@ -195,8 +213,14 @@ def iter_short_interest_bulk(symbols: list[str], since: date, *, until: date | N
         if resp.status_code != 200:
             log.warning("FINRA: no bulk file for %s (HTTP %s)", settle, resp.status_code)
             continue
-        recs = [r for r in _parse_bulk_file(resp.text)
-                if (r.get("symbolCode") or "").upper() in symset]
+        recs = _parse_bulk_file(resp.text)
+        # A changed format reads as "no short interest", never as an error: fail loudly, so the
+        # caller leaves the settlement unrecorded and the next run fetches it again.
+        if recs and "symbolCode" not in recs[0]:
+            raise ValueError(f"FINRA {settle}: unreadable bulk file (columns {list(recs[0])[:3]})")
+        recs = [r for r in recs if (r.get("symbolCode") or "").upper() in symset]
+        if not recs and len(symset) >= _MIN_MATCHED:
+            raise ValueError(f"FINRA {settle}: none of {len(symset)} symbols in the bulk file")
         yield settle, _records_to_rows(recs)
 
 

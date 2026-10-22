@@ -46,7 +46,9 @@ def signals(panel: Panel, *, example_window: int = 20, cash_frac: float = 0.25) 
                 price (scalar or frame; NaN = no stop).
             ``sl_trail`` — True to make ``sl_stop`` trail the price.
             ``cash_frac`` — see above; an opposite-direction entry closes the
-                open position (percent sizing cannot reverse in one order).
+                open position (percent sizing cannot reverse in one order). A dense
+                per-bar frame instead of the scalar sizes each entry on its own
+                (``min(slot, risk_per_trade / stop)``); NaN cells are refused.
     """
     raw = panel.close > bt.sma(panel.close, example_window)  # your idea goes here
     entries = bt.next_bar(raw & ~raw.shift(1, fill_value=False))  # e.g. on crossover only

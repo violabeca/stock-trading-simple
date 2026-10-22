@@ -1,5 +1,7 @@
 # volume_momentum — intraday volume spikes, momentum picks the side
 
+**Superseded by [`burst_scan`](../burst_scan/README.md)** — the same idea (a volume burst, then decide the side) on a point-in-time universe, with learned direction per side. Kept as the record of this version.
+
 **Thesis.** A minute with far more volume than usual marks the arrival of new
 information or a large participant, and the burst tends to continue the
 prevailing move for a short window. "More than usual" is judged against the

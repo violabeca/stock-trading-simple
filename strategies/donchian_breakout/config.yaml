@@ -15,7 +15,9 @@ data:
 # Study settings. The search SPACE is not here — each parameter declares its own
 # `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: donchian-1m-v7    # v7: 2026-07-19 engine realism (panel-priced costs +
+  study: donchian-1m-v8    # v8: 2026-09-27 wallet shorts lock cash — short proceeds
+                           # no longer fund longs; a short's stop covers it whole. v7 not comparable.
+                           # v7: 2026-07-19 engine realism (panel-priced costs +
                            # pessimistic stop fills, exit-wins signal conflicts) — v6 journals not comparable.
                            # v6: capital model changed to one shared $10k wallet — v5
                            # scored independent per-symbol books; journal stays on disk

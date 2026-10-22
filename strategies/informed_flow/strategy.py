@@ -125,7 +125,9 @@ drifts *down* the ranking and leaves through ``q_out`` on an ordering.
 A signal that is missing, or that covers too few names to rank meaningfully (see
 :data:`_MIN_COVERAGE`), is dropped from the composite and its weight renormalized
 away — so the strategy degrades gracefully and gains a new sleeve without an
-engine change.
+engine change. The floor also holds bar by bar: a sleeve that goes thin (a table that
+stopped being refreshed) falls silent on those bars instead of tilting the book toward
+the few names still covered.
 
 :func:`explain` exposes every intermediate frame for one symbol, so you can see
 *why* a name sits inside or outside the bucket on any given bar. It shares its
@@ -151,7 +153,8 @@ _WEIGHT_KEY = {"insider": "w_insider", "ratings": "w_rating",
                "recency": "w_recency", "trend": "w_trend", "rsi": "w_rsi"}
 
 #: A sleeve must carry data for at least this fraction of the universe on its
-#: best-covered bar to count as live. Without this floor, a barely-ingested table
+#: best-covered bar to count as live, and ranks only on the bars where it still does
+#: (:func:`_sleeve_rank`). Without this floor, a barely-ingested table
 #: still passes a bare "any data?" test: every uncovered name lands on the neutral
 #: ``.fillna(0.5)`` rank while the covered handful gets real percentiles, so the
 #: sleeve silently becomes a large, arbitrary tilt on those few names and pure
@@ -195,6 +198,8 @@ def signals(
     target_vol: float = 0.20,
     vol_window: int = 21,
     exposure_step: float = 0.10,
+    neutral_groups: int = 0,
+    dtc_window: int = 1,
 ) -> dict:
     """Build long-only target weights from the ranked informed-flow composite.
 
@@ -234,9 +239,11 @@ def signals(
         max_hold: Time-stop backstop — see :func:`_select` for the one case it binds.
         min_events: Minimum insider+rating events in the trailing window for a
             name to be eligible (drops never-covered names from the ranking). A
-            universe floor only — pinned at ``1`` and unsearched, because a searched
+            universe floor only — pinned and unsearched, because a searched
             threshold on a rolling count becomes an exit rule that fires when an old
-            event ages out of the window. See the module docstring.
+            event ages out of the window. See the module docstring. ``0`` = eligible
+            wherever a RANKED sleeve has a live value (for the short-interest book: a
+            days-to-cover reading at most 45 days old), so weight-0 feeds cannot empty it.
         max_positions: Number of slots in the book. Each holds a fixed
             ``1 / max_positions`` of the capital, so the book is fully invested when all
             slots are filled and holds cash when fewer names qualify.
@@ -265,6 +272,14 @@ def signals(
         vol_window: ``vol_target`` only — trailing bars of realized volatility.
         exposure_step: ``vol_target`` only — the exposure moves only once its target has
             drifted this far, so the whole book is not re-trimmed on every small change.
+        neutral_groups: Rank every sleeve INSIDE this many dollar-volume groups instead of
+            across the whole universe (``0`` or ``1`` = off, the ranking as it always was).
+            Days-to-cover has volume in its denominator, so the plain ranking leans toward
+            heavily traded names — a bet on liquidity the thesis never asked for, and one
+            that flattered 2025-26. See :func:`_liquidity_groups`.
+        dtc_window: Trailing bars the short-interest sleeve AVERAGES days-to-cover over before
+            ranking (``1`` = the latest settlement alone, the ranking as it always was). See
+            :func:`_compose`.
 
     Returns:
         ``{"weights", "retrim_k", "exposure"}`` — a target-weight frame (already scaled by
@@ -278,7 +293,8 @@ def signals(
                      ptrev_halflife=ptrev_halflife, w_insider=w_insider, w_rating=w_rating,
                      w_ptrev=w_ptrev, w_dtc=w_dtc, w_recency=w_recency, min_events=min_events,
                      trend_fast=trend_fast, trend_slow=trend_slow, rsi_period=rsi_period,
-                     w_trend=w_trend, w_rsi=w_rsi)
+                     w_trend=w_trend, w_rsi=w_rsi, neutral_groups=neutral_groups,
+                     dtc_window=dtc_window)
     if not parts["present"]:
         flat = pd.DataFrame(0.0, index=panel.close.index, columns=panel.close.columns)
         return {"weights": flat, "retrim_k": retrim_k,
@@ -425,6 +441,53 @@ def _rsi(close: pd.DataFrame, period: int) -> pd.DataFrame:
     return 100.0 - 100.0 / (1.0 + rs)
 
 
+def _liquidity_groups(panel: Panel, n: int) -> pd.DataFrame | None:
+    """Each name's dollar-volume group on each bar, or ``None`` when neutrality is off.
+
+    The trailing 63-bar median of ``close x volume`` — a median, so one blow-off session does
+    not move a name between groups — ranked across the panel and cut into ``n`` equal groups.
+    Known at the bar, like every other input of the composite, so it adds no look-ahead.
+
+    Args:
+        panel: Price panel (close and volume).
+        n: Number of groups; below 2 switches neutrality off.
+
+    Returns:
+        A ``(bars x symbols)`` frame of group labels ``1`` (least traded) .. ``n`` (most
+        traded), NaN where a name has no dollar volume yet; ``None`` when ``n < 2``.
+    """
+    if n < 2:
+        return None
+    dollars = (panel.close * panel.volume).rolling(63, min_periods=21).median()
+    return np.ceil(dollars.rank(axis=1, pct=True) * n).clip(1, n)
+
+
+def _rank(frame: pd.DataFrame, groups: pd.DataFrame | None) -> pd.DataFrame:
+    """Cross-sectional percentile rank per bar — inside each liquidity group when given.
+
+    Ranking inside groups makes a sleeve blind to liquidity by construction: the best name of
+    the least traded group scores like the best name of the most traded one, so the composite
+    can no longer express "own what trades most" — only "own the better name among alike
+    names". A name with no group yet (no dollar volume) gets no rank and lands on the neutral
+    0.5 fill like any other missing cell.
+
+    Args:
+        frame: Raw sleeve values, NaN where a name is not ranked.
+        groups: Group labels from :func:`_liquidity_groups`, or ``None`` for one cross-section.
+
+    Returns:
+        Percentile ranks in ``(0, 1]``, NaN where ``frame`` (or the group label) is NaN.
+    """
+    if groups is None:
+        return frame.rank(axis=1, pct=True)
+    out = pd.DataFrame(np.nan, index=frame.index, columns=frame.columns)
+    labels = groups.to_numpy()
+    for g in np.unique(labels[~np.isnan(labels)]):
+        inside = groups == g
+        out = out.where(~inside, frame.where(inside).rank(axis=1, pct=True))
+    return out
+
+
 def _compose(
     panel: Panel,
     *,
@@ -442,6 +505,8 @@ def _compose(
     rsi_period: int = 14,
     w_trend: float = 0.0,
     w_rsi: float = 0.0,
+    neutral_groups: int = 0,
+    dtc_window: int = 1,
     **_,
 ) -> dict:
     """Build every intermediate the composite rests on (shared by signals + explain).
@@ -458,18 +523,28 @@ def _compose(
         w_rating: Weight on the rating-change signal.
         w_ptrev: Weight on the price-target revision signal.
         w_dtc: Weight on the (negated) days-to-cover signal.
-        min_events: Eligibility floor on trailing insider+rating events.
+        min_events: Eligibility floor on trailing insider+rating events; ``0`` = eligible
+            wherever a present sleeve has a live value.
         w_recency: Weight on the coverage-recency sleeve (``0`` ablates it).
         trend_fast: Fast-MA lookback (bars) for the price-derived MA-trend sleeve.
         trend_slow: Slow-MA lookback (bars) for the MA-trend sleeve (> trend_fast).
         rsi_period: Lookback (bars) for the price-derived Wilder-RSI sleeve.
         w_trend: Weight on the MA-trend sleeve (``0`` ablates it — the default).
         w_rsi: Weight on the RSI sleeve (``0`` ablates it — the default).
+        neutral_groups: Dollar-volume groups each sleeve is ranked inside (``0`` = one
+            cross-section, the default). See :func:`_rank`.
+        dtc_window: Trailing bars days-to-cover is averaged over (``1`` = latest settlement).
+            Days-to-cover is FINRA short interest over FINRA average daily volume, and the
+            volume in the denominator is noisy, so one settlement's rank jitters: averaging
+            the carried level over ~2 months (~4 settlements) measures the same short
+            position with less noise. On train (2020-07 → 2024-12) 1 / 21 / 42 / 63 bars read
+            beta-adjusted IC +0.046 / +0.050 / +0.055 / +0.058 while the top decile's daily
+            churn fell 0.125 / 0.095 / 0.068 / 0.058.
         **_: Ignored, so callers can splat a full parameter dict.
 
     Returns:
         ``{"raw", "ranks", "filled", "contrib", "composite", "score_pct",
-        "eligible", "n_events", "n_ranked", "present"}``. ``raw``/``ranks``/
+        "eligible", "n_events", "n_ranked", "present", "groups"}``. ``raw``/``ranks``/
         ``filled``/``contrib`` are ``{signal: frame}`` over the *present* signals
         only; ``filled[k]`` marks cells where an **eligible** name had no data for
         sleeve ``k`` and so received the neutral 0.5 rank;
@@ -491,7 +566,11 @@ def _compose(
         raw["price_target"] = feats["price_target"].ewm(
             halflife=ptrev_halflife, min_periods=1).mean()
     if "short_interest" in feats:
-        raw["short_interest"] = -feats["short_interest"]  # low days-to-cover is favourable
+        # low days-to-cover is favourable; averaged over dtc_window bars of the carried level,
+        # and only where the level itself is live, so the average cannot carry a masked value
+        dtc = feats["short_interest"]
+        smoothed = dtc.rolling(int(dtc_window), min_periods=1).mean()
+        raw["short_interest"] = -smoothed.where(dtc.notna())
 
     # Derived from the same event stream `_eligibility` counts, but continuous and with no
     # window of its own: it is what the `min_events` cliff used to express by accident.
@@ -513,9 +592,17 @@ def _compose(
                "recency": w_recency, "trend": w_trend, "rsi": w_rsi}
     present = [k for k in raw if weights[k] > 0 and _coverage(raw[k]) >= _MIN_COVERAGE]
     n_events = _eligibility(feats, insider_window)
-    eligible = n_events >= min_events
+    if min_events > 0:
+        eligible = n_events >= min_events
+    else:   # the ranked sleeves' OWN data decide: a name is in the cross-section while one of
+        # them carries a live value for it — never because a weight-0 feed happened to report
+        eligible = pd.DataFrame(False, index=panel.close.index, columns=panel.close.columns)
+        for k in present:
+            eligible |= raw[k].reindex_like(eligible).notna()
+    groups = _liquidity_groups(panel, neutral_groups)
     base = {"raw": raw, "ranks": {}, "filled": {}, "contrib": {}, "n_events": n_events,
-            "eligible": eligible, "n_ranked": eligible.sum(axis=1), "present": present}
+            "eligible": eligible, "n_ranked": eligible.sum(axis=1), "present": present,
+            "groups": groups}
     if not present:
         return base
 
@@ -523,7 +610,7 @@ def _compose(
     for k in present:
         # .where(eligible): a name with too little alt-data is dropped from the
         # cross-section outright, so it neither receives a rank nor displaces anyone.
-        ranks = raw[k].where(eligible).rank(axis=1, pct=True)
+        ranks = _sleeve_rank(raw[k], eligible, groups)
         base["ranks"][k] = ranks
         base["filled"][k] = ranks.isna() & eligible   # ranked, but no data -> neutral 0.5
         base["contrib"][k] = (weights[k] * ranks.fillna(0.5) / wsum).where(eligible)
@@ -534,7 +621,7 @@ def _compose(
 
 
 def _score_from_raw(raw: dict, weights: dict, present: list, wsum: float,
-                    eligible: pd.DataFrame) -> pd.DataFrame:
+                    eligible: pd.DataFrame, groups: pd.DataFrame | None = None) -> pd.DataFrame:
     """Rank each raw signal across the eligible cross-section, blend, and re-rank.
 
     The composite pipeline in one expression, so :func:`_own_vs_peer` can re-run it
@@ -548,11 +635,12 @@ def _score_from_raw(raw: dict, weights: dict, present: list, wsum: float,
         present: Signals to include.
         wsum: Sum of the present weights (the renormalizer).
         eligible: Boolean mask of names that are in the ranked universe.
+        groups: The liquidity groups :func:`_compose` ranked inside (``None`` = none).
 
     Returns:
         The ``(bars x symbols)`` composite rank in [0, 1]; NaN where ineligible.
     """
-    composite = sum(weights[k] * raw[k].where(eligible).rank(axis=1, pct=True).fillna(0.5)
+    composite = sum(weights[k] * _sleeve_rank(raw[k], eligible, groups).fillna(0.5)
                     / wsum for k in present)
     return composite.where(eligible).rank(axis=1, pct=True)
 
@@ -709,8 +797,39 @@ def _select(parts: dict, *, q_in: float, q_out: float, max_hold: int,
             "qualified": score >= q_in, "exits": exits}
 
 
+def _sleeve_rank(raw: pd.DataFrame, eligible: pd.DataFrame,
+                 groups: pd.DataFrame | None) -> pd.DataFrame:
+    """One sleeve's ranks over the eligible names — and none at all on a bar it is too thin.
+
+    :func:`_coverage` decides whether a sleeve exists, on its best bar; but a sleeve can be
+    broad on its best bar and thin on others. A table that stopped being refreshed for most
+    names (short interest from the 2026-07-15 settlement, masked once older than
+    ``features._SI_MAX_AGE_DAYS``) still clears the floor on every earlier bar. Ranked on a
+    thin bar, the few names that still have data would take real percentiles while the rest
+    sat on the neutral 0.5 — the tilt :data:`_MIN_COVERAGE` exists to prevent. So a bar below
+    the floor gets no ranks: every name takes the same 0.5, a constant that cannot move the
+    composite's ordering, and the sleeve says nothing on exactly those bars. When every sleeve
+    is thin, every name ties in the middle of the ranking: nothing qualifies, and at any
+    ``q_out`` above the middle (0.80 ships) the book exits — a stale table turns into cash,
+    never a tilt.
+
+    Args:
+        raw: The sleeve's raw (pre-rank) values.
+        eligible: Boolean mask of the ranked universe.
+        groups: Liquidity groups for :func:`_rank` (``None`` = one cross-section).
+
+    Returns:
+        Percentile ranks; NaN where ineligible, missing, or on a bar below the floor.
+    """
+    ranks = _rank(raw.where(eligible), groups)
+    ranks.loc[raw.notna().mean(axis=1) < _MIN_COVERAGE] = np.nan
+    return ranks
+
+
 def _coverage(frame: pd.DataFrame) -> float:
     """Fraction of the universe this signal covers on its best-covered bar.
+
+    Whether a sleeve exists at all; :func:`_sleeve_rank` applies the same floor bar by bar.
 
     Args:
         frame: A raw (pre-rank) signal frame.
@@ -839,7 +958,8 @@ def valid(params: dict) -> bool:
                and 0.0 <= params.get("risk_off_exposure", 0.0) <= 1.0
                and params.get("target_vol", 0.2) > 0.0)
     return (q_out < q_in and weights > 0 and trend_ok and risk_ok
-            and params.get("max_positions", 10) >= 1)
+            and params.get("max_positions", 10) >= 1 and params.get("neutral_groups", 0) >= 0
+            and params.get("dtc_window", 1) >= 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1186,6 @@ def _own_vs_peer(parts: dict, symbol: str) -> tuple:
     raw, present = parts["raw"], parts["present"]
     frozen = {k: raw[k].assign(**{symbol: raw[k][symbol].shift(1)}) for k in present}
     score_cf = _score_from_raw(frozen, parts["weights"], present, parts["wsum"],
-                               parts["eligible"])[symbol]
+                               parts["eligible"], parts.get("groups"))[symbol]
     score = parts["score_pct"][symbol]
     return score - score_cf, score_cf - score.shift(1)

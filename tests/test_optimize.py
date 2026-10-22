@@ -41,6 +41,17 @@ def test_make_sampler_selection_and_unknown():
         opt.make_sampler({"sampler": "genetic"})
 
 
+def test_grid_sampler_visits_every_point_exactly_once():
+    space = {"w": {"type": "categorical", "choices": [1, 21, 42]},
+             "q": {"type": "float", "low": 0.7, "high": 0.8, "step": 0.05}}
+    assert opt.grid_space(space) == {"w": [1, 21, 42], "q": [0.7, 0.75, 0.8]}
+    study = optuna.create_study(sampler=opt.make_sampler({"sampler": "grid", "space": space}))
+    study.optimize(lambda t: sum(opt.suggest_params(t, space).values()), n_trials=9)
+    assert len({tuple(t.params.values()) for t in study.trials}) == 9     # all 3 x 3, no repeat
+    with pytest.raises(ValueError, match="no step"):
+        opt.grid_space({"x": {"type": "float", "low": 0.0, "high": 1.0}})
+
+
 def test_storage_path_lives_in_strategy_folder():
     strat = strategies.load("volume_momentum")
     opt.storage_for(strat, "unit-test-storage")
@@ -385,3 +396,130 @@ def test_pareto_and_trials_frames():
     assert front["trial"].tolist() == [0, 1]                           # earliest trial kept
     everything = opt.trials_frame(study)
     assert len(everything) == 4 and {"trial", "w", first, second} <= set(everything)
+
+
+def test_objectives_come_from_config_with_directions_built_in():
+    """One or two scoreable metrics; the direction belongs to the metric, never the YAML."""
+    from dataclasses import replace
+
+    strat = strategies.load("volume_momentum")
+
+    def names(value):
+        return opt.objectives_for(replace(strat, optuna={**strat.optuna, "objectives": value}))
+
+    assert opt.objectives_for(strat) == opt.OBJECTIVES             # no key -> the default pair
+    assert names(["excess_cagr"]) == names("excess_cagr") == ("excess_cagr",)
+    assert names(["info_ratio", "max_drawdown"]) == ("info_ratio", "max_drawdown")
+    assert names(["alpha_cagr", "volatility"]) == ("alpha_cagr", "volatility")
+    assert tuple(opt.SCOREABLE[n] for n in opt.OBJECTIVES) == opt.DIRECTIONS
+    for bad in (["sharpe"], ["excess_cagr"] * 2, ["excess_cagr", "volatility", "info_ratio"]):
+        with pytest.raises(ValueError, match="optuna.objectives"):
+            names(bad)
+
+
+def test_objective_returns_only_the_configured_metrics_and_records_the_rest():
+    """A one-objective trial still carries volatility & co., so its risk stays visible."""
+    from dataclasses import replace
+
+    from tests.conftest import make_panel
+    from trading_simple import backtest as bt
+    from trading_simple.config import Settings
+
+    def one_trade(p, **_):
+        entries = pd.DataFrame(False, index=p.close.index, columns=p.close.columns)
+        entries.iloc[5, 0] = True
+        return {"entries": entries, "exits": bt.exit_after(entries, 10)}
+
+    strat = replace(strategies.load("volume_momentum"), signals=one_trade,
+                    valid=lambda p: True, params={},
+                    optuna={"space": {}, "objectives": ["excess_cagr"]})
+    study = optuna.create_study(directions=["maximize"])
+    study.optimize(lambda t: opt.objective(t, strat, make_panel(), Settings()), n_trials=1)
+    trial = study.trials[0]
+    assert trial.state is optuna.trial.TrialState.COMPLETE and len(trial.values) == 1
+    assert {"volatility", "info_ratio", "sharpe", "trades_per_year"} <= set(trial.user_attrs)
+    assert "excess_cagr" not in trial.user_attrs                  # scored, not duplicated
+
+
+def test_a_single_objective_study_picks_and_plots_its_best_trial():
+    """[excess_cagr] alone: the front is the best trial, the pick and the plot follow.
+
+    Switching a config's objectives without bumping the study is refused, like any
+    journal scored on something else.
+    """
+    from dataclasses import replace
+
+    from trading_simple import plots
+
+    base = strategies.load("volume_momentum")
+    strat = replace(base, optuna={**base.optuna, "objectives": ["excess_cagr"]})
+    name = "unit-test-single-objective"
+    try:
+        study = opt.run_study(strat, None, settings=None, study_name=name, n_trials=0)
+        assert study.metric_names == ["excess_cagr"] and len(study.directions) == 1
+        with pytest.raises(ValueError, match="Bump `optuna.study`"):
+            opt.load_study(base, name)                   # same journal, read as the pair
+        dist = {"w": optuna.distributions.IntDistribution(0, 9)}
+        for w, (excess, vol, tpy) in enumerate([(0.10, 0.30, 30), (0.25, 0.40, 5),
+                                                (0.25, 0.35, 40), (-0.10, 0.10, 50)]):
+            study.add_trial(optuna.trial.create_trial(
+                params={"w": w}, distributions=dist, values=[excess],
+                user_attrs={"volatility": vol, "trades_per_year": tpy}))
+        front = opt.pareto_frame(opt.load_study(strat, name))
+        assert front["trial"].tolist() == [1, 2]            # the two tied for best excess
+        assert front.attrs["objectives"] == ("excess_cagr",)
+        pick = opt.pick_from_front(front[front["trades_per_year"] >= 20])  # attrs survive
+        assert pick["trial"] == 2 and pick["n_tied"] == 1
+        tie = opt.pick_best(study)
+        assert tie.number == 1                              # the tie goes to the earliest
+        fig = plots.plot_pareto(front, opt.trials_frame(study), picked=2)
+        assert fig.layout.xaxis.title.text == "volatility"  # its risk, across
+    finally:
+        opt.study_path(strat, name).unlink(missing_ok=True)
+
+
+def test_pick_from_front_hurdle_follows_the_first_objective():
+    """An alpha study is picked on alpha > 0; excess_cagr rides along but is not its gate."""
+    front = pd.DataFrame({"trial": [0, 1, 2], "alpha_cagr": [0.03, -0.01, 0.06],
+                          "volatility": [0.05, 0.02, 0.12], "excess_cagr": [-0.4, -0.5, -0.3]})
+    front.attrs["objectives"] = ("alpha_cagr", "volatility")
+    calm = opt.pick_from_front(front, weights=(0.0, 1.0))
+    assert calm["trial"] == 0 and calm["beats_benchmark"]        # never the −1%/yr alpha row
+    assert opt.pick_from_front(front, weights=(1.0, 0.0))["trial"] == 2
+    read_as_excess = opt.pick_from_front(front, objectives=("excess_cagr", "volatility"))
+    assert not read_as_excess["beats_benchmark"]                  # every row loses on excess
+
+
+def test_run_study_scores_the_window_warm():
+    """score_from: signals on the whole panel, trades and metrics only from the window on."""
+    from dataclasses import replace
+
+    from tests.conftest import make_panel
+    from trading_simple import backtest as bt
+    from trading_simple.config import Settings
+
+    panel = make_panel()
+
+    def two_trades(p, **_):
+        entries = pd.DataFrame(False, index=p.close.index, columns=p.close.columns)
+        entries.iloc[[5, 45], 0] = True
+        return {"entries": entries, "exits": bt.exit_after(entries, 10), "cash_frac": 0.5}
+
+    base = strategies.load("volume_momentum")
+    strat = replace(base, signals=two_trades, valid=lambda p: True, params={},
+                    optuna={**base.optuna, "space": {}, "min_trades_per_year": 0})
+    name, start = "unit-test-score-from", panel.close.index[30]
+    try:
+        study = opt.run_study(strat, panel, settings=Settings(), study_name=name, n_trials=1,
+                              score_from=start)
+        trial = study.trials[0]
+        assert trial.state is optuna.trial.TrialState.COMPLETE
+        assert trial.user_attrs["n_trades"] == 1                  # the bar-5 trade is outside
+        assert study.user_attrs["score_from"] == str(start.date())
+        with pytest.raises(ValueError, match="two windows"):     # another window, same journal
+            opt.run_study(strat, panel, settings=Settings(), study_name=name, n_trials=0)
+        cfg = replace(strat, optuna={**strat.optuna, "score_from": str(start.date())})
+        resumed = opt.run_study(cfg, panel, settings=Settings(), study_name=name, n_trials=0)
+        assert len(resumed.trials) == 1                           # config default = same window
+    finally:
+        opt.study_path(strat, name).unlink(missing_ok=True)

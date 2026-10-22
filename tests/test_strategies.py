@@ -113,6 +113,33 @@ def test_backtest_block_selects_the_fill_and_rejects_typos(probe_dir):
             strategies.load("probe")
 
 
+def test_order_notional_prices_the_minimum_commission_at_the_real_order_size(probe_dir):
+    """`backtest.order_notional` is the strategy's real order in dollars; absent = $10,000.
+
+    make_panel's median close is $100, so the $1 minimum binds at both sizes: 1 bp/leg on a
+    $10,000 order, 10 bp/leg on the $1,000 orders of a 30-slot book on a $30k account. At the
+    default size every fee fraction is unchanged, which is what keeps every other strategy's
+    numbers where they were.
+    """
+    from tests.conftest import make_panel
+    from trading_simple.config import Settings
+
+    cfg = _write(probe_dir, "  window: 20\n") / "config.yaml"
+    base, panel, settings = cfg.read_text(), make_panel(), Settings()
+    plain = strategies.load("probe")
+    assert plain.order_notional is None
+    assert bt.strategy_costs(plain, panel, settings) == bt.panel_costs(settings.costs, panel)
+    cfg.write_text(base + "backtest:\n  order_notional: 1000\n")
+    small = strategies.load("probe")
+    assert small.order_notional == 1000.0
+    fees, slip = bt.strategy_costs(small, panel, settings)
+    assert fees == pytest.approx(1.0 / 1_000 + 1.0 / 1e4)      # $1 on $1,000 + half the spread
+    assert slip == pytest.approx(1.0 / 1e4)
+    cfg.write_text(base + "backtest:\n  order_notional: 0\n")
+    with pytest.raises(ValueError, match="order_notional"):
+        strategies.load("probe")
+
+
 @pytest.mark.parametrize("name", strategies.available())
 def test_every_shipped_config_satisfies_its_own_invariants(name):
     """Every strategy in the repo — the check that keeps the fleet aligned, not just one.

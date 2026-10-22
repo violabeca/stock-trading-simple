@@ -51,9 +51,8 @@ AJG reported ×1,000,000 shares for two 2020 quarters (market cap ×1e6 → book
 earnings yield collapse to ~0 → bottom rank), BALL a literal 0 on 2022-02-14 (dropped), RMD
 and CMG ÷1,000 for one quarter each (market cap ÷1,000 → both value ratios ×1,000 → **top
 rank** for a quarter), CCL ×1,000. The `fundamentals` table holds 124 rows with a
-non-positive share count across 87 symbols. A plausibility filter in the feature layer is
-the fix (engine proposal in `../turnover_momentum/IDEAS.md`); until then read a sudden
-top-decile value rank as a possible unit error.
+non-positive share count across 87 symbols. Fixed 2026-09-14: share counts are screened at
+read time (`features._screen_shares`) — see the section below.
 
 ### Frozen fundamentals series — and gp's coverage sits on the floor (measured 2026-09-14)
 
@@ -85,3 +84,16 @@ ordinary shares while the stored price is per ADS: stored price × shares at 202
 TSM ~$5.0T (5× too high), TM ~$2.6T (10×), HSBC ~$0.87T (5×) and MFG ~$12B (5× too low).
 BTI, SAP, ASML and the Canadian 40-F banks are 1:1 and fine.
 
+**Fixed 2026-09-14** (what shipped is in `../turnover_momentum/IDEAS.md`). With the per-period
+fallback in the parser, masking stale values no longer ablates gp: its best-bar coverage stays at
+0.51 with the 800-day cap on, because AMZN, COST, BMY, PH and SCCO carry current gross profit
+again. Config defaults, train 2021–2024:
+
+| data | factors present | eligible/day | IC63 | excess_cagr | info_ratio |
+|---|---|---|---|---|---|
+| before the fix | bp, ey, gp | 48 | +0.004 | +4.4% | 0.45 |
+| after the fix | bp, ey, gp | 51 | +0.016 (t 0.42) | +3.9% | 0.38 |
+
+The traded composite's IC rose but is still indistinguishable from zero, so the diagnosis above
+stands: selection adds little over owning the universe. V now drops out of the market-cap factors
+(no usable SEC share tag since 2010) instead of ranking on its 2010 count.

@@ -207,6 +207,39 @@ def test_a_quote_in_an_issuer_name_cannot_swallow_the_file():
     assert {row.symbol for row in finra._records_to_rows(recs)} == {"AAPL", "DOD", "MSFT"}
 
 
+def test_a_fully_quoted_bulk_file_parses_like_the_old_format():
+    """FINRA quotes every field since the 2026-09-15 settlement; under QUOTE_NONE the quotes
+    stayed in every key, ``symbolCode`` was never found and every file matched no symbol."""
+    quoted = "|".join(f'"{c}"' for c in _BULK_HEADER.split("|")) + "\n" + (
+        '"20260915"|"AAPL"|"Apple Inc."|"R"|"NNM"|"1000000"|"900000"||"250000"|"4.00"||||'
+        '"2026-09-15"\n'
+        '"20260915"|"DOD"|"ELEMENTS ""Dogs of the Dow"""|"E"|"ARCA"|"613"|"2318"||"4445"|"1.00"'
+        '||||"2026-09-15"\n')
+    recs = finra._parse_bulk_file(quoted)
+    assert [r["symbolCode"] for r in recs] == ["AAPL", "DOD"]
+    assert recs[1]["issueName"] == 'ELEMENTS "Dogs of the Dow"'
+    assert finra._records_to_rows(recs)[0].days_to_cover == 4.0
+
+
+def test_an_unreadable_or_unmatched_bulk_file_fails_loudly(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, text):
+            self.text = text
+
+    monkeypatch.setattr(finra, "settlement_dates", lambda since, until=None: [date(2026, 9, 15)])
+    row = "202609|AAPL|Apple Inc.|R|NNM|1000000|900000||250000||||100000|2026-09-15\n"
+    for body, symbols in (("bad|header\n1|2\n", ["AAPL"]),                 # format change
+                          (_BULK_HEADER + "\n" + row, [f"S{i}" for i in range(60)])):  # no match
+        monkeypatch.setattr("requests.get", lambda url, timeout, b=body: _Resp(b))
+        try:
+            list(finra.iter_short_interest_bulk(symbols, date(2026, 9, 1)))
+        except ValueError:
+            continue
+        raise AssertionError("a file that matches nothing must raise, not yield zero rows")
+
+
 def test_si_request_body_adds_upper_bound_only_when_until_set():
     open_body = finra._si_request_body(["aapl", "MSFT"], date(2024, 1, 1), None, 0)
     assert open_body["compareFilters"] == [
@@ -268,6 +301,15 @@ def _fact(end, val, filed, *, start=None, fy=None, fp=None, form=None, accn=None
     return f
 
 
+#: Calendar fiscal periods (Q3 year-to-date and full year, 2022-2023) for the fixtures below.
+_PERIODS = dict(
+    q322=dict(start="2022-01-01", filed="2022-11-01", accn="q322", fy=2022, fp="Q3", form="10-Q"),
+    fy22=dict(start="2022-01-01", filed="2023-02-15", accn="a22", fy=2022, fp="FY", form="10-K"),
+    q323=dict(start="2023-01-01", filed="2023-11-01", accn="q323", fy=2023, fp="Q3", form="10-Q"),
+    fy23=dict(start="2023-01-01", filed="2024-02-15", accn="a23", fy=2023, fp="FY", form="10-K"),
+)
+
+
 def _companyfacts():
     """A two-fiscal-year (calendar) companyfacts fixture exercising every branch.
 
@@ -277,10 +319,7 @@ def _companyfacts():
     second tag fallback.
     """
     usd = "USD"
-    q322 = dict(start="2022-01-01", filed="2022-11-01", accn="q322", fy=2022, fp="Q3", form="10-Q")
-    fy22 = dict(start="2022-01-01", filed="2023-02-15", accn="a22", fy=2022, fp="FY", form="10-K")
-    q323 = dict(start="2023-01-01", filed="2023-11-01", accn="q323", fy=2023, fp="Q3", form="10-Q")
-    fy23 = dict(start="2023-01-01", filed="2024-02-15", accn="a23", fy=2023, fp="FY", form="10-K")
+    q322, fy22, q323, fy23 = (_PERIODS[k] for k in ("q322", "fy22", "q323", "fy23"))
     return {"facts": {
         "us-gaap": {
             "StockholdersEquity": {"units": {usd: [
@@ -365,3 +404,146 @@ def test_companyfacts_prefers_tagged_gross_profit_when_present():
     ]}}}}}
     gp = [r for r in sec._parse_companyfacts(facts, "AAPL") if r.concept == "gp_ttm"]
     assert gp and gp[0].val == 1700.0 and gp[0].tag == "us-gaap:GrossProfit"
+
+
+def test_companyfacts_equity_follows_the_best_tag_each_filing_reports():
+    """A filer that drops ``StockholdersEquity`` must not freeze the equity series.
+
+    Resolving the fallback once for the whole history locked AVGO and QCOM onto a tag
+    they had stopped filing. Per filing, the best tag that filing reports wins.
+    """
+    se = "StockholdersEquity"
+    nci = "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"
+    facts = {"facts": {"us-gaap": {
+        se: {"units": {"USD": [_fact("2022-12-31", 5000, "2023-02-15", accn="a22")]}},
+        nci: {"units": {"USD": [
+            _fact("2021-12-31", 4000, "2022-02-15", accn="a21"),
+            _fact("2022-12-31", 5100, "2023-02-15", accn="a22"),
+            _fact("2023-12-31", 5600, "2024-02-15", accn="a23"),
+        ]}},
+    }}}
+    equity = [r for r in sec._parse_companyfacts(facts, "AVGO") if r.concept == "equity"]
+    assert [(r.period_end, r.val, r.tag) for r in equity] == [
+        (date(2021, 12, 31), 4000.0, f"us-gaap:{nci}"),
+        (date(2022, 12, 31), 5000.0, f"us-gaap:{se}"),     # the filing's preferred tag
+        (date(2023, 12, 31), 5600.0, f"us-gaap:{nci}"),    # the series keeps moving
+    ]
+
+
+def test_companyfacts_shares_fall_back_to_weighted_average_basic():
+    """A filing with no share count contributes its latest, shortest weighted average.
+
+    Multi-class issuers stopped filing a non-dimensional cover-page count, which froze
+    MA and CMCSA at 2010 and left META with no share count at all.
+    """
+    waso = "WeightedAverageNumberOfSharesOutstandingBasic"
+    facts = {"facts": {
+        "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+            _fact("2023-02-01", 100, "2023-02-15", accn="a22")]}}},
+        "us-gaap": {waso: {"units": {"shares": [
+            _fact("2022-12-31", 99, "2023-02-15", start="2022-01-01", accn="a22"),
+            _fact("2023-09-30", 104, "2023-11-01", start="2023-07-01", accn="q323"),  # quarter
+            _fact("2023-09-30", 103, "2023-11-01", start="2023-01-01", accn="q323"),  # 9 months
+            _fact("2022-09-30", 98, "2023-11-01", start="2022-07-01", accn="q323"),   # comparative
+            _fact("2023-12-31", 106, "2024-02-15", start="2023-01-01", accn="a23"),
+        ]}}},
+    }}
+    shares = [r for r in sec._parse_companyfacts(facts, "MA") if r.concept == "shares"]
+    assert [(r.period_end, r.val) for r in shares] == [
+        (date(2023, 2, 1), 100.0), (date(2023, 9, 30), 104.0), (date(2023, 12, 31), 106.0)]
+    assert [r.tag for r in shares] == ["dei:EntityCommonStockSharesOutstanding",
+                                      f"us-gaap:{waso}", f"us-gaap:{waso}"]
+    assert all(r.period_start is None for r in shares)
+
+
+def test_companyfacts_shares_prefer_a_point_in_time_count_over_the_average():
+    """A filing that reports a share count never contributes its weighted average instead."""
+    facts = {"facts": {"us-gaap": {
+        "CommonStockSharesOutstanding": {"units": {"shares": [
+            _fact("2023-12-31", 110, "2024-02-15", accn="a23")]}},
+        "WeightedAverageNumberOfSharesOutstandingBasic": {"units": {"shares": [
+            _fact("2023-12-31", 107, "2024-02-15", start="2023-10-01", accn="a23")]}},
+    }}}
+    shares = [r for r in sec._parse_companyfacts(facts, "AAPL") if r.concept == "shares"]
+    assert [(r.period_end, r.val, r.tag) for r in shares] == [
+        (date(2023, 12, 31), 110.0, "us-gaap:CommonStockSharesOutstanding")]
+
+
+def test_companyfacts_net_income_continues_on_profitloss():
+    """Net income keeps updating after a filer stops tagging ``NetIncomeLoss``."""
+    p = _PERIODS
+    facts = {"facts": {"us-gaap": {
+        "NetIncomeLoss": {"units": {"USD": [
+            _fact("2022-09-30", 700, **p["q322"]), _fact("2022-12-31", 1000, **p["fy22"])]}},
+        "ProfitLoss": {"units": {"USD": [
+            _fact("2022-09-30", 710, **p["q322"]), _fact("2022-12-31", 1010, **p["fy22"]),
+            _fact("2023-09-30", 910, **p["q323"]), _fact("2023-12-31", 1210, **p["fy23"])]}},
+    }}}
+    ni = [r for r in sec._parse_companyfacts(facts, "PH") if r.concept == "ni_ttm"]
+    assert [(r.period_end, r.val, r.tag) for r in ni] == [
+        (date(2022, 12, 31), 1000.0, "us-gaap:NetIncomeLoss"),  # same filing: priority decides
+        (date(2023, 9, 30), 1210.0, "us-gaap:ProfitLoss"),      # FY22 1010 + 910 - 710
+        (date(2023, 12, 31), 1210.0, "us-gaap:ProfitLoss"),
+    ]
+
+
+def test_companyfacts_gross_profit_is_synthesized_after_the_tag_stops():
+    """Revenue minus COGS takes over the periods a filer no longer tags ``GrossProfit``.
+
+    Synthesis used to run only when the tag had NEVER existed, so AMZN's gross profit sat
+    on its 2009 figure.
+    """
+    p = _PERIODS
+    facts = {"facts": {"us-gaap": {
+        "GrossProfit": {"units": {"USD": [_fact("2022-12-31", 1200, **p["fy22"])]}},
+        "Revenues": {"units": {"USD": [
+            _fact("2022-09-30", 2100, **p["q322"]), _fact("2022-12-31", 3000, **p["fy22"]),
+            _fact("2023-09-30", 2700, **p["q323"]), _fact("2023-12-31", 3600, **p["fy23"])]}},
+        "CostOfRevenue": {"units": {"USD": [
+            _fact("2022-09-30", 1300, **p["q322"]), _fact("2022-12-31", 1800, **p["fy22"]),
+            _fact("2023-09-30", 1500, **p["q323"]), _fact("2023-12-31", 2000, **p["fy23"])]}},
+    }}}
+    gp = [r for r in sec._parse_companyfacts(facts, "AMZN") if r.concept == "gp_ttm"]
+    assert [(r.period_end, r.val, r.tag) for r in gp] == [
+        (date(2022, 12, 31), 1200.0, "us-gaap:GrossProfit"),
+        (date(2023, 9, 30), 1600.0, "computed:GrossProfit"),    # 1200 + 1200 - 800
+        (date(2023, 12, 31), 1600.0, "computed:GrossProfit"),
+    ]
+
+
+def test_a_proxy_statement_never_displaces_the_10k_income():
+    """A period comes from the filing that disclosed it FIRST, whatever the tag order.
+
+    DEF 14A pay-versus-performance tables tag ``NetIncomeLoss``; merging by tag priority
+    took MA's FY2025 net income from the proxy filed ~75 days after the 10-K.
+    """
+    fy22 = _PERIODS["fy22"]
+    proxy = dict(fy22, filed="2023-04-27", accn="p23", form="DEF 14A")
+    facts = {"facts": {"us-gaap": {
+        "NetIncomeLoss": {"units": {"USD": [_fact("2022-12-31", 1000, **proxy)]}},
+        "ProfitLoss": {"units": {"USD": [_fact("2022-12-31", 1000, **fy22)]}},
+    }}}
+    ni = [r for r in sec._parse_companyfacts(facts, "MA") if r.concept == "ni_ttm"]
+    assert [(r.period_end, r.accn) for r in ni] == [(date(2022, 12, 31), "a22")]
+
+
+def test_synthesized_gross_profit_never_borrows_a_later_filings_cogs():
+    """Revenue and COGS must come from the SAME filing; matching on the period leaked.
+
+    The FY23 10-K re-presents FY22. Matching on the period alone paired the FY22 10-K's
+    revenue with that later COGS and stamped the result with the earlier filing date.
+    """
+    fy22, fy23 = _PERIODS["fy22"], _PERIODS["fy23"]
+    fy22_again = dict(fy23, start="2022-01-01")         # FY22 as re-presented in the FY23 10-K
+    facts = {"facts": {"us-gaap": {
+        "Revenues": {"units": {"USD": [
+            _fact("2022-12-31", 3000, **fy22), _fact("2022-12-31", 2600, **fy22_again),
+            _fact("2023-12-31", 3600, **fy23)]}},
+        "CostOfRevenue": {"units": {"USD": [
+            _fact("2022-12-31", 1800, **fy22), _fact("2022-12-31", 1700, **fy22_again),
+            _fact("2023-12-31", 2000, **fy23)]}},
+    }}}
+    rows = sec._parse_companyfacts(facts, "PH")
+    gp = {r.period_end: r.val for r in rows if r.concept == "gp_ttm"}
+    assert gp[date(2022, 12, 31)] == 1200.0            # 3000 - 1800, never 3000 - 1700
+    assert gp[date(2023, 12, 31)] == 1600.0

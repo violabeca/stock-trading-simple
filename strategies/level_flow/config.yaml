@@ -1,0 +1,227 @@
+# level_flow — multi-week price levels x today's activity, long/short, flat by the close.
+# Blocks: data, optuna, backtest, params. See README.md for the thesis and the honest read.
+
+data:
+  universe: Morning200     # 200 names ranked POINT-IN-TIME (dollar volume over 2025-01..06,
+                           # before the window) — NOT HighOctaneTop20, whose +460%/yr hurdle
+                           # was chosen with data from inside the window (see gap_and_go)
+  bar: 1m                  # the STORED bar; coarser execution bars are derived, never backfilled
+  resample: null           # null = trade the 1m bars; 5 / 15 = derive 5m / 15m candles at load
+                           # time (data.resample_panel). Each execution bar is its own study —
+                           # bump `study` (level_flow-5m-v1) when you change this
+  start: "2025-06-18"      # the first stored 1m session: the level tables warm up here
+  end: "2026-04-30"        # TRAIN cutoff — 2026-05-01 .. 2026-06-30 is the diagnostics holdout
+  session: regular
+  max_symbols: 200
+
+optuna:
+  study: level_flow-1m-v2  # v2: 2026-09-27 wallet shorts lock cash — short proceeds
+                           # no longer fund longs; a short's stop covers it whole. v1 not comparable.
+                           # bump on any `search:` bound, objective, fill, window or bar change
+  sampler: nsga2
+  seed: 42
+  n_trials: 1000
+  objectives: [alpha_cagr, volatility]   # alpha after beta: this book is flat most of the day and
+                           # near-zero beta, so `excess_cagr` against a fully invested +47%/yr
+                           # basket is unreachable by construction and would say "nothing beats
+                           # buy-and-hold" without measuring the selection. Alpha still charges
+                           # for whatever beta the book actually ran (optimize.OBJECTIVES).
+  score_from: "2025-07-17" # every trial is scored WARM from the first session after the pinned
+                           # 20-session warm-up: without this the flat warm-up sits against an
+                           # invested benchmark for every trial (~-3.7%/yr of excess, uniform)
+  min_trades_per_year: 60  # admissibility floor, PER YEAR (~50 trades on this window). The
+                           # watchlist caps the rate at 252 x max_candidates per side and the
+                           # break polarity is ~5x rarer than the bounce; a book built to sit
+                           # out is allowed to be selective, a lucky handful is not
+  pick_min_trades_per_year: 100  # the PICKING floor, both notebooks (the walk-forward re-picks
+                           # with the same rule that picked the candidate)
+
+backtest:
+  fill: open               # the diagnostics notebook re-runs the pick under `pessimistic`
+
+# EVERY PARAMETER IS DECLARED ONCE: doc / value (ships) / search (optuna) / grid (sweep).
+# Time knobs are in MINUTES so the same config runs on 1m, 5m or 15m execution bars; candle
+# knobs (tf_levels, signal_tf, trend_tf, scan_minute) must be whole multiples of the bar.
+params:
+  # --- levels ----------------------------------------------------------------------------
+  tf_levels:
+    doc: Candle length (minutes) whose swing highs/lows define the levels.
+    value: 15
+    search: { type: categorical, choices: [15, 30, 60] }
+  pivot_k:
+    doc: Candles on each side a swing must dominate; a pivot is confirmed pivot_k candles later.
+    value: 2
+    search: { type: int, low: 1, high: 4 }
+  level_days:
+    doc: >-
+      Sessions of history behind a session's level table (excluding today) — "the last few
+      weeks". Capped at 20 because the stored 1m history starts 2025-06-18 and the pinned
+      warm-up must cover it; longer windows need an earlier 1m backfill (IDEAS.md).
+    value: 15
+    search: { type: int, low: 5, high: 20, log: true }
+  bin_pct:
+    doc: HSAR bin width in log price; pivots inside one bin are one level (0.005 = 0.5%).
+    value: 0.005
+    search: { type: float, low: 0.002, high: 0.02, log: true }
+  min_touches:
+    doc: Pivots a bin needs to be a level. 1 = any swing is a level (the ablation control).
+    value: 2
+    search: { type: int, low: 1, high: 5 }
+    grid: [1, 2]
+  # --- multiple timeframes ---------------------------------------------------------------
+  signal_tf:
+    doc: Candle (minutes) on whose closes the trigger is read; 0 = every execution bar.
+    value: 0
+    search: { type: categorical, choices: [0, 5, 15] }
+    grid: [0, 5]
+  trend_tf:
+    doc: >-
+      Candle (minutes) of the higher-timeframe EMA trend; 0 = NO trend gate (the one
+      off-switch — trend_gate then has no effect, so no combo is rejected or inert).
+    value: 0
+    search: { type: categorical, choices: [0, 5, 15, 60] }
+    grid: [0, 15]
+  trend_len:
+    doc: EMA length of the higher-timeframe trend, in candles (capped — long filters regime-fit).
+    value: 20
+    search: { type: int, low: 5, high: 50, log: true }
+  trend_gate:
+    doc: >-
+      with (a long needs the last COMPLETED trend candle above its EMA, a short below) |
+      against (mirrored). Only read when trend_tf > 0. Folk practice — the first event study
+      says "with" carries the bounce's only information (README) — it must earn its place.
+    value: with
+    search: { type: categorical, choices: [with, against] }
+  # --- triggers --------------------------------------------------------------------------
+  touch_tol:
+    doc: Touch band and reclaim margin around a level, in session ATRs.
+    value: 0.15
+    search: { type: float, low: 0.05, high: 0.5, step: 0.05 }
+  touch_minutes:
+    doc: How far back (minutes) the low/high may have touched the band (may reach before the scan).
+    value: 5
+    search: { type: int, low: 1, high: 30, log: true }
+  confirm_minutes:
+    doc: Bounce confirmation — the close must exceed the close this many minutes ago; 0 = off.
+    value: 0
+    search: { type: int, low: 0, high: 15 }
+  break_tol:
+    doc: A break must close this many session ATRs beyond the level.
+    value: 0.1
+    search: { type: float, low: 0.0, high: 0.5, step: 0.05 }
+  polarity:
+    doc: >-
+      bounce = fade the level (take-profit clustering) | break = trade through it (stop
+      clustering). Osler's two polarities, searched not assumed; the event study decides.
+    value: bounce
+    search: { type: categorical, choices: [bounce, break] }
+    grid: [bounce, break]
+  direction:
+    doc: long | short | both.
+    value: both
+    search: { type: categorical, choices: [long, short, both] }
+    grid: [long, both]
+  vwap_gate:
+    doc: none | above | below — a long needs the close on that side of the session VWAP.
+    value: none
+    search: { type: categorical, choices: [none, above, below] }
+  range_used_max:
+    doc: Skip a name whose session range already spans this many session ATRs; 0 = off.
+    value: 0.0
+    search: { type: float, low: 0.0, high: 2.0, step: 0.25 }
+  # --- the scan: activity-ranked watchlist -----------------------------------------------
+  scan_minute:
+    doc: Minute of the session the watchlist is frozen at; entries only after it.
+    value: 30
+    search: { type: categorical, choices: [15, 30, 45, 60] }
+  skip_close:
+    doc: No entries in the last N minutes of the session.
+    value: 15
+  vol_mult:
+    doc: >-
+      Relative volume at the scan bar (cumulative volume over its time-of-day expectation)
+      a candidate needs; 0 = no floor. With rank_by rvol the floor only binds when fewer than
+      max_candidates names clear it (the top seats are the most active names anyway), so the
+      "no activity selection" control is rank_by touches WITH vol_mult 0, never vol_mult alone.
+    value: 1.0
+    search: { type: float, low: 0.0, high: 3.0, step: 0.25 }
+    grid: [0.0, 1.0]
+  profile_days:
+    doc: Sessions in the time-of-day volume baseline (bt.volume_profile).
+    value: 10
+  rank_by:
+    doc: >-
+      Watchlist order — rvol | touches (of the nearest level) | rvol_x_touches. rvol IS the
+      activity selection; touches with vol_mult 0 is the no-activity control.
+    value: rvol
+    search: { type: categorical, choices: [rvol, touches, rvol_x_touches] }
+    grid: [rvol, touches]
+  max_candidates:
+    doc: Watchlist seats per session; the slot size is 1/max_candidates of the free cash.
+    value: 5
+    search: { type: int, low: 2, high: 12 }
+  reach_atr:
+    doc: A name is a candidate only if a level lies within this many session ATRs of its close.
+    value: 0.5
+    search: { type: float, low: 0.2, high: 1.5, step: 0.1 }
+  min_price:
+    doc: Price floor at the scan bar (a cheap name's spread is nothing like 2 bps).
+    value: 5.0
+  min_dollar_volume:
+    doc: Dollar volume traded by the scan bar. Written out — YAML reads a bare 1e6 as a STRING.
+    value: 1000000
+  # --- regime and warm-up ----------------------------------------------------------------
+  regime:
+    doc: >-
+      none | active_only | calm_only on the panel's equal-weight index realized volatility
+      versus its trailing 60-session median. Ablatable market-state gate.
+    value: none
+    search: { type: categorical, choices: [none, active_only, calm_only] }
+  regime_days:
+    doc: Realized-volatility window in sessions.
+    value: 10
+  atr_days:
+    doc: Session-ATR smoothing window in sessions — the ONE distance unit.
+    value: 14
+  warmup_sessions:
+    doc: >-
+      No trading in the first N sessions, pinned so every trial shares the same dead zone
+      (>= every session-level window; valid() enforces it). optuna.score_from skips it.
+    value: 20
+  # --- risk ------------------------------------------------------------------------------
+  sl_atr:
+    doc: >-
+      Stop distance beyond the level, in session ATRs — on the far side of the level from the
+      entry, so it is outside the touch band by construction (no rejection needed).
+    value: 0.3
+    search: { type: float, low: 0.1, high: 1.0, step: 0.05 }
+  max_stop:
+    doc: >-
+      Skip a setup whose stop would be further than this fraction of price (rather miss). A
+      0.3-ATR stop on these names is already ~1% of price, so below 0.01 nothing trades.
+    value: 0.02
+    search: { type: float, low: 0.01, high: 0.05, step: 0.005 }
+  tp_ratio:
+    doc: Target as a multiple of the stop; 0 = no target.
+    value: 1.5
+    search: { type: float, low: 0.0, high: 4.0, step: 0.5 }
+  sl_trail:
+    doc: Trail the stop behind the best price (suits break, not bounce — Kaminski-Lo).
+    value: false
+    search: { type: categorical, choices: [false, true] }
+  horizon:
+    doc: Time stop in minutes.
+    value: 180
+    search: { type: int, low: 30, high: 360, log: true }
+  risk_per_trade:
+    doc: >-
+      Fraction of the book one stop-out may lose; each entry deploys
+      min(1/max_candidates, risk_per_trade / stop) of the FREE cash (per-entry cash_frac frame).
+    value: 0.004
+    search: { type: float, low: 0.002, high: 0.01, log: true }
+  ssr_guard:
+    doc: Never short a name down 10% from its prior close (Reg SHO Rule 201), that day and the next.
+    value: true
+  eod_exit:
+    doc: Flat at every session's last bar, shorts included. Never off.
+    value: true

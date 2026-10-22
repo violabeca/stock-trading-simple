@@ -49,7 +49,7 @@ the latter.
 The positive holdout (+8.2%, Sharpe 3.7, 183 trades over two months) is from study v2: 20
 independent $10k books (20× the capital of the wallet it now trades), the pre-realism
 engine (optimistic stop fills), the old objective, and a universe whose buy-and-hold
-returned +460%/yr. `keltner-1m-v4` — the space this config ships — has never been run.
+returned +460%/yr. `keltner-1m-v5` — the space this config ships — has never been run.
 Order of work: `data.universe: Morning200` (`max_symbols: 200`; `bt.sweep` needs
 `chunk_size=2` at that width), run v4, only then read §11.
 

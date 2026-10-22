@@ -508,10 +508,14 @@ def plot_volume_profile(volume: pd.Series, baseline: pd.Series, tz: str, *, days
 
 def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
                 *, picked: int | None = None, axes: tuple[str, str] | None = None) -> go.Figure:
-    """The Pareto front of an optimization study, on the study's own two objectives.
+    """The Pareto front of an optimization study, on the study's own objectives.
 
     By default volatility (the annual risk rate) runs across and excess return up — the
     usual picture of an efficient frontier: up is more return, left is a calmer ride.
+    A one-objective study has no trade-off to draw — its "front" is its best trial (or the
+    trials tied for it) — so its objective runs up against ``volatility`` across
+    (``excess_cagr`` when volatility is the objective): what risk the single-minded search
+    bought.
     Completed trials draw as a recessive gray cloud; the front as a blue
     staircase (the exact boundary of the dominated region — a diagonal would
     claim unattained trade-offs — stepped the right way for each objective's
@@ -525,7 +529,7 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
 
     Args:
         front: ``optimize.pareto_frame`` output (needs the two ``axes`` columns
-            plus ``trial``).
+            plus ``trial``; its ``attrs["objectives"]`` names the study's objectives).
         all_trials: Optional frame of every completed trial (context cloud).
         picked: Trial number to highlight (from ``optimize.pick_best``).
         axes: ``(x, y)`` metric columns; defaults to the objectives, second one across.
@@ -533,15 +537,18 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
     Returns:
         The figure.
     """
-    from trading_simple.optimize import DIRECTIONS, OBJECTIVES
+    from trading_simple.optimize import OBJECTIVES, SCOREABLE
 
-    x, y = axes or (OBJECTIVES[1], OBJECTIVES[0])
+    names = front.attrs.get("objectives", OBJECTIVES)
+    label = "Pareto front" if len(names) > 1 else "best trial"
+    x, y = axes or ((names[1], names[0]) if len(names) > 1 else
+                    ("volatility" if names[0] != "volatility" else "excess_cagr", names[0]))
     pct = {m: m.endswith("return") or m in _PERCENT for m in (x, y)}
     hover = (f"<b>trial %{{customdata[0]}}</b><br>{x} %{{x:{'.1%' if pct[x] else '.2f'}}} | "
              f"{y} %{{y:{'.1%' if pct[y] else '.2f'}}}<br>%{{customdata[1]}}<extra></extra>")
     # The dominated region hugs the front from the side its x-axis is worse on: step
     # vertically first when larger x is better, horizontally first when smaller x is.
-    shape = "vh" if dict(zip(OBJECTIVES, DIRECTIONS, strict=True)).get(x) != "minimize" else "hv"
+    shape = "hv" if SCOREABLE.get(x) == "minimize" else "vh"
     fig = go.Figure()
     if all_trials is not None and len(all_trials):
         fig.add_trace(go.Scatter(
@@ -557,7 +564,7 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
                                    for a, b in zip(ys, ys[1:], strict=False)]
     fig.add_trace(go.Scatter(
         x=front[x], y=front[y], mode="lines+markers+text",
-        name="Pareto front", line={"color": SERIES[0], "width": 2, "shape": shape},
+        name=label, line={"color": SERIES[0], "width": 2, "shape": shape},
         marker={"size": 10, "color": SERIES[0], "line": {"color": "white", "width": 1}},
         text=[f"trial {t} " for t in front["trial"]], textposition=positions,
         textfont={"size": 11, "color": _INK},
@@ -580,7 +587,7 @@ def plot_pareto(front: pd.DataFrame, all_trials: pd.DataFrame | None = None,
                           annotation_position="bottom right")
     fig.update_xaxes(title=x.replace("_", " "), tickformat=".0%" if pct[x] else None)
     fig.update_yaxes(title=y.replace("_", " "), tickformat=".0%" if pct[y] else None)
-    return _base(fig, title=f"Optimization Pareto front — {x} vs {y}")
+    return _base(fig, title=f"Optimization {label} — {x} vs {y}")
 
 
 def plot_heatmap_grid(stats: pd.DataFrame, *, pairs: list[tuple[str, str]],

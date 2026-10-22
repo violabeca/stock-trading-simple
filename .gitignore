@@ -7,5 +7,12 @@ __pycache__/
 .ipynb_checkpoints/
 .env
 strategies/*/studies/*.log
+strategies/*/studies/*.pkl
+strategies/*/studies/panels/
 strategies/*/studies/*.candidates.yaml
+# executed notebooks archived next to their study journal (outputs kept, so tens of MB)
+strategies/*/studies/*.ipynb
 .DS_Store
+var/
+strategies/burst_scan/options_data/
+strategies/darts_forecast/cache/

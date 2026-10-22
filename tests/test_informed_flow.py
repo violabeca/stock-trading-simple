@@ -18,7 +18,11 @@ _PARAMS = {"insider_window": 10, "rating_halflife": 5, "ptrev_halflife": 5,
            # Enough slots that the panel's whole universe fits, so tests about *ranking*
            # are not silently also testing the capital constraint. The tests that DO
            # exercise the slot limit set it themselves.
-           "max_positions": 5, "displace_margin": 1.0}
+           "max_positions": 5, "displace_margin": 1.0,
+           # config.yaml ships liquidity-neutral ranking (neutral_groups 5) since v31; on a
+           # 4-name synthetic panel five groups leave every name alone in its group, so the
+           # mechanics tests rank one cross-section. The neutral ranking has its own test.
+           "neutral_groups": 0}
 
 
 def _if(panel, **overrides):
@@ -72,6 +76,35 @@ def test_insider_cluster_enters_next_bar():
     assert _bought(sig, "AAA")[0] == 31
     # Names with no alt-data activity are ineligible and are never bought.
     assert not (sig["weights"]["CCC"] > 0).any()
+
+
+def test_neutral_groups_rank_inside_liquidity_groups():
+    """`neutral_groups` takes the liquidity lean out of the ranking, and 0 leaves it untouched.
+
+    Six names, the last three trading 100x the first three, and a days-to-cover that falls
+    with volume (as it does by construction: volume is its denominator). Ranked across the
+    whole universe the best three names are exactly the three most traded; ranked inside two
+    dollar-volume groups, each group's best name ties for the top and its worst for the bottom.
+    """
+    symbols = ("AAA", "BBB", "CCC", "XXX", "YYY", "ZZZ")
+    p = _panel(symbols=symbols)
+    p.volume.loc[:, ["XXX", "YYY", "ZZZ"]] = 100_000_000.0
+    p.features["ratings"].iloc[25, :] = 1.0          # every name eligible (a 10-bar window)
+    index = p.close.index
+    p.features["short_interest"] = pd.DataFrame([[6.0, 5.0, 4.0, 3.0, 2.0, 1.0]] * len(index),
+                                                index=index, columns=list(symbols))
+    only_dtc = {**_PARAMS, "w_insider": 0.0, "w_rating": 0.0, "w_ptrev": 0.0, "w_dtc": 1.0,
+                "w_recency": 0.0}
+    compose, bar = _module()["_compose"], index[30]
+
+    plain = compose(p, **only_dtc)["score_pct"].loc[bar]
+    assert plain.nlargest(3).index.tolist() == ["ZZZ", "YYY", "XXX"]      # the lean, undiluted
+    assert compose(p, **{**only_dtc, "neutral_groups": 0})["score_pct"].loc[bar].equals(plain)
+
+    neutral = compose(p, **{**only_dtc, "neutral_groups": 2})["score_pct"].loc[bar]
+    assert neutral["CCC"] == neutral["ZZZ"] == neutral.max()              # best of each group
+    assert neutral["AAA"] == neutral["XXX"] == neutral.min()              # worst of each group
+    assert not _module()["valid"]({**only_dtc, "neutral_groups": -1})
 
 
 def test_eligibility_mask_blocks_thin_names():
@@ -137,7 +170,10 @@ def test_stale_coverage_exits_through_the_band_before_the_cliff():
     p.features["insider"].iloc[30, 0] = 5_000_000.0
     p.features["insider"].iloc[30, 1] = 1_000_000.0
     p.features["ratings"].iloc[30:, 1] = 1.0          # BBB's coverage stays fresh
-    sig = _if(p, max_hold=200)                        # recency on (config ships w_recency=1)
+    # Recency ON, explicitly: config.yaml ships w_recency = 0.0 since v27 (the sleeve is
+    # direction-blind and carries no information on Liquid500), but the mechanism this test pins
+    # — staleness leaves through the band, never through the min_events cliff — is unchanged.
+    sig = _if(p, max_hold=200, w_recency=1.0)
     sold = _sold(sig, "AAA")
     assert sold.size and sold[0] < 40                 # gone before the cliff could fire
     exits = _causes(p, max_hold=200)
@@ -462,6 +498,62 @@ def test_low_coverage_sleeve_is_dropped():
     dtc["CCC"] = 3.0
     parts = _module()["_compose"](p, **{**_PARAMS, "w_dtc": 0.9})
     assert "short_interest" in parts["present"]
+
+
+def test_dtc_window_averages_the_level_and_one_bar_is_the_old_ranking():
+    """Averaging days-to-cover damps a one-settlement jump; 1 bar leaves the ranking as it was,
+    and a masked (stale) level is never revived by the average."""
+    p = _panel()
+    p.features["ratings"].iloc[::5, :] = 1.0
+    dtc = pd.DataFrame([[1.0, 2.0, 3.0, 4.0]] * len(p.close.index),
+                       index=p.close.index, columns=p.symbols)
+    dtc.iloc[50:, 0] = 5.0                           # AAA's short position jumps at bar 50
+    dtc.iloc[70:, 3] = np.nan                        # DDD's level expires at bar 70
+    p.features["short_interest"] = dtc
+    compose = _module()["_compose"]
+    raw = {w: compose(p, **{**_PARAMS, "dtc_window": w})["raw"]["short_interest"] for w in (1, 42)}
+    pd.testing.assert_frame_equal(raw[1], -dtc)                         # 1 bar = the level
+    assert raw[42].iloc[51]["AAA"] == pytest.approx(-(1.0 * 40 + 5.0 * 2) / 42)   # damped jump
+    assert raw[42].iloc[70:]["DDD"].isna().all()                        # no stale revival
+    assert not _module()["valid"]({**_PARAMS, "dtc_window": 0})
+
+
+def test_min_events_zero_ranks_names_on_their_own_short_interest():
+    """At 0 the ranked sleeve's own data decide eligibility: a name with short interest but no
+    insider or rating event is ranked; a name with no short interest is not."""
+    p = _panel()                                       # no insider / rating events at all
+    dtc = pd.DataFrame([[1.0, 2.0, 3.0, np.nan]] * len(p.close.index),
+                       index=p.close.index, columns=p.symbols)
+    p.features["short_interest"] = dtc
+    only_dtc = {**_PARAMS, "w_insider": 0.0, "w_rating": 0.0, "w_dtc": 1.0, "w_recency": 0.0}
+    compose = _module()["_compose"]
+    assert not compose(p, **{**only_dtc, "min_events": 1})["eligible"].to_numpy().any()
+    eligible = compose(p, **{**only_dtc, "min_events": 0})["eligible"]
+    assert eligible[["AAA", "BBB", "CCC"]].all().all() and not eligible["DDD"].any()
+
+
+def test_a_sleeve_that_goes_thin_falls_silent_on_those_bars_only():
+    """Broad on its best bar is not broad on every bar: a table that stops being refreshed
+    must not tilt the ranking toward the few names still covered.
+
+    Regression test for 2026-07: short interest stopped being ingested for 395 of Liquid500's
+    500 names. Once the feature layer masks their stale levels, the sleeve covers the other
+    105 — still "live" by its best bar, so without a per-bar floor those 105 would take real
+    percentiles and everyone else the neutral 0.5.
+    """
+    p = _panel()                                     # AAA, BBB, CCC, DDD
+    p.features["ratings"].iloc[::5, :] = 1.0         # every name eligible throughout
+    dtc = pd.DataFrame([[1.0, 2.0, 3.0, 4.0]] * len(p.close.index),
+                       index=p.close.index, columns=p.symbols)
+    dtc.iloc[60:, 1:] = np.nan                       # from bar 60 only AAA is still covered
+    p.features["short_interest"] = dtc
+    only_dtc = {**_PARAMS, "w_insider": 0.0, "w_rating": 0.0, "w_dtc": 1.0, "w_recency": 0.0}
+    parts = _module()["_compose"](p, **only_dtc)
+
+    assert parts["present"] == ["short_interest"]    # alive by its best bar
+    assert parts["score_pct"].iloc[50].idxmax() == "AAA"          # broad: lowest DTC ranks top
+    assert parts["ranks"]["short_interest"].iloc[60:].isna().all().all()   # thin: no ranks
+    assert parts["score_pct"].iloc[60:].nunique(axis=1).eq(1).all()        # ... and no tilt
 
 
 # --- the recency sleeve (v21) ------------------------------------------------

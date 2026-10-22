@@ -36,10 +36,15 @@ Two execution models, chosen by what a strategy's ``signals()`` returns:
   variant of the signal path: ONE shared account of ``init_cash`` *total*, and
   each entry deploys ``cash_frac`` of the currently *free* cash, so the book can
   never be more than 100% invested. This is how a single real account of
-  ``init_cash`` would trade a multi-symbol signal scanner. Stops work per column
+  ``init_cash`` would trade a multi-symbol signal scanner. ``cash_frac`` is a
+  scalar, or a per-bar frame read at each fill bar (:func:`cash_frac_size`) — how a
+  strategy sizes every entry off its own stop distance. Stops work per column
   as usual. Percent sizing cannot *reverse* a position, so an opposite-direction
   entry closes the open position instead (``upon_opposite_entry="close"``); the
-  new direction opens on a later bar if its signal persists.
+  new direction opens on a later bar if its signal persists. Shorts **lock cash**
+  (``lock_cash=True``): a short's sale proceeds stay reserved for buying it back, so
+  they can never fund a long (the book stays at most 100% invested, shorts included)
+  and a stop on a short always covers the whole position.
 
 **Every return metric is per-year** (:func:`_years`). A cumulative return rewards
 a long backtest window for being long, so it can compare neither two strategies
@@ -76,11 +81,14 @@ STOP_KEYS = ("sl_stop", "sl_trail", "tp_stop")
 #: Returning this frame instead of ``entries``/``exits`` opts a strategy into
 #: **portfolio mode**: one shared cash account, rebalanced to these target weights.
 WEIGHTS_KEY = "weights"
-#: Returning this scalar (0 < f <= 1) alongside ``entries``/``exits`` opts a signal
+#: Returning this scalar (0 < f <= 1) — or a dense (bar x symbol) frame of such fractions,
+#: read at each fill bar, which is how risk-per-trade sizing ``min(slot, risk / stop)`` is
+#: expressed (:func:`cash_frac_size`) — alongside ``entries``/``exits`` opts a signal
 #: strategy into **one cash-shared wallet** of ``init_cash`` TOTAL: each entry deploys
-#: this fraction of the group's currently free cash, so total invested can never
+#: its fraction of the group's currently free cash, so total invested can never
 #: exceed the book. Percent sizing cannot reverse a position, so an opposite-direction
-#: entry closes the open position instead of flipping it.
+#: entry closes the open position instead of flipping it. A short's sale proceeds stay
+#: locked for its cover (``lock_cash``), so they never fund a long.
 CASH_FRAC_KEY = "cash_frac"
 #: Returning this scalar (``k > 1``) alongside ``weights`` opts a portfolio-mode strategy
 #: into a **concentration cap**: whenever a held name's realized book weight reaches
@@ -91,6 +99,13 @@ CASH_FRAC_KEY = "cash_frac"
 #: strategy that does not set it keep the pure buy-and-once-hold behavior. See
 #: :func:`_run_portfolio` and :func:`_retrim_loop`.
 RETRIM_K_KEY = "retrim_k"
+#: Returning this frame (bar x symbol) — or a scalar — of YEARLY borrow rates (fractions:
+#: 0.005 = 0.5%/yr) alongside ``weights`` charges every short position its borrow fee. The
+#: engine models no stock-loan market of its own: the strategy states what each name costs
+#: to borrow and :func:`_borrow_fees` charges it, accrued day by day on the calendar, on the
+#: order that buys the short back (a short still open on the last bar pays on the order that
+#: opened it). Portfolio mode only; without it shorts borrow for free.
+BORROW_KEY = "borrow"
 #: Fill models a strategy's ``backtest.fill`` may select (see :func:`fill_prices`).
 #: ``open`` (the default) fills every order at the bar's adjusted open — symmetric and
 #: neutral. ``pessimistic`` fills every buy at the bar's high and every sell at its low: the
@@ -104,7 +119,7 @@ FILLS = ("open", "pessimistic")
 METRIC_COLS = frozenset({
     "total_return", "cagr", "sharpe", "max_drawdown", "win_rate", "pct_profitable",
     "n_trades", "trades_per_year", "years", "excess_cagr", "info_ratio", "tracking_error",
-    "volatility",
+    "volatility", "alpha_cagr", "beta",
 })
 
 _configured = False
@@ -297,6 +312,32 @@ def exit_after(entries: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return entries.shift(horizon, fill_value=False)
 
 
+def cash_frac_size(frac):
+    """A strategy's ``cash_frac`` as vectorbt's ``size``: a float, or a dense per-bar frame.
+
+    A frame lets a strategy size each entry on its own — ``min(slot, risk_per_trade /
+    stop_distance)`` is the risk-per-trade rule — and vectorbt reads it at the FILL bar. A
+    NaN cell there SKIPS the entry with no error (verified on vectorbt 1.0), which would turn
+    a sizing bug into a silent signal gate, so a frame must be dense: fill the bars that
+    never fill with the slot fraction.
+
+    Args:
+        frac: Scalar fraction of free cash, or a ``(bar x symbol)`` frame of fractions.
+
+    Returns:
+        ``float``, or the frame cast to float.
+
+    Raises:
+        ValueError: If the frame has any NaN cell.
+    """
+    if not isinstance(frac, pd.DataFrame):
+        return float(frac)
+    if frac.isna().to_numpy().any():
+        raise ValueError("cash_frac frame has NaN cells — a NaN size silently skips the entry; "
+                         "fill the non-entry bars with the slot fraction")
+    return frac.astype(float)
+
+
 # ---------------------------------------------------------------------------
 # Costs and grids.
 # ---------------------------------------------------------------------------
@@ -310,7 +351,11 @@ def leg_costs(costs: CostSettings, *, price: float = 20.0,
     The fraction assumes ``notional``-sized orders; a cash-shared wallet's child
     orders are smaller (e.g. ~$2.5k at ``cash_frac`` 0.25), where the minimum
     commission is ~4 bp/leg instead of the modeled ~2.5 — a small, constant
-    understatement that cannot reorder parameter sets or Pareto fronts.
+    understatement that cannot reorder parameter sets or Pareto fronts. It is NOT small
+    for a many-slot portfolio book: 30 slots of a $30k account place $1,000 orders, where
+    the $1 minimum is 10 bp/leg, and at ~1 bp a high-turnover parameter set looks almost
+    free. Such a strategy declares its real order size as ``backtest.order_notional`` in
+    its ``config.yaml`` (:func:`strategy_costs`).
 
     Args:
         costs: The ``costs:`` block from settings.
@@ -348,6 +393,24 @@ def panel_costs(costs: CostSettings, panel: Panel, *,
     if not np.isfinite(price) or price <= 0:
         price = 20.0
     return leg_costs(costs, price=price, notional=notional)
+
+
+def strategy_costs(strategy: LoadedStrategy, panel: Panel,
+                   settings: Settings) -> tuple[float, float]:
+    """:func:`panel_costs` at the strategy's own order size (``backtest.order_notional``).
+
+    The one place the per-strategy order size enters the cost model, so a backtest, a sweep
+    and a notebook cell that rebuilds a book by hand all charge the same fee fraction.
+
+    Args:
+        strategy: A loaded strategy; its ``order_notional`` is ``None`` for the $10,000 default.
+        panel: The panel the backtest will run on (the scored window, when there is one).
+        settings: Global settings (the ``costs:`` block).
+
+    Returns:
+        ``(fees_fraction, slippage_fraction)`` per leg.
+    """
+    return panel_costs(settings.costs, panel, notional=strategy.order_notional or 10_000.0)
 
 
 def fill_prices(panel: Panel, slippage: float, fill: str = "open"):
@@ -407,7 +470,7 @@ def grid_from_config(sweep_cfg: dict[str, list], valid=lambda p: True) -> list[d
 # Running portfolios.
 # ---------------------------------------------------------------------------
 def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
-        init_cash: float = 10_000.0, fill: str = "open"):
+        init_cash: float = 10_000.0, fill: str = "open", whole_shares: bool = False):
     """Build one vectorbt Portfolio from a strategy's signal dict.
 
     Dispatches on what the strategy returned. A ``weights`` frame selects
@@ -420,16 +483,21 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
     Args:
         panel: Price panel.
         signals: Strategy output — either :data:`WEIGHTS_KEY` (a target-weight
-            frame, optionally with a :data:`RETRIM_K_KEY` scalar to cap single-name
-            concentration), or any subset of :data:`SIGNAL_KEYS` (boolean frames) and
+            frame, negative for a short, optionally with a :data:`RETRIM_K_KEY` scalar to
+            cap single-name concentration and a :data:`BORROW_KEY` rate for shorts), or any
+            subset of :data:`SIGNAL_KEYS` (boolean frames) and
             :data:`STOP_KEYS` (scalars or frames; stop distances are fractions of
             entry price, NaN = no stop), optionally plus :data:`CASH_FRAC_KEY`
-            (a scalar fraction of free cash deployed per entry).
+            (the fraction of free cash deployed per entry: a scalar, or a dense per-bar
+            frame read at the fill bar — see :func:`cash_frac_size`).
         fees: Per-leg fee fraction (see :func:`leg_costs`).
         slippage: Per-leg slippage fraction.
         init_cash: Starting cash — **per symbol** in per-symbol mode, the **whole
             book** in portfolio mode and in cash-shared signal mode.
         fill: Fill model, one of :data:`FILLS` (a strategy's ``backtest.fill``).
+        whole_shares: Round every order down to whole shares (a real account's
+            constraint; see ``LoadedStrategy.whole_shares``). Off by default: the engine
+            trades fractional shares, which makes every book scale-free.
 
     Returns:
         A ``vectorbt.Portfolio`` (grouped and cash-sharing in portfolio and
@@ -437,19 +505,24 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
 
     Raises:
         ValueError: If the signals set both ``weights`` and ``cash_frac`` — the
-            two capital models are mutually exclusive — or on an unknown ``fill``.
+            two capital models are mutually exclusive — or ``borrow`` without ``weights``,
+            or on an unknown ``fill``.
     """
     configure()
     import vectorbt as vbt
 
     if WEIGHTS_KEY in signals and CASH_FRAC_KEY in signals:
         raise ValueError("signals may set 'weights' OR 'cash_frac', not both")
+    if BORROW_KEY in signals and WEIGHTS_KEY not in signals:
+        raise ValueError("'borrow' is charged in portfolio mode only (return 'weights')")
     price, slippage = fill_prices(panel, slippage, fill)
+    whole = {"size_granularity": 1.0} if whole_shares else {}
     if WEIGHTS_KEY in signals:
         return _run_portfolio(panel, signals[WEIGHTS_KEY], price=price, fees=fees,
                               slippage=slippage, init_cash=init_cash,
-                              retrim_k=signals.get(RETRIM_K_KEY))
-    kwargs = {k: signals[k] for k in (*SIGNAL_KEYS, *STOP_KEYS) if k in signals}
+                              retrim_k=signals.get(RETRIM_K_KEY),
+                              borrow=signals.get(BORROW_KEY), **whole)
+    kwargs = {k: signals[k] for k in (*SIGNAL_KEYS, *STOP_KEYS) if k in signals} | whole
     if any(k in signals for k in STOP_KEYS):
         # open= lets a bar that GAPS through a stop fill at its (worse) true open
         # instead of at the stop level, and "stopmarket" makes stop legs pay
@@ -465,9 +538,15 @@ def run(panel: Panel, signals: dict, *, fees: float, slippage: float,
         # puts same-bar sells before buys, so an exit frees the cash a new entry spends.
         # upon_opposite_entry="close": percent sizing cannot reverse a position
         # (vectorbt raises), so an opposite entry closes the open position instead.
-        kwargs |= dict(size=float(signals[CASH_FRAC_KEY]), size_type="percent",
+        # lock_cash=True: a short's sale proceeds stay RESERVED for buying it back.
+        # Without it vectorbt counts them as spendable, so a later long entry buys with
+        # them (a $10k wallet ran 280% invested in the regression test) and the buy that
+        # covers the short is then cash-limited — its stop fills only part of the position
+        # and the rest runs on past the stop. burst_scan measured it on a real book: free
+        # cash negative on 11% of bars, split covers, 199 skipped entries (2026-09-27).
+        kwargs |= dict(size=cash_frac_size(signals[CASH_FRAC_KEY]), size_type="percent",
                        group_by=True, cash_sharing=True, call_seq="auto",
-                       upon_opposite_entry="close")
+                       upon_opposite_entry="close", lock_cash=True)
     return vbt.Portfolio.from_signals(
         panel.close, price=price, fees=fees, slippage=slippage,
         init_cash=init_cash, freq=panel.freq,
@@ -580,18 +659,78 @@ def _retrim_loop(build, targets: pd.DataFrame, weights: pd.DataFrame,
     return pf
 
 
+def _borrow_fees(targets: pd.DataFrame, borrow, fees: float) -> pd.DataFrame:
+    """The fee frame that charges every short its borrow: ``fees`` plus a surcharge.
+
+    A short accrues ``rate × days / 365`` for every calendar day it is held (the rate read
+    at each bar; weekends and holidays count, as a stock loan does). The accrued fee is
+    charged as a fraction of the order that buys the short back — scaled by the short's
+    size over the order's size, since that order may also buy into a long. A short still
+    open on the last bar has no such order, so its accrual is charged on the order that
+    opened it instead: the cost lands earlier than in reality, but it is never skipped,
+    which a backtest window cut short would otherwise do to every position it ends on.
+
+    Sizes are read from the TARGETS (what each order asks for), so a short re-sized while
+    open is charged at its size at the buy-back — exact for books that open a short once and
+    buy it back whole (event-driven rotation), approximate otherwise.
+
+    Args:
+        targets: Masked target weights (:func:`rotation_targets`): NaN = no order.
+        borrow: Yearly borrow rate per name and bar (frame on ``targets``' index), or one
+            scalar for every name; NaN reads as 0.
+        fees: The per-leg fee fraction every order pays.
+
+    Returns:
+        A frame shaped like ``targets``: ``fees`` everywhere, plus the borrow surcharge on
+        the orders that pay it.
+    """
+    index = targets.index
+    if isinstance(borrow, pd.DataFrame):
+        rate = borrow.reindex(index=index, columns=targets.columns).fillna(0.0).to_numpy()
+    else:
+        rate = np.full(targets.shape, float(borrow))
+    years = np.r_[0.0, np.diff(index.asi8) / 86_400e9] / 365.0
+    accrued = np.cumsum(rate * years[:, None], axis=0)      # accrued[i]: bars 1..i
+    t = targets.to_numpy(dtype=float)
+    out = np.zeros_like(t)
+    for j in range(t.shape[1]):
+        orders = np.flatnonzero(~np.isnan(t[:, j]))
+        w, since, opened = 0.0, 0, None                     # in-force weight, last charge
+        for k in orders:
+            x = t[k, j]
+            if w < 0 and x > w:                             # buys (part of) the short back
+                out[k, j] += (accrued[k, j] - accrued[since, j]) * (-w) / (x - w)
+                since = k
+            if x < 0 and w >= 0:                            # a new short starts here
+                opened, since = (k, w), k
+            w = x
+        if w < 0 and opened is not None:                    # still short on the last bar
+            k, before = opened
+            out[k, j] += (accrued[-1, j] - accrued[since, j]) * (-w) / (before - t[k, j])
+    return pd.DataFrame(fees + out, index=index, columns=targets.columns)
+
+
 def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, price: pd.DataFrame, fees: float,
-                   slippage, init_cash: float, retrim_k: float | None = None):
+                   slippage, init_cash: float, retrim_k: float | None = None,
+                   borrow=None, size_granularity: float | None = None):
     """One shared cash account rebalanced to target weights — buying requires selling.
 
     The ``from_orders`` call site. ``from_signals`` cannot do this: it rejects
     target-percent sizing outright (*"Only SizeType.Amount, Value, and Percent are
     supported"*), because boolean entries carry no notion of "rebalance to this book".
 
+    A negative weight is a short. Its sale proceeds stay locked for the buy-back
+    (``lock_cash``), exactly as in the cash-shared wallet: without it vectorbt counted them
+    as spendable, so a long/short book silently ran above 100% gross (``trend_following``
+    measured free cash below zero on 94% of bars, gross up to 114%). Under the lock a short
+    reserves its whole notional, so gross exposure — longs plus shorts — tops out near 100%
+    of the book when orders are placed: a dollar-neutral book is about 50/50.
+
     Args:
         panel: Price panel.
-        weights: Target fraction of the book per symbol, per bar (rows summing to <= 1;
-            the remainder is held as cash). Already execution-timed by the strategy.
+        weights: Target fraction of the book per symbol, per bar; negative = short (gross
+            ``|weights|`` summing to <= 1; the remainder is held as cash). Already
+            execution-timed by the strategy.
         price: Fill price frame (from :func:`fill_prices`).
         fees: Per-leg fee fraction.
         slippage: Per-leg slippage fraction, or per-bar frame (from :func:`fill_prices`).
@@ -600,17 +739,28 @@ def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, price: pd.DataFrame, 
             untouched — one ``from_orders`` pass, identical to the original behavior and
             zero extra cost. A number ``> 1`` trims a held name back to its slot once its
             realized book weight reaches ``retrim_k ×`` its target, via :func:`_retrim_loop`.
+            Longs only: a short is never trimmed.
+        borrow: Yearly borrow rate of each short (:data:`BORROW_KEY`; frame or scalar), or
+            ``None`` (default): shorts borrow for free.
+        size_granularity: ``1.0`` rounds every order down to whole shares, so a name priced
+            above its slot is never bought and each slot's remainder waits in cash;
+            ``None`` (default) trades fractional shares.
 
     Returns:
         A grouped, cash-sharing ``vectorbt.Portfolio``.
     """
     import vectorbt as vbt
 
+    whole = {} if size_granularity is None else {"size_granularity": size_granularity}
+    targets = rotation_targets(weights)
+    if borrow is not None:
+        fees = _borrow_fees(targets, borrow, fees)
+
     def build(targets):
         return vbt.Portfolio.from_orders(
             panel.close, size=targets, size_type="targetpercent",
-            price=price, fees=fees, slippage=slippage, init_cash=init_cash,
-            group_by=True, cash_sharing=True,
+            price=price, fees=fees, slippage=slippage, init_cash=init_cash, **whole,
+            group_by=True, cash_sharing=True, lock_cash=True,
             # MANDATORY, not cosmetic: sorts sells before buys within a bar. Without it a
             # buy gets partially rejected because the sell funding it has not executed yet,
             # silently leaving cash idle — the exact bug this whole mode exists to remove.
@@ -618,7 +768,6 @@ def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, price: pd.DataFrame, 
             freq=panel.freq,
         )
 
-    targets = rotation_targets(weights)
     if retrim_k is None:
         return build(targets)
     return _retrim_loop(build, targets, weights, retrim_k * weights)
@@ -671,9 +820,10 @@ def _run_scored(strategy: LoadedStrategy, panel: Panel, params: dict | None,
     signals = strategy.signals(panel, **{**strategy.params, **(params or {})})
     if score_from is not None:
         panel, signals = _score_window(panel, signals, score_from)
-    fees, slippage = panel_costs(settings.costs, panel)
+    fees, slippage = strategy_costs(strategy, panel, settings)
     pf = run(panel, signals, fees=fees, slippage=slippage,
-             init_cash=settings.backtest.init_cash, fill=strategy.fill)
+             init_cash=settings.backtest.init_cash, fill=strategy.fill,
+             whole_shares=strategy.whole_shares)
     return pf, panel, fees, slippage
 
 
@@ -782,22 +932,35 @@ def active_stats(pf, panel: Panel, *, fees: float, slippage: float,
         fill: Fill model (must match the run — pass ``strategy.fill``).
 
     Returns:
-        ``{"excess_cagr", "info_ratio", "tracking_error"}``. ``excess_cagr`` is the
-        strategy's annualized return minus the benchmark's — the alpha you would have
-        earned per year. ``tracking_error`` is the annualized standard deviation of the
-        *active* per-bar return (strategy minus benchmark): how far the strategy's path
-        strays from simply owning the universe (0 = it IS the benchmark). ``info_ratio``
-        is the annualized mean active return over that same deviation — excess per unit
-        of straying, the Sharpe ratio of the value the strategy adds.
+        ``{"excess_cagr", "alpha_cagr", "beta", "info_ratio", "tracking_error"}``.
+        ``excess_cagr`` is the strategy's annualized return minus the benchmark's — what
+        it earned per year over simply owning the universe. ``beta`` is the book's
+        per-bar return sensitivity to the benchmark's, and ``alpha_cagr`` is the return
+        left after the market exposure the book actually ran: ``cagr − beta × benchmark
+        cagr``. A fully invested long book has beta ≈ 1 and alpha ≈ excess, so nothing is
+        given away; a book that is flat most of the time has beta ≈ 0 and still pays for
+        the exposure it did take — the honest hurdle for a near-zero-beta long/short
+        scanner, which no cash-heavy strategy can clear by sitting out (its alpha is then
+        just its own small return). ``tracking_error`` is the annualized standard
+        deviation of the *active* per-bar return (strategy minus benchmark): how far the
+        strategy's path strays from simply owning the universe (0 = it IS the benchmark).
+        ``info_ratio`` is the annualized mean active return over that same deviation —
+        excess per unit of straying, the Sharpe ratio of the value the strategy adds.
     """
     bench_return, bench_curve = benchmark(panel, fees=fees, slippage=slippage, fill=fill)
-    active = equity_curve(pf)["value"].pct_change().fillna(0.0) - bench_curve
+    own = equity_curve(pf)["value"].pct_change().fillna(0.0)
+    active = own - bench_curve
     sd = float(active.std())
     index = panel.close.index
     years = _years(index)
     ann = np.sqrt(len(index) / years)               # works for daily and intraday
+    var = float(bench_curve.var())
+    beta = float(own.cov(bench_curve) / var) if var else 0.0
+    cagr, bench_cagr = _cagr(total_return, years), _cagr(bench_return, years)
     return {
-        "excess_cagr": _cagr(total_return, years) - _cagr(bench_return, years),
+        "excess_cagr": cagr - bench_cagr,
+        "alpha_cagr": cagr - beta * bench_cagr,
+        "beta": beta,
         "info_ratio": float(active.mean() / sd * ann) if sd else 0.0,
         "tracking_error": sd * ann,
     }
@@ -821,10 +984,11 @@ def evaluate(strategy: LoadedStrategy, panel: Panel, params: dict, *, settings: 
 
     Returns:
         ``{total_return, cagr, sharpe, volatility, max_drawdown, win_rate, pct_profitable,
-        n_trades, trades_per_year, years, excess_cagr, info_ratio, tracking_error}`` — the
-        last three are measured against an equal-weight buy-and-hold of the same (scored)
-        panel (see :func:`benchmark`). :mod:`trading_simple.optimize` scores ``excess_cagr``
-        against ``volatility``: the return must beat the market, the risk is the book's own.
+        n_trades, trades_per_year, years, excess_cagr, alpha_cagr, beta, info_ratio,
+        tracking_error}`` — the last five are measured against an equal-weight buy-and-hold
+        of the same (scored) panel (see :func:`benchmark`, :func:`active_stats`).
+        :mod:`trading_simple.optimize` scores ``excess_cagr`` against ``volatility`` by
+        default: the return must beat the market, the risk is the book's own.
     """
     pf, window, fees, slippage = _run_scored(strategy, panel, params, settings, score_from)
     stats = portfolio_stats(pf)
@@ -851,15 +1015,18 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
 
     Returns:
         DataFrame with the grid's parameter columns plus every metric in
-        :data:`METRIC_COLS` except ``info_ratio`` and ``tracking_error`` (which need a
-        per-combo equity curve the column-stacked sweep does not keep — use
-        :func:`evaluate` for those).
+        :data:`METRIC_COLS` except ``info_ratio``, ``tracking_error``, ``alpha_cagr`` and
+        ``beta`` (which need a per-combo equity curve the column-stacked sweep does not
+        keep — use :func:`evaluate` for those).
     """
     configure(settings)
     import vectorbt as vbt
 
     chunk_size = chunk_size or settings.backtest.chunk_size
-    fees, slippage = panel_costs(settings.costs, panel)
+    if strategy.whole_shares:
+        raise NotImplementedError(
+            "sweep() trades fractional shares; run a whole_shares strategy through run()")
+    fees, slippage = strategy_costs(strategy, panel, settings)
     price, fill_slip = fill_prices(panel, slippage, strategy.fill)   # same fills as run()
     init_cash = settings.backtest.init_cash
     index, columns = panel.close.index, panel.close.columns
@@ -898,6 +1065,9 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
         slip = tile(fill_slip) if isinstance(fill_slip, pd.DataFrame) else fill_slip
 
         if WEIGHTS_KEY in combo_signals[0]:
+            if any(BORROW_KEY in s for s in combo_signals):
+                raise NotImplementedError("sweep() does not charge 'borrow'; run the combos "
+                                          "with evaluate() / run_strategy()")
             # Portfolio mode: group by the combo level, so each combo is its own shared
             # cash account of `init_cash` — not one giant book pooling every combo.
             weights_stacked = stack([s[WEIGHTS_KEY] for s in combo_signals])
@@ -908,6 +1078,7 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
                     tile(panel.close), size=t, size_type="targetpercent",
                     price=tile(price), fees=fees, slippage=slip,
                     init_cash=init_cash, group_by="combo", cash_sharing=True,
+                    lock_cash=True,               # short proceeds never fund a long
                     call_seq="auto", freq=panel.freq,
                 )
 
@@ -949,12 +1120,17 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
             # Cash-shared signal mode: one wallet PER COMBO — group on the combo level,
             # each entry deploying that combo's fraction of its own free cash. Reduced
             # via _grouped_stats like the weights branch, so sweep numbers match what
-            # evaluate() reports for the same combo.
+            # evaluate() reports for the same combo. Scalars stay a one-row broadcast; a
+            # per-entry frame (risk-per-trade sizing) stacks like a stop frame.
+            fracs = [s[CASH_FRAC_KEY] for s in combo_signals]
+            if any(isinstance(f, pd.DataFrame) for f in fracs):
+                size = stack([as_frame(cash_frac_size(f), no_stop) for f in fracs])
+            else:
+                size = np.repeat([float(f) for f in fracs], len(columns))[None, :]
             kwargs |= dict(
-                size=np.repeat([float(s[CASH_FRAC_KEY]) for s in combo_signals],
-                               len(columns))[None, :],
-                size_type="percent", group_by="combo", cash_sharing=True,
+                size=size, size_type="percent", group_by="combo", cash_sharing=True,
                 call_seq="auto", upon_opposite_entry="close",
+                lock_cash=True,   # short proceeds stay reserved for the cover, as in run()
             )
 
         pf = vbt.Portfolio.from_signals(
@@ -1020,7 +1196,7 @@ def portfolio_stats(pf) -> dict:
 
     ``volatility`` is the annual risk rate: the standard deviation of the book's per-bar
     returns, annualized on the same bars-per-calendar-year clock as ``sharpe`` (the
-    per-symbol mean in per-symbol mode). It is one of the study objectives
+    per-symbol mean in per-symbol mode). It is one of the default study objectives
     (:data:`trading_simple.optimize.OBJECTIVES`).
 
     Args:

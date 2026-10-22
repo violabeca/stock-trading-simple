@@ -22,7 +22,9 @@ data:
 # Study settings. The search SPACE is not here — each parameter declares its own
 # `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: gap_and_go-1m-v3  # v3: the engine's objectives changed (now excess_cagr ↑ / volatility
+  study: gap_and_go-1m-v4  # v4: 2026-09-27 wallet shorts lock cash — short proceeds
+                           # no longer fund longs; a short's stop covers it whole. v3 not comparable.
+                           # v3: the engine's objectives changed (now excess_cagr ↑ / volatility
                            # ↓); the v2 journal (info_ratio / excess_cagr) is refused by the engine.
                            # v1 is kept as the record of the diagnosis; its numbers are not
                            # comparable (different universe, benchmark, and parameterization)

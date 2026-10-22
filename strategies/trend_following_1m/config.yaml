@@ -1,0 +1,104 @@
+# ===========================================================================
+# trend_following_1m — trend_following's signals on 1-MINUTE bars of ten liquid stocks.
+# Same logic (Donchian + ADX start, ratcheting ATR chandelier, opposite-start exit);
+# every window is in minutes; entry blackouts at the open/close; flat at the close or
+# held overnight (searched). Layout: data, optuna, backtest, params.
+# ===========================================================================
+
+data:
+  universe: Morning10      # HOOD MU COIN SMCI INTC ORCL GS NOW MRVL SPOT — Morning200's ten
+                           # most liquid names by its point-in-time ranking (settings.yaml)
+  bar: 1m                  # the stored bar; 100k regular-session bars per name
+  resample: null           # null = trade the 1m bars (5 / 15 would derive 5m / 15m candles —
+                           # each execution bar is its own study: bump `study` if you change it)
+  start: "2025-06-18"      # the first stored 1m session — two weeks of warm-up
+  end: "2026-04-30"        # TRAIN cutoff (Morning200's) — 2026-05-01 .. 2026-06-26 is the
+                           # holdout; the stored 1m history of these names ends 2026-06-26
+  session: regular
+  max_symbols: 10
+
+optuna:
+  study: trend-following-1m-v2   # v2 (2026-10-19): portfolio mode locks short proceeds
+                                 # (lock_cash, proposal #31). Bump on any `search:` bound, objective, fill, window or bar
+  sampler: nsga2
+  seed: 42
+  n_trials: 300
+  objectives: [alpha_cagr, volatility]   # alpha after beta, as level_flow: buy-and-hold of these
+                           # ten names made ~+140%/yr over the window and all of it overnight,
+                           # so excess_cagr would read "-140%" for any book that is flat at the
+                           # close, whatever its selection. Alpha still charges the beta it ran.
+  score_from: "2025-07-01" # scored WARM from Morning200's window start (the ranking closed here)
+  min_trades_per_year: 250  # ~one round trip a day across the book; fewer is a lucky handful
+
+backtest:
+  fill: open               # the next minute's open
+  order_notional: 5000     # the REAL order: 10 slots of a $50k account — the $1 minimum
+                           # commission is 2 bp a leg (+1 bp half-spread, +1 bp slippage)
+
+# Every parameter declared ONCE (doc / value / search / grid). Windows are in MINUTES.
+params:
+  entry_window:
+    doc: >-
+      Donchian lookback in minutes: a start is a close beyond the prior entry_window-minute
+      high (long) / low (short). 390 = one session. The v1 study ships 31.
+    value: 31
+    search: { type: int, low: 5, high: 780, log: true }
+  adx_window:
+    doc: Wilder smoothing window of ADX and ±DI, in minutes (Wilder's 14). Not searched.
+    value: 14
+  adx_min:
+    doc: >-
+      ADX floor a breakout needs to count as a start (±DI agreeing); 0 = off. THE knob on
+      minute bars: the study ships 57 — only the most violent intraday bursts start a trade.
+      It sits near the searched bound, but on train the alpha peaks at 54-57 and falls above
+      (60: +4.0%, 70: +2.3%/yr) while the trade rate drops below the floor — not widened. The
+      grid runs a moderate 25 against it, so the sweep is its ablation.
+    value: 57.0
+    search: { type: float, low: 0.0, high: 60.0, step: 1.0 }
+    grid: [25.0, 57.0]
+  atr_window:
+    doc: ATR window of the stop, in minutes (Wilder smoothing). The study ships 47.
+    value: 47
+    search: { type: int, low: 5, high: 390, log: true }
+  atr_mult:
+    doc: >-
+      Stop distance in minute-ATRs: from the signal close at entry, then trailing behind the
+      best price since entry on the current ATR, never loosened. A 1m ATR of these names is
+      ~0.1-0.2% of price, so 10 ATRs is a ~1-2% stop. The study ships 28.2 (its pick,
+      unrounded): wide again — most positions are closed by the session end, not the stop.
+    value: 28.211491131617
+    search: { type: float, low: 1.0, high: 40.0, log: true }
+  direction:
+    doc: long | short | both. Ships both; the grid runs each side alone. Not searched.
+    value: both
+    grid: [long, short, both]
+  max_positions:
+    doc: >-
+      Ten equal slots for ten names — one per stock, so the slots never bind and the
+      relative-strength admission below is inert. Never searched (a risk decision).
+    value: 10
+  rs_window:
+    doc: >-
+      Relative-strength lookback (minutes) ranking starts that compete for a slot — inert
+      while every name has its own slot. One session.
+    value: 390
+  rs_skip:
+    doc: Most recent minutes left out of the relative strength. Inert here (see rs_window).
+    value: 30
+  skip_open:
+    doc: >-
+      No starts in the first N minutes of a session: the opening range is still forming and
+      every early bar trivially breaks a channel built across the overnight gap.
+    value: 15
+  skip_close:
+    doc: No starts in the last N minutes of a session (closing-auction noise).
+    value: 15
+  eod_exit:
+    doc: >-
+      true = flat before each session's final bar, nothing held overnight (a pure intraday
+      book). false = hold across the close — the minute-ATR stop keeps trailing next session,
+      and the overnight gap (where these names made all their money) is in the position.
+      Searched, and both sides of the grid.
+    value: true
+    search: { type: categorical, choices: [true, false] }
+    grid: [true, false]
