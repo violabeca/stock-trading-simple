@@ -1,0 +1,147 @@
+# ===========================================================================
+# quality_junk — quality minus junk, long/short, beta-neutral (STRATEGY_OVERVIEW.md §6 proposal 4,
+# 2026-10-22). Evaluated in strategies/proposals_lab (lab.py) under its mandatory protocol; the
+# numbers and decisions are in RESEARCH_LOG.md. The values below are the pre-registered
+# literature defaults (U0). Verdict: no edge. Round 2 (lab v2, RESEARCH_LOG.md §13) adopted a
+# re-tuned final candidate, TRv2, by margins inside the noise; it is kept as overrides, not
+# shipped here, so every saved label run with '{}' (U0, U0v2) stays reproducible:
+#   {"w_prof": 1.0, "vol_window": 189, "q_in": 0.9, "q_out": 0.75, "slots": 15,
+#    "rebalance": "month", "beta_window": 252, "max_size": 3.0}
+# ===========================================================================
+
+data:
+  universe: Liquid500      # the headless default; the lab trades its own rolling point-in-time
+                           # universes (top 500, names 501-1000, ...) re-formed every 6 months
+  bar: 1d
+  start: "2015-01-01"      # 252-bar volatility + 126-bar beta need ~1 year before scoring
+  end: null
+  session: regular
+  max_symbols: 500
+  features: [fund_gp_ttm, fund_assets, fund_ni_ttm, fund_equity, short_interest, fund_shares]
+                           # the lab adds `sector` to every panel; without it the profitability
+                           # sleeve is ranked across all names (one group)
+
+optuna:
+  study: quality-junk-v1   # the lab's tuner keeps its own journals (var/proposals_lab/studies)
+  sampler: tpe
+  seed: 42
+  n_trials: 1              # nothing ships tuned (RESEARCH_LOG.md)
+  objectives: [alpha_cagr] # a beta-neutral book: excess over a fully invested basket is
+                           # unreachable by construction
+  score_from: "2016-07-01"
+  min_trades_per_year: 20
+
+backtest:
+  fill: open               # market-on-open orders
+  order_notional: 1000     # a $40k account of 40 slots (20 a side): each order ~$1,000
+
+params:
+  w_prof:
+    doc: >-
+      Weight of the profitability rank in the composite: gross profit TTM / total assets, or net
+      income TTM / equity where gross profit is missing (banks), ranked within sector.
+    value: 1.0
+    search: { type: float, low: 0.0, high: 2.0, step: 0.25 }
+  w_safe:
+    doc: >-
+      Weight of the safety rank: minus the vol_window-bar volatility of daily returns (or minus
+      beta, `safety: beta`). The numeraire of the composite; not searched.
+    value: 1.0
+  vol_window:
+    doc: Bars of daily returns behind the safety measure (half of them required).
+    value: 252
+    search: { type: int, low: 63, high: 504, step: 63 }
+  safety:
+    doc: >-
+      vol | beta. "beta" ranks minus the vol_window-bar beta to the equal-weight eligible names
+      (betting against beta) instead of minus volatility.
+    value: vol
+  safe_by_sector:
+    doc: >-
+      Rank the safety measure within sector too (true), so the whole composite is sector-neutral;
+      false (the default) ranks volatility across all eligible names, as the low-volatility
+      literature does.
+    value: false
+  w_growth:
+    doc: >-
+      Weight of a third sleeve, profitability growth (QMJ's growth dimension): the change in the
+      name's own profitability ratio over growth_window bars, ranked within sector x measure like
+      profitability; a name without a year of history sits at the neutral 0.5. 0 = off.
+    value: 0.0
+  growth_window:
+    doc: Bars over which profitability growth is measured (252 = four quarters).
+    value: 252
+  q_in:
+    doc: Long entry rank (top tenth); the short side enters at 1 - q_in.
+    value: 0.9
+    search: { type: float, low: 0.8, high: 0.95, step: 0.05 }
+  q_out:
+    doc: Long exit rank (the hysteresis band); the short side exits above 1 - q_out.
+    value: 0.8
+    search: { type: float, low: 0.6, high: 0.85, step: 0.05 }
+  slots:
+    doc: Positions per side.
+    value: 20
+    search: { type: int, low: 10, high: 40, step: 5 }
+  rebalance:
+    doc: month | quarter — the decision bars (last session of each month / quarter).
+    value: month
+    search: { type: categorical, choices: [month, quarter] }
+  gross:
+    doc: >-
+      Long plus short exposure as a share of the book at entry. The engine locks short proceeds,
+      so no order can take gross above ~100%; 0.98 leaves headroom for fees. Held positions then
+      drift (realized gross averaged 0.99 in the lab, at most 1.31).
+    value: 0.98
+  long_share:
+    doc: The long side's share of gross before beta sizing (0.5 = equal slots a side).
+    value: 0.5
+  sides:
+    doc: both | long | short.
+    value: both
+  sizing:
+    doc: >-
+      beta | equal. "beta" scales a slot at entry by the median beta / the name's beta (between
+      1/max_size and max_size), frozen while held: low-beta longs bigger, high-beta shorts smaller.
+    value: beta
+  beta_window:
+    doc: Bars of the trailing beta (to the equal-weight eligible names) that beta sizing reads.
+    value: 126
+    search: { type: int, low: 63, high: 252, step: 63 }
+  max_size:
+    doc: Bounds of beta sizing (1.0 = equal slots).
+    value: 1.5
+    search: { type: float, low: 1.0, high: 3.0, step: 0.25 }
+  short_stop:
+    doc: >-
+      The squeeze stop (daily): a short whose close rises this far above its entry close is bought
+      back and not shorted again until its rank has left the short zone (informed_flow_ls_p1 v6).
+    value: 1.0
+  short_max_si:
+    doc: >-
+      Short interest / shares outstanding above which a name is never shorted; a held short
+      reaching it is bought back (daily).
+    value: 0.3
+  si_mid:
+    doc: Crowding tier for the borrow fee (short interest / shares outstanding).
+    value: 0.1
+  si_high:
+    doc: Upper crowding tier for the borrow fee.
+    value: 0.2
+  borrow_gc:
+    doc: >-
+      Yearly borrow fee below si_mid and wherever there is no short-interest data (before 2018).
+      Assumptions on the conservative side of the literature (D'Avolio 2002).
+    value: 0.005
+  borrow_mid:
+    doc: Yearly borrow fee between si_mid and si_high.
+    value: 0.03
+  borrow_high:
+    doc: Yearly borrow fee above si_high (up to short_max_si).
+    value: 0.1
+  min_price:
+    doc: Minimum close for a name to be ranked.
+    value: 5.0
+  retrim_k:
+    doc: A long that grows to k x its slot is trimmed back (the engine's cap; longs only).
+    value: 2.0

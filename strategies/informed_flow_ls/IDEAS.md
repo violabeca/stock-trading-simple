@@ -174,6 +174,16 @@ it in-sample (informed_flow's lesson), so every change is judged like this:
   names 501-1000 (−21 pts in 2026-H2 at its tuned weight). One year of option data cannot separate
   signal from luck. Revisit after six months of paper trading add history; pre-register the weight
   (1.0, not the tuned 3.75) and judge it on names 501-1000 first.
+  Anatomy (2026-10-22, `x06_explain.py` / `x06_attr.py` in the session scratchpad): the whole
+  effect is the option year (Oct 2025 → Oct 2026). Top 500 +17 to +20 pts/yr (10-day-block t 1.8-2.0),
+  names 501-1000 −6 to −12 (t −0.8 to −1.0), 1001-1500 +4 to +9 (t < 1). Top-500 gain: 10 names
+  give more than all of it (MU +5.0 held long while put-heavy; call-heavy ACHR / WULF / CIFR / RKT /
+  SMR avoided; RGTI −4.0 the biggest cost); positive in 9 of 13 months. The nested "+4.0, P 0.99"
+  is not separate evidence: the 2025-07 fold's training window had NO option data (its pick came
+  from noise), and any positive weight wins on the top 500 that year. Even with no data the
+  sleeve moves ~2% of ranks (floating-point ties at the bands): ±1-1.5 pts a half-year is noise.
+  Longer history: OCC customer put/call VOLUME per stock (rolling 2 years, free; a flow proxy for
+  the OI ratio) or paid OI history (MarketData paid plans, ORATS, OptionMetrics).
 - **Volatility-scaled short sizes** (x09): +0.9 / +1.2 tuned, T2 −0.1, PBO 0.63, worst period
   −32%. A near miss; worth one re-read on new data, not a re-tune.
 - **High-beta shorts first** (x01): the nested tuning found +2.9 (P 0.93) but its consensus

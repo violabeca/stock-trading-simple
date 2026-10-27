@@ -29,7 +29,9 @@ optuna:
   # buy-and-hold of the SAME panel (backtest.benchmark). A long-only momentum book in a
   # rising market earns a positive absolute Sharpe just by being invested, so only the
   # benchmark-relative pair separates stock selection from market exposure.
-  study: turnover-momentum-1d-v3   # bump whenever a `search:` bound, the objective or the
+  # v4: engine proposals #46-#52 (2026-10-24) change portfolio-mode fills
+  # (call order, working orders, borrow deferral, NYSE sessions); turnover-momentum-1d-v3 was the old engine.
+  study: turnover-momentum-1d-v4   # bump whenever a `search:` bound, the objective or the
                                    # execution model changes — a journal that mixes two
                                    # spaces cannot be read. v2: engine objectives changed
                                    # (now excess_cagr ↑ / volatility ↓; v1 is refused).

@@ -60,7 +60,14 @@ git ls-files '*.ipynb' | xargs python3 scripts/nbclean.py   # clear notebook out
   `init_cash` in its own account. Returning a `weights` frame (target fraction of the
   book per symbol) runs **portfolio mode**: ONE shared cash account of `init_cash`
   *total*, so a buy must be funded by a sell (`from_orders`, `group_by=True`,
-  `cash_sharing=True`, `call_seq="auto"`). Per-symbol is right for a per-symbol signal
+  `cash_sharing=True`). Within a bar the orders run in a fixed order, `backtest._call_order`:
+  long cuts, short covers, new shorts, long buys. vectorbt's `call_seq="auto"` ran a new short
+  before the cover that frees its collateral and starved it (proposal #46, 2026-10-24). An
+  order that the free cash refused or part-filled keeps working on later bars until it fills
+  (`backtest._working_orders`, #47). Before, it was lost: a cover refused at zero free cash
+  left a squeezed short open for 30-46 bars (Wayfair 2020, GME 2024). A run that still holds
+  unfilled orders warns (#49): a full long/short book needs gross ≤ ~0.90. The benchmark
+  sends each order once (`working=False`). Per-symbol is right for a per-symbol signal
   and **fatal for a cross-sectional ranker**: cash attached to a name it is flat in sits
   idle, so a strategy holding 40 of 100 names is structurally ~30% invested against a
   100%-invested benchmark and cannot beat it however well it picks. (`informed_flow`
@@ -535,3 +542,24 @@ test, adapt a strategy notebook, then pass:
   (SEC & FINRA rate-limit per IP), like the IBKR rule.
 - Alt-data features align to the panel by UTC session date and are `shift(1)`
   lagged in `features.py` (conservative point-in-time); this supports daily bars.
+- **A US panel keeps NYSE sessions only** (`data.us_sessions_only`, proposal #50,
+  2026-10-24).
+  - The calendar is SPY's stored daily bars. A row is dropped only when SPY has no bar that
+    day and fewer than half the panel's US names are priced, so a gap in SPY's own history
+    is safe.
+  - Before this, listings that also trade abroad (ALC, CFR) put US holidays into the union
+    calendar: rows on which no US stock was priced, where a book exited everything.
+- **Sector SPDRs XLE XLF XLI XLK XLV XLY were typed `equity`** in the shared `securities`
+  table. They sat in point-in-time "top 500 stocks" sets from 2024-H2, and were retyped `etf`
+  on 2026-10-24 (#51).
+  - `upsert_securities` never overwrites `security_type`, so a registration cannot undo the
+    fix.
+  - A fresh DB registers new symbols as `equity`, so check new ETFs there.
+- **Adjusted daily bars are a basis, not a fact** (#52). yfinance rescales a symbol's whole
+  history after every dividend, and IBKR stores `adj_close = close`.
+  - `tsim backfill` checks each daily refresh against the stored rows it meets
+    (`db.adjustment_splice`).
+  - A yfinance refresh whose basis moved re-downloads the symbol's whole stored span.
+  - An IBKR daily refresh that would splice onto adjusted history is refused for that
+    symbol.
+  - SPY's stored series once jumped +3.43% on 2023-10-17 this way.

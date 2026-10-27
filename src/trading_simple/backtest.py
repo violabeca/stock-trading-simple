@@ -31,7 +31,10 @@ Two execution models, chosen by what a strategy's ``signals()`` returns:
   invested and cannot beat a fully-invested benchmark however good its selection.
   Held names drift untouched, but a strategy may add a ``retrim_k`` **concentration
   cap** (:func:`_retrim_loop`) so a runaway winner is trimmed back to its slot rather
-  than left to dominate the book. See :func:`_run_portfolio`.
+  than left to dominate the book. Within a bar, sales and covers run before the new
+  shorts and buys they fund (:func:`_call_order`), and an order the cash could not fill
+  keeps working on the following bars until it does (:func:`_working_orders`). See
+  :func:`_run_portfolio`.
 * **Cash-shared signals** (``entries``/``exits`` + ``cash_frac``) — the wallet
   variant of the signal path: ONE shared account of ``init_cash`` *total*, and
   each entry deploys ``cash_frac`` of the currently *free* cash, so the book can
@@ -61,6 +64,7 @@ calls.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import replace
 from itertools import product
 from typing import TYPE_CHECKING
@@ -672,7 +676,12 @@ def _borrow_fees(targets: pd.DataFrame, borrow, fees: float) -> pd.DataFrame:
 
     Sizes are read from the TARGETS (what each order asks for), so a short re-sized while
     open is charged at its size at the buy-back — exact for books that open a short once and
-    buy it back whole (event-driven rotation), approximate otherwise.
+    buy it back whole (event-driven rotation), approximate otherwise. A re-trim that buys back
+    less than a quarter of the short does NOT trigger the charge (engine proposal #48): the
+    surcharge is a fee FRACTION ``accrued × |w| / |x − w|`` of the order, which a hair-sized
+    re-trim turns into most of the order's value (etf_trend's review measured borrow charged
+    4-5× over what was owed); its accrual carries on to the next substantial buy-back or the
+    end of the window instead.
 
     Args:
         targets: Masked target weights (:func:`rotation_targets`): NaN = no order.
@@ -698,7 +707,8 @@ def _borrow_fees(targets: pd.DataFrame, borrow, fees: float) -> pd.DataFrame:
         w, since, opened = 0.0, 0, None                     # in-force weight, last charge
         for k in orders:
             x = t[k, j]
-            if w < 0 and x > w:                             # buys (part of) the short back
+            small = x < 0 and (x - w) < 0.25 * (-w)         # a hair re-trim of the short
+            if w < 0 and x > w and not small:               # buys (part of) the short back
                 out[k, j] += (accrued[k, j] - accrued[since, j]) * (-w) / (x - w)
                 since = k
             if x < 0 and w >= 0:                            # a new short starts here
@@ -710,9 +720,196 @@ def _borrow_fees(targets: pd.DataFrame, borrow, fees: float) -> pd.DataFrame:
     return pd.DataFrame(fees + out, index=index, columns=targets.columns)
 
 
+def _call_order(targets: pd.DataFrame, cats: np.ndarray | None = None,
+                groups: int = 1) -> np.ndarray:
+    """Per-bar execution order (a vectorbt ``call_seq`` array) for a portfolio-mode book.
+
+    Each order is classed against the name's IN-FORCE target before the bar (its last emitted
+    target): 0 a long cut or exit, 1 a short cover or cut, 2 a new or larger short (a long
+    flipped short included), 3 a long bought or added (a short flipped long included); names
+    with no order run last. Sales and covers free the cash that new shorts need as collateral
+    and longs spend (engine proposal #46). vectorbt's ``call_seq="auto"`` sorts by order value
+    and runs a new short (a sale) BEFORE the cover (a buy) that would release locked cash, so on
+    a full book it refused or part-filled the new short.
+
+    Args:
+        targets: Masked target weights (NaN = no order); with ``groups > 1``, ``groups`` equal
+            consecutive column blocks (a sweep's per-combo books).
+        cats: Optional class per cell (-1 = derive it), for a re-sent order that repeats an
+            earlier order and so keeps that order's class (:func:`_working_orders`).
+        groups: Number of equal consecutive column groups, each its own book.
+
+    Returns:
+        ``call_seq[row, k]`` = the position, inside its group, of the column called k-th
+        (vectorbt's convention).
+    """
+    t = targets.to_numpy(dtype=float)
+    prev = pd.DataFrame(t).ffill().shift(1).fillna(0.0).to_numpy()
+    has = ~np.isnan(t)
+    x = np.where(has, t, prev)
+    cat = np.full(t.shape, 4, dtype=np.int64)
+    cat[has & (x > 0) & (x > prev)] = 3
+    cat[has & (x < 0) & (x < prev)] = 2
+    cat[has & (prev < 0) & (x >= prev) & (x <= 0)] = 1
+    cat[has & (prev > 0) & (x <= prev) & (x >= 0)] = 0
+    if cats is not None:
+        cat = np.where(cats >= 0, cats, cat)
+    width = t.shape[1] // groups
+    return np.concatenate([np.argsort(cat[:, g * width:(g + 1) * width], axis=1, kind="stable")
+                           for g in range(groups)], axis=1)
+
+
+#: An order counts as filled when it executed at least this share of the shares it asked
+#: for (the rest is fees, slippage and the valuation gap between the open and the order).
+_FILL_SHARE = 0.98
+#: Backstop on :func:`_working_orders` passes. Each pass resolves every unfilled order in one
+#: re-simulation (an order keeps working on every later priced bar until it fills), so a book
+#: converges in two or three; the cap only guards a cascade that never settles.
+_MAX_WORKING_ITERS = 12
+
+
+def _unfilled(pf, targets: np.ndarray, price: np.ndarray, value_px: np.ndarray, *,
+              init_cash: float, groups: int, granularity: float | None):
+    """The emitted orders a run refused or part-filled, read from its positions (no order log).
+
+    vectorbt's order log holds a record for EVERY cell of the frame (600k records for a
+    1,200-bar, 500-name book), so the requested shares are rebuilt instead: target weight ×
+    the group's value at the bar's open ÷ the fill price, against the shares the bar actually
+    added. An order on an unpriced bar (vectorbt drops it) is not counted.
+
+    Returns:
+        ``(rows, cols, cats)`` of every order that executed less than :data:`_FILL_SHARE` of
+        its shares (and more than one ``granularity`` short of them), with each order's class
+        for :func:`_call_order`: 0 long cut, 1 short cover, 2 new or larger short, 3 long buy.
+    """
+    assets = pf.assets().to_numpy(dtype=float)
+    cash = np.asarray(pf.cash(), dtype=float)
+    cash = cash[:, None] if cash.ndim == 1 else cash
+    n, m = assets.shape
+    prev = np.vstack([np.zeros((1, m)), assets[:-1]])
+    prev_cash = np.vstack([np.full((1, cash.shape[1]), float(init_cash)), cash[:-1]])
+    held = np.nan_to_num(prev * value_px).reshape(n, groups, m // groups).sum(axis=2)
+    book = prev_cash + held                                    # each group's value at the open
+    rows, cols = np.nonzero(~np.isnan(targets) & np.isfinite(price))
+    group = cols // (m // groups)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        want = targets[rows, cols] * book[rows, group] / price[rows, cols]
+    need = want - prev[rows, cols]
+    got = assets[rows, cols] - prev[rows, cols]
+    big = np.abs(need) * price[rows, cols] > 1e-4 * np.abs(book[rows, group])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        short = (got / need < _FILL_SHARE) & (np.abs(need - got) > (granularity or 0.0))
+    bad = big & short & np.isfinite(need)
+    rows, cols, need, p0 = rows[bad], cols[bad], need[bad], prev[rows[bad], cols[bad]]
+    cats = np.where(need > 0, np.where(p0 < 0, 1, 3), np.where(p0 > 0, 0, 2))
+    return rows, cols, cats
+
+
+def _working_orders(build, targets: pd.DataFrame, price: pd.DataFrame, *, init_cash: float,
+                    groups: int = 1, granularity: float | None = None,
+                    report: dict | None = None):
+    """Run a book with every refused or part-filled order kept working until it fills.
+
+    :func:`rotation_targets` emits a target only when it changes, so an order vectorbt
+    refuses or part-fills (no free cash under ``lock_cash``: a cover of a short that more than
+    doubled, a buy on a fully invested book) used to be lost: the book held what the strategy
+    had exited, or missed what it wanted, until the name's next signal change (Wayfair 2020:
+    46 bars; GME 2024: 32 bars; engine proposal #47). Now each such order is re-sent on every
+    later priced bar up to the name's next own order, the way a working order stays on a
+    broker's book, and dropped after the bar it fills on. A re-sent order keeps the class of
+    the order it repeats in :func:`_call_order`, and ``build`` receives the frame its borrow is
+    charged on: each chain's LAST attempt, the one that completes it.
+
+    Args:
+        build: ``(targets, cats, fee_targets) -> vectorbt.Portfolio``: one ``from_orders`` pass.
+        targets: The masked target frame (:func:`rotation_targets`, perhaps with trims).
+        price: The fill price frame (``price`` of ``from_orders``), aligned to ``targets``.
+        init_cash: Each group's starting cash.
+        groups: Equal consecutive column groups (a sweep's per-combo books).
+        granularity: ``size_granularity`` of the run (1.0 = whole shares), so a remainder
+            smaller than one share is not chased.
+        report: Given, the number of orders still unfilled is stored as ``report["stuck"]``
+            and nothing is warned: the caller warns once about its FINAL run (the retrim loop
+            simulates several times, and only its last run is the book).
+
+    Returns:
+        The final ``vectorbt.Portfolio``. Without ``report``, a run that still holds unfilled
+        orders when the loop stops warns (:func:`_warn_unfilled`, engine proposal #49).
+    """
+    cur = targets.to_numpy(dtype=float).copy()
+    own = ~np.isnan(cur)                                       # the strategy's own orders
+    px = price.to_numpy(dtype=float)
+    value_px = pd.DataFrame(px).ffill().to_numpy()
+    cats = np.full(cur.shape, -1, dtype=np.int64)
+    # (row, col) of a failed order -> [every priced row up to the name's next own order,
+    # the number of those rows currently re-sent]
+    chains: dict[tuple[int, int], list] = {}
+
+    def frames():
+        fee = cur.copy()
+        for (r, c), (rows, used) in chains.items():
+            fee[r, c] = np.nan
+            fee[rows[:used - 1], c] = np.nan
+        wrap = lambda a: pd.DataFrame(a, index=targets.index, columns=targets.columns)  # noqa: E731
+        return wrap(cur), cats, wrap(fee)
+
+    def failures(pf):
+        rows, cols, kinds = _unfilled(pf, cur, px, value_px, init_cash=init_cash,
+                                      groups=groups, granularity=granularity)
+        return set(zip(rows.tolist(), cols.tolist(), strict=True)), rows, cols, kinds
+
+    pf = build(*frames())
+    for _ in range(_MAX_WORKING_ITERS):
+        failed, rows, cols, kinds = failures(pf)
+        changed = False
+        for (r, c), entry in chains.items():        # end each chain on the bar it fills
+            full, used = entry
+            filled = [k for k in range(used) if (int(full[k]), c) not in failed]
+            want = filled[0] + 1 if filled else len(full)
+            if want != used:
+                cur[full[want:], c], cats[full[want:], c] = np.nan, -1
+                cur[full[:want], c], cats[full[:want], c] = cur[r, c], cats[full[0], c]
+                entry[1] = want
+                changed = True
+        working = {(int(row), c) for (_, c), (full, used) in chains.items()
+                   for row in full[:used]}
+        for r, c, kind in zip(rows.tolist(), cols.tolist(), kinds.tolist(), strict=True):
+            if (r, c) in chains or (r, c) in working or r + 1 >= len(cur):
+                continue
+            nxt = np.flatnonzero(own[r + 1:, c])
+            end = r + 1 + (int(nxt[0]) if len(nxt) else len(cur) - r - 1)
+            full = r + 1 + np.flatnonzero(np.isfinite(px[r + 1:end, c]))
+            if not len(full):
+                continue
+            cur[full, c], cats[full, c] = cur[r, c], kind
+            chains[(r, c)] = [full, len(full)]
+            changed = True
+        if not changed:
+            break
+        pf = build(*frames())
+    failed, _, _, _ = failures(pf)
+    working = {(int(row), c) for (_, c), (full, used) in chains.items() for row in full[:used]}
+    stuck = sum(all((int(row), c) in failed for row in full[:used])
+                for (_, c), (full, used) in chains.items())
+    stuck += sum(cell not in chains and cell not in working for cell in failed)
+    if report is None:
+        _warn_unfilled(stuck)
+    else:
+        report["stuck"] = stuck
+    return pf
+
+
+def _warn_unfilled(stuck: int) -> None:
+    """Warn that a book ran below its targets (engine proposal #49) if an order stayed unfilled."""
+    if stuck:
+        warnings.warn(f"{stuck} portfolio orders stayed unfilled (lock_cash left no free "
+                      "cash): the book ran below its targets. A full long/short book needs "
+                      "gross <= ~0.90 (engine proposal #49).", RuntimeWarning, stacklevel=4)
+
+
 def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, price: pd.DataFrame, fees: float,
                    slippage, init_cash: float, retrim_k: float | None = None,
-                   borrow=None, size_granularity: float | None = None):
+                   borrow=None, size_granularity: float | None = None, working: bool = True):
     """One shared cash account rebalanced to target weights — buying requires selling.
 
     The ``from_orders`` call site. ``from_signals`` cannot do this: it rejects
@@ -745,6 +942,9 @@ def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, price: pd.DataFrame, 
         size_granularity: ``1.0`` rounds every order down to whole shares, so a name priced
             above its slot is never bought and each slot's remainder waits in cash;
             ``None`` (default) trades fractional shares.
+        working: Keep a refused or part-filled order working on the following bars until it
+            fills (:func:`_working_orders`, the default). ``False`` sends every order once:
+            :func:`benchmark`, whose late listings buy with the cash they find.
 
     Returns:
         A grouped, cash-sharing ``vectorbt.Portfolio``.
@@ -753,24 +953,34 @@ def _run_portfolio(panel: Panel, weights: pd.DataFrame, *, price: pd.DataFrame, 
 
     whole = {} if size_granularity is None else {"size_granularity": size_granularity}
     targets = rotation_targets(weights)
-    if borrow is not None:
-        fees = _borrow_fees(targets, borrow, fees)
 
-    def build(targets):
+    def build(targets, cats=None, fee_targets=None):
         return vbt.Portfolio.from_orders(
-            panel.close, size=targets, size_type="targetpercent",
-            price=price, fees=fees, slippage=slippage, init_cash=init_cash, **whole,
+            panel.close, size=targets, size_type="targetpercent", price=price,
+            fees=fees if borrow is None else _borrow_fees(
+                targets if fee_targets is None else fee_targets, borrow, fees),
+            slippage=slippage, init_cash=init_cash, **whole,
             group_by=True, cash_sharing=True, lock_cash=True,
-            # MANDATORY, not cosmetic: sorts sells before buys within a bar. Without it a
-            # buy gets partially rejected because the sell funding it has not executed yet,
-            # silently leaving cash idle — the exact bug this whole mode exists to remove.
-            call_seq="auto",
+            # MANDATORY, not cosmetic: within a bar, sales and covers run before the new
+            # shorts and buys they fund (_call_order, engine proposal #46). Without an order
+            # a buy is rejected because the sale funding it has not executed yet, and under
+            # lock_cash a new short is starved by the cover that would release its collateral.
+            call_seq=_call_order(targets, cats),
             freq=panel.freq,
         )
 
-    if retrim_k is None:
-        return build(targets)
-    return _retrim_loop(build, targets, weights, retrim_k * weights)
+    report: dict = {}
+
+    def simulate(targets):
+        if not working:
+            return build(targets)
+        return _working_orders(build, targets, price.reindex_like(targets),
+                               init_cash=init_cash, granularity=size_granularity, report=report)
+
+    pf = (simulate(targets) if retrim_k is None
+          else _retrim_loop(simulate, targets, weights, retrim_k * weights))
+    _warn_unfilled(report.get("stuck", 0))           # the final run's, not a retrim pass's
+    return pf
 
 
 def _score_window(panel: Panel, signals: dict, start) -> tuple[Panel, dict]:
@@ -905,9 +1115,13 @@ def benchmark(panel: Panel, *, fees: float, slippage: float,
         # With the mask, rotation_targets sees NaN -> 1/N on the first valid bar and
         # buys the name at its listing, which is what buy-and-hold actually means.
         weights = weights.where(panel.close.notna())
-        pf = run(panel, {WEIGHTS_KEY: weights},   # constant weights -> a name's listing
-                 fees=fees, slippage=slippage,    # bar is its only rotation: buy + hold
-                 fill=fill)
+        configure()
+        price, slip = fill_prices(panel, slippage, fill)
+        # Constant weights -> a name's listing bar is its only rotation: buy + hold. Sent
+        # once (working=False): a late listing buys with the cash it finds, never by
+        # waiting for cash a buy-and-hold book does not free.
+        pf = _run_portfolio(panel, weights, price=price, fees=fees, slippage=slip,
+                            init_cash=10_000.0, working=False)
         curve = equity_curve(pf)["value"].pct_change().fillna(0.0)
         if len(_BENCHMARK) > 16:                    # bounded: walk-forward makes many panels
             _BENCHMARK.clear()
@@ -1073,18 +1287,27 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
             weights_stacked = stack([s[WEIGHTS_KEY] for s in combo_signals])
             targets = stack([rotation_targets(s[WEIGHTS_KEY]) for s in combo_signals])
 
-            def build(t, slip=slip):
+            books = len(ids)
+
+            def build(t, cats=None, fee_targets=None, slip=slip, n=books):
                 return vbt.Portfolio.from_orders(
                     tile(panel.close), size=t, size_type="targetpercent",
                     price=tile(price), fees=fees, slippage=slip,
                     init_cash=init_cash, group_by="combo", cash_sharing=True,
                     lock_cash=True,               # short proceeds never fund a long
-                    call_seq="auto", freq=panel.freq,
+                    call_seq=_call_order(t, cats, groups=n),   # as in _run_portfolio
+                    freq=panel.freq,
                 )
+
+            report: dict = {}
+
+            def simulate(t, build=build, n=books, report=report):
+                return _working_orders(build, t, tile(price), init_cash=init_cash, groups=n,
+                                       report=report)
 
             retrim_k = combo_signals[0].get(RETRIM_K_KEY)
             if retrim_k is None:
-                pf = build(targets)
+                pf = simulate(targets)
             else:
                 # Same concentration cap as _run_portfolio, per combo. retrim_k is a fixed
                 # policy (never swept), so every combo shares it — but a per-column threshold
@@ -1093,8 +1316,9 @@ def sweep(strategy: LoadedStrategy, panel: Panel, grid: list[dict], *,
                 k_per_col = np.repeat(
                     [float(s[RETRIM_K_KEY]) if s.get(RETRIM_K_KEY) is not None else np.nan
                      for s in combo_signals], len(columns))
-                pf = _retrim_loop(build, targets, weights_stacked,
+                pf = _retrim_loop(simulate, targets, weights_stacked,
                                   weights_stacked.mul(k_per_col, axis=1))
+            _warn_unfilled(report.get("stuck", 0))
             # A one-combo chunk has one group and cannot be indexed into further.
             rows += [{**grid[cid], **_grouped_stats(pf[cid] if len(ids) > 1 else pf)}
                      for cid in ids]

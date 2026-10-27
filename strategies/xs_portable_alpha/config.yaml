@@ -1,0 +1,65 @@
+# ===========================================================================
+# xs_portable_alpha — the proposals lab's cross-strategy round (2026-10-23), the absolute-
+# performance design: a constant SPY core (0.45) plus the SI + MOM market-neutral overlay of
+# xs_three_book (sleeves si,mom at 0.225 each), in one cash account at a nominal gross of 0.90.
+# Every value below is the pre-registered U0 (RESEARCH_LOG.md §0): nothing is searched. The lab
+# runs every label with --hedge (SPY merged into every panel: the core is that column), and the
+# lab's verdict with --not-neutral (beta ~0.4 by design).
+# ===========================================================================
+
+data:
+  universe: Liquid500      # the headless default; the lab trades its rolling point-in-time
+                           # top 500 (T1) and names 501-1000 (T2), each half-year re-formed.
+                           # SPY must be a column of the panel (the lab's --hedge): Liquid500
+                           # has no SPY, so a headless run refuses (signals() raises)
+  bar: 1d
+  start: "2015-01-01"      # warm-up: MOM's 252-bar beta + 12-1 formation, I1's 252-bar median
+  end: null
+  session: regular
+  max_symbols: 500
+  features: [short_interest, fund_shares]   # SI ranks days-to-cover; MOM reads both for borrow
+
+optuna:
+  study: xs-portable-alpha-v1   # nothing is searched: the lab's labels are the experiments
+  sampler: tpe
+  seed: 42
+  n_trials: 1
+  objectives: [alpha_cagr] # the design's risk-adjusted bars read alpha (net of the core's own
+                           # alpha, research.py); its absolute bars read CAGR
+  score_from: "2018-07-01" # short interest starts 2018-01 (E0 has none)
+  min_trades_per_year: 20
+
+backtest:
+  fill: open               # market-on-open orders, as every component (SPY: the lab's SPY
+                           # column has open = close, so the core fills at the fill bar's close)
+  # The declared account is about $150k: an SI slot is 0.75% (~$1,125), a MOM slot 0.56% x its
+  # volatility scale (~$850 at full scale). 2x costs bound a $75k account (failure mode 7).
+  order_notional: 1000
+
+params:
+  core:
+    doc: >-
+      SPY's target weight in the account: an equal split of the 0.90 gross between beta and
+      alpha, fixed a priori and never tuned. The engine buys it on each period's first bar and
+      holds it (a constant target is never re-sent). The c-frontier labels F15 / F30 / F60 (0.15 /
+      0.30 / 0.60) are information only, never adopted. 0 = the overlay alone at the full gross
+      (xs_three_book's C_core).
+    value: 0.45
+  core_vol:
+    doc: >-
+      Iteration I1, a falling-market core: SPY's weight is core x m, m = 1 / 0.5 / 0 as SPY's
+      21-session realized variance at the month-end close is at most its trailing 252-session
+      median / at most twice it / above; decided at month ends, applied from the next open; the
+      freed gross sits in cash and the overlay is never re-traded. false = U0.
+    value: false
+  sleeves:
+    doc: >-
+      The overlay's books, an xs_three_book sleeves string: si (informed_flow_ls_p1, lab v6_si)
+      and mom (resid_momentum, U0v2), each at (gross - core) / 2 of the account, netted per name.
+    value: si,mom
+  gross:
+    doc: >-
+      Nominal gross of the whole account (core included). Shorts lock cash, so a long/short
+      account cannot exceed ~100% gross; 0.90 leaves the >= 10% headroom the lab's runner needs
+      (resid_momentum R2.1). The overlay runs at gross - core = 0.45.
+    value: 0.9

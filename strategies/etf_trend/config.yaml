@@ -1,0 +1,119 @@
+# ===========================================================================
+# etf_trend — cross-asset time-series momentum on ETFs (proposal 7 of STRATEGY_OVERVIEW.md §6,
+# "also considered"; research folder of the proposals lab, 2026-10-22). Evaluated by
+# research.py on its own ETF panel and half-year periods (TRAIN 2004-15, VALID 2016-26, LOCKED
+# 2000-03); RESEARCH_LOG.md holds the pre-registration and every result. The values below are
+# U0, the literature default (Moskowitz-Ooi-Pedersen 2012): nothing is tuned unless the log
+# says it was adopted.
+# ===========================================================================
+
+data:
+  universe: null           # not a named universe: research.py loads these ETFs itself
+  symbols: [SPY, QQQ, IWM, EFA, EEM, XLB, XLE, XLF, XLI, XLK, XLP, XLU, XLV, XLY, VNQ,
+            TLT, IEF, LQD, HYG, GLD, SLV, DBC, UUP, SHY]
+  bar: 1d
+  start: "1993-01-01"      # SPY's inception; each asset joins after 12 months of history
+  end: "2026-10-16"
+  session: regular
+
+optuna:
+  study: etf-trend-v1      # research.py tune: TPE on the TRAIN half-years, robust objective
+                           # (mean - 1/2 sd of the per-period alphas vs SPY)
+  sampler: tpe
+  seed: 42
+  n_trials: 120
+
+backtest:
+  fill: open               # decided at the close, filled at the next open (market-on-open)
+  order_notional: 1000     # the lab's common order size (a $30k account in ~30 slots)
+
+params:
+  lookback:
+    doc: >-
+      Bars of the trailing total return that sets each asset's state (252 = 12 months, the
+      Moskowitz-Ooi-Pedersen default).
+    value: 252
+    search: { type: int, low: 63, high: 378, step: 21 }
+  skip:
+    doc: Bars skipped at the end of the lookback window (0 = up to the decision bar).
+    value: 0
+    search: { type: categorical, choices: [0, 21] }
+  blend:
+    doc: >-
+      Comma-separated lookbacks whose states are averaged, e.g. "21,63,126,252" (a fraction of
+      a position per agreeing horizon); "" = lookback alone.
+    value: ""
+  hurdle:
+    doc: >-
+      cash = an asset is on when its return beats the cash asset's (SHY) over the same window
+      (excess-return TSMOM); zero = when its return is positive. Before SHY exists: zero.
+    value: cash
+  vol_com:
+    doc: Centre of mass (bars) of the EWMA volatility behind the inverse-vol sizes (MOP 60).
+    value: 60
+    search: { type: int, low: 20, high: 120, step: 20 }
+  mode:
+    doc: long_flat (an off asset's budget goes to cash) or long_short (an off asset is shorted).
+    value: long_flat
+  cash:
+    doc: >-
+      The cash asset: holds the unused budget and sets the hurdle (the engine pays 0% on idle
+      cash). "" = idle cash.
+    value: SHY
+  gross:
+    doc: >-
+      Long plus short exposure including the cash asset (at most 1, since shorts lock their
+      proceeds).
+    value: 0.98
+  band:
+    doc: >-
+      A held asset whose state is unchanged keeps its weight unless its new target is more
+      than this (relative) away. A cost guard, not tuned: tiny monthly re-trims really pay the
+      $1 minimum commission, which the engine's fee fraction undercharges.
+    value: 0.25
+  min_change:
+    doc: >-
+      Smallest target change (absolute share of the book, the cash asset's included) that is
+      traded: a smaller one keeps the held weight and a smaller entry is not opened; an exit
+      always trades. A cost guard added in round 2 (2026-10-23 review), not tuned: a hair-sized
+      order pays the real $1 minimum.
+    value: 0.0025
+  offset:
+    doc: >-
+      Trading day of the month the book is decided on (0 = the first; filled at the next open).
+      research.py's noise check moves it to 5 / 10 / 15 (rebalance timing luck).
+    value: 0
+  vol_target:
+    doc: >-
+      Ex-ante annual volatility the risky book is scaled down to at each decision (0 = off;
+      never levers up). From the trailing cov_window-bar covariance.
+    value: 0.0
+  cov_window:
+    doc: Bars of the sample covariance behind vol_target.
+    value: 126
+  budget:
+    doc: >-
+      asset = inverse vol over every live risky asset (naive risk parity); class = each asset
+      class (equity, bond, commodity, currency) an equal share, split by inverse vol inside.
+    value: asset
+  overlay:
+    doc: >-
+      SPY = every equity fund also needs SPY's own trend on (the SPY trend as an overlay on the
+      equity sleeve; long_flat only). "" = off.
+    value: ""
+  borrow:
+    doc: Yearly borrow rate on shorts (liquid ETFs are general collateral, ~0.25-0.5%).
+    value: 0.005
+  min_history:
+    doc: Closes an asset needs before it can be held (252 = the 12 months its signal needs).
+    value: 252
+  rule:
+    doc: >-
+      return = the trailing lookback-bar total return sets the state (MOP); sma = the close
+      against its lookback-bar simple average (Faber's 10-month rule at lookback 210).
+    value: return
+  assets:
+    doc: >-
+      Comma-separated risky ETFs the book may hold ("" = every ETF of the panel but cash).
+      "SPY" = the SPY / cash switch, the SPY trend alone as an equity overlay.
+    value: ""

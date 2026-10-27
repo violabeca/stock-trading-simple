@@ -1036,3 +1036,71 @@ def test_alpha_cagr_is_the_return_after_beta():
     fees, slip = bt.panel_costs(_settings().costs, panel)
     flat_stats = bt.active_stats(pf, panel, fees=fees, slippage=slip, total_return=0.0)
     assert flat_stats["beta"] == 0.0 and flat_stats["alpha_cagr"] == 0.0
+
+
+# --- engine proposals #46, #47, #49 (2026-10-24) ---------------------------------------
+
+def _flat_panel(close: pd.DataFrame) -> Panel:
+    return Panel(close=close, open_=close.copy(), high=close.copy(), low=close.copy(),
+                 volume=pd.DataFrame(1e6, index=close.index, columns=close.columns), bar="1d")
+
+
+def test_call_order_runs_sales_and_covers_before_new_shorts_and_buys():
+    """#46: long cuts, short covers, new shorts, long buys, then names with no order."""
+    idx = pd.date_range("2024-01-01", periods=2, freq="B", tz="UTC")
+    t = pd.DataFrame({"buy": [0.0, 0.3], "short": [0.0, -0.3], "cover": [-0.3, 0.0],
+                      "sell": [0.3, 0.0], "none": [0.1, np.nan]}, index=idx)
+    order = list(t.columns[bt._call_order(t)[1]])
+    assert order == ["sell", "cover", "short", "buy", "none"]
+    two = pd.concat([t, t], axis=1)                       # a sweep: two books side by side
+    seq = bt._call_order(two, groups=2)[1]
+    assert list(seq[:5]) == list(seq[5:]) == list(bt._call_order(t)[1])
+
+
+def test_a_new_short_is_not_starved_by_the_cover_that_funds_it():
+    """#46: a full book covers B and shorts C on the same bar; under call_seq="auto" the new
+    short ran first and was part-filled (~20 of ~500 shares)."""
+    idx = pd.date_range("2024-01-01", periods=4, freq="B", tz="UTC")
+    close = pd.DataFrame({"A": [10.0] * 4, "B": [10, 9, 9, 9.0], "C": [10.0] * 4}, index=idx)
+    w = pd.DataFrame({"A": [0.49] * 4, "B": [-0.49, 0.0, 0.0, 0.0],
+                      "C": [0.0, -0.49, -0.49, -0.49]}, index=idx)
+    pf = bt._run_portfolio(_flat_panel(close), w, price=close, fees=0.0, slippage=0.0,
+                           init_cash=10_000)
+    assert pf.assets()["C"].iloc[-1] == pytest.approx(-0.49 * pf.value().iloc[1] / 10, rel=0.02)
+
+
+def test_a_refused_cover_keeps_working_until_cash_frees_it():
+    """#47: B's short tripled, so its cover needs free cash that a 98%-gross book lacks; the
+    order fills on the next bar, once A's sale frees cash, instead of being lost."""
+    idx = pd.date_range("2024-01-01", periods=6, freq="B", tz="UTC")
+    close = pd.DataFrame({"A": [10.0] * 6, "B": [10, 20, 30, 30, 30, 30.0]}, index=idx)
+    w = pd.DataFrame({"A": [0.49, 0.49, 0.49, 0.0, 0.0, 0.0],
+                      "B": [-0.49, -0.49, 0.0, 0.0, 0.0, 0.0]}, index=idx)
+    kw = dict(price=close, fees=0.0, slippage=0.0, init_cash=10_000)
+    once = bt._run_portfolio(_flat_panel(close), w, working=False, **kw)
+    kept = bt._run_portfolio(_flat_panel(close), w, **kw)
+    assert once.assets()["B"].iloc[2] < -400 and once.assets()["B"].iloc[-1] < -400   # lost
+    assert kept.assets()["B"].iloc[3:].eq(0.0).all()                                  # filled
+    assert kept.assets()["A"].iloc[3:].eq(0.0).all()
+
+
+def test_an_order_that_never_fills_warns():
+    """#49: with no sale ever freeing cash the cover cannot fill; the run says so."""
+    idx = pd.date_range("2024-01-01", periods=6, freq="B", tz="UTC")
+    close = pd.DataFrame({"A": [10.0] * 6, "B": [10, 20, 30, 30, 30, 30.0]}, index=idx)
+    w = pd.DataFrame({"A": [0.49] * 6, "B": [-0.49, -0.49, 0.0, 0.0, 0.0, 0.0]}, index=idx)
+    with pytest.warns(RuntimeWarning, match="stayed unfilled"):
+        pf = bt._run_portfolio(_flat_panel(close), w, price=close, fees=0.0, slippage=0.0,
+                               init_cash=10_000)
+    assert pf.assets()["B"].iloc[-1] < 0
+
+
+def test_a_book_without_failures_runs_once_and_matches_the_plain_runner():
+    """Working orders change nothing when every order fills."""
+    p = make_panel()
+    w = pd.DataFrame(0.0, index=p.close.index, columns=p.close.columns)
+    w.iloc[:, 0], w.iloc[30:, 1] = 0.4, 0.3
+    kw = dict(price=p.open_, fees=0.001, slippage=0.0005, init_cash=10_000)
+    a = bt._run_portfolio(p, w, working=False, **kw).value()
+    b = bt._run_portfolio(p, w, **kw).value()
+    assert np.allclose(a.to_numpy(), b.to_numpy())

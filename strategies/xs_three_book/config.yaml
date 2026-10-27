@@ -1,0 +1,121 @@
+# ===========================================================================
+# xs_three_book — the proposals lab's cross-strategy round (2026-10-23): the three books with T1
+# selection skill in ONE cash account, equal thirds, netted. SI = informed_flow_ls_p1 (lab label
+# v6_si), MOM = resid_momentum (U0v2), AH = adaptive_hedge (TUNEDv2 = its config + {max_shorts 20,
+# adx_min 40, entry_window 27, atr_mult 16, atr_window 48}); each component runs from its own
+# config.yaml, unchanged (strategy.py pins the files' SHA-256). Every value below is the
+# pre-registered U0 (RESEARCH_LOG.md §0): nothing was searched. The lab runs every label with
+# --hedge (SPY merged into every panel), so all labels share one panel and one benchmark; SPY is
+# traded only by ah_hedge (control C_idx) and the beta cap (iteration I1).
+# ===========================================================================
+
+data:
+  universe: Liquid500      # the headless default; the lab trades its rolling point-in-time
+                           # top 500 (T1) and names 501-1000 (T2), each half-year re-formed
+  bar: 1d
+  start: "2015-01-01"      # warm-up: MOM's 252-bar beta + 12-1 formation, AH's 252-bar strength
+  end: null
+  session: regular
+  max_symbols: 500
+  features: [short_interest, fund_shares]   # SI and AH rank days-to-cover; MOM reads them for
+                                            # borrow only
+
+optuna:
+  study: xs-three-book-v1  # nothing is searched: the lab's labels are the experiments
+  sampler: tpe
+  seed: 42
+  n_trials: 1
+  objectives: [alpha_cagr] # near-zero-beta long/short account: excess over a fully invested
+                           # basket is unreachable by construction (optimize.OBJECTIVES)
+  score_from: "2018-07-01" # short interest starts 2018-01 (E0 has none)
+  min_trades_per_year: 20
+
+backtest:
+  fill: open               # market-on-open orders, as every component
+  # The declared account is about $100k: an SI or AH slot is 1% of the book (~$1,000), a MOM
+  # slot 0.75% x its volatility scale. MOM's quarter-step scale changes make orders of ~$190
+  # (failure mode 7): those are hand re-priced at the $1 minimum beside G5 (research.py orders).
+  order_notional: 1000
+
+params:
+  sleeves:
+    doc: >-
+      Comma-separated books in the account: si (informed_flow_ls_p1), mom (resid_momentum), ah
+      (adaptive_hedge). Controls and the challenger: CRISIS = mom,ah; C_core = si,mom; S_si /
+      S_mom / S_ah = one book alone at the whole budget (the TL read's same-read controls).
+    value: si,mom,ah
+  budgets:
+    doc: >-
+      "" = equal budgets, (gross - hedge_max) / n each (0.30 at the defaults); otherwise one
+      positive number per sleeve in `sleeves` order, summing to at most gross - hedge_max
+      (iteration I2: "0.36,0.36,0.18"). Equal because estimated weights added nothing: causal
+      inverse-vol / ERC budgets set SI to 0 on TRAIN (the design's evidence).
+    value: ""
+  gross:
+    doc: >-
+      Nominal gross of the whole account (the SPY hedge included). Shorts lock cash, so a
+      long/short account cannot exceed ~100% gross; 0.90 leaves the >= 10% headroom the lab's
+      runner needs (resid_momentum R2.1). Pre-registered rule: if the execution audit finds any
+      rejected or part-filled order on TB or T1 at 0.90, every label runs at 0.85.
+    value: 0.9
+  ah_variant:
+    doc: >-
+      tuned (TUNEDv2, adaptive_hedge's final) | u0 (its config values; control C_ahu0, which
+      measures how much of the TRAIN gate is AH's in-sample tune).
+    value: tuned
+  ah_part:
+    doc: >-
+      all | shorts. "shorts" keeps AH's short weights only, at b_ah / max_shorts a slot (the
+      crisis sleeve of iteration I2); AH's longs duplicate the SI long rule.
+    value: all
+  ah_hedge:
+    doc: >-
+      "" | SPY. SPY = AH's own index mode (control C_idx): AH keeps its longs, and every AH short
+      slot is held as a SPY short of the slot's size, timed by the same breakdown count. Same
+      breadth timing, no name selection.
+    value: ""
+  book_vol:
+    doc: >-
+      Iteration I1's volatility scale: the summed overlay is scaled by min(1, book_vol / sigma),
+      sigma the trailing vol_window-bar realized volatility of the UNSCALED overlay (resid_momentum
+      book_scale), decided at month ends, applied from the next open. 0 = off (U0); I1 = 0.10.
+    value: 0.0
+  vol_window:
+    doc: Bars of the overlay's realized volatility (I1).
+    value: 126
+  vol_step:
+    doc: The overlay scale is rounded to this step (I1), so it changes rarely.
+    value: 0.25
+  min_scale:
+    doc: The smallest overlay scale (I1).
+    value: 0.25
+  beta_cap:
+    doc: >-
+      Iteration I1's beta cap: at each month end a SPY short brings the overlay's ex-ante beta
+      (sum of weight x trailing beta to the core panel's equal-weight market) down to this, up to
+      hedge_max. I1 = 0.15.
+    value: 0.0
+  hedge_max:
+    doc: >-
+      Largest SPY short of the beta cap (0 = no hedge, U0). The sleeves share gross - hedge_max,
+      so the account's nominal gross stays at gross. I1 = 0.08 (the overlay then runs at 0.82).
+    value: 0.0
+  beta_window:
+    doc: Bars of the trailing betas the beta cap reads (lab._ex_ante_beta's 126).
+    value: 126
+  hedge_step:
+    doc: >-
+      The SPY hedge is rounded UP in size to a multiple of this, so an uncapped hedge always
+      brings the ex-ante beta to beta_cap or below; it changes only at month ends.
+    value: 0.02
+  min_coverage:
+    doc: >-
+      The coverage switch: on the bar after a decision bar where fewer than this share of the
+      names closing >= $5 carry a days-to-cover, the SI and AH sleeves are 0 (cash). It never
+      binds on the open tests TB/T3/T1/T2 (checked by the audit); it guards E0 and TL.
+    value: 0.5
+  retrim_k:
+    doc: >-
+      A long that grows to k x its target is trimmed back (the engine's concentration cap, longs
+      only), as in every component (2).
+    value: 2.0

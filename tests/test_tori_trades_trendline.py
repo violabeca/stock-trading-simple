@@ -57,6 +57,24 @@ def test_chain_by_hand():
     assert first.confirmed and second.confirmed and first.tf == "1D"
 
 
+@pytest.mark.parametrize(("gap", "kept"), [(0, 2), (4, 2), (5, 1), (6, 1), (7, 0)])
+def test_the_anchor_gap_ends_the_chain_at_the_first_line_too_short(gap, kept):
+    """The hand-made chain's lines have their points A and B 6 and 4 candles apart: a gap of 5
+    keeps the first line and leaves the second as the pending ray; 7 keeps none. What is kept
+    is the same as without a gap."""
+    days = daily(HIGHS)
+    frames = {"1D": TD.candles(days, None, "1D", TD.clock(days))}
+    free = TD.top_down(frames, "down", touch=unit(days, 0.15), pierce=0.0)["1D"]
+    lines = TD.top_down(frames, "down", touch=unit(days, 0.15), pierce=0.0, gap=gap)["1D"]
+    confirmed = lines[lines["confirmed"].astype(bool)]
+    assert len(confirmed) == kept
+    pd.testing.assert_frame_equal(confirmed, free.iloc[:kept])
+    assert ((confirmed["b_x"] - confirmed["a_x"]) >= gap).all()
+    if kept < 2:                                  # the first line too short: it is the pending ray
+        pending = lines[~lines["confirmed"].astype(bool)].iloc[0]
+        assert pending["a_x"] == (0, 6)[kept] and pending["b_x"] == (6, 10)[kept]
+
+
 def test_without_a_touch_tolerance_point_b_is_the_stopping_candle():
     """With no tolerance only exact touches count: B is the last candle ON the line (x4; x2 also
     lies on it), and the near miss x6 no longer moves it."""
@@ -126,6 +144,176 @@ def test_top_down_keeps_her_rules(seed, log):
         assert (lines.loc[lines["tf"] == "1M", "a_x"] < x0).all()
         assert (lines.loc[lines["a_x"] >= x0, "tf"] == "1D").all()
     assert drawn >= 2
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_with_anchors_on_the_line_every_anchor_is_a_candle_on_it(seed):
+    """``on_line`` and no poke allowance, on random monthly + daily candles: point B is the
+    angle candle, so it lies exactly on the line (a monthly line's B moves onto the daily candle
+    that holds its price), every line starts exactly at the previous
+    line's point B, no candle of the daily screen goes through a line, and a line adjusted on
+    the daily chart keeps the monthly chart as its origin (never a chart below the one it was
+    last drawn on)."""
+    rng = np.random.default_rng(seed)
+    close = 100 * np.exp(np.cumsum(rng.normal(0, 0.02, 700)))
+    days = pd.DataFrame({"open": close, "close": close * np.exp(rng.normal(0, 0.01, 700))},
+                        index=pd.bdate_range("2020-01-01", periods=700))
+    days["high"] = days[["open", "close"]].max(axis=1) * (1 + rng.uniform(0, 0.01, 700))
+    days["low"] = days[["open", "close"]].min(axis=1) * (1 - rng.uniform(0, 0.01, 700))
+    sessions = TD.clock(days)
+    frames = {tf: TD.candles(days, None, tf, sessions) for tf in ("1M", "1D")}
+    order = list(TD.TIMEFRAMES)
+    for side in TD.SIDES:
+        lines = TD.top_down(frames, side, pierce=0.0, screen=120, on_line=True)["1D"]
+        lines = lines[lines["confirmed"].astype(bool)]
+        # B is the angle candle: the same price always; the same candle on the line's own
+        # chart (the monthly line the daily walk restarts from moves B onto the daily candle
+        # that holds its price, inside the monthly angle candle)
+        assert (lines["b_y"] == lines["stop_y"]).all() and (lines["b_x"] >= lines["stop_x"]).all()
+        here = lines[lines["tf"] == "1D"]
+        assert (here["b_x"] == here["stop_x"]).all()
+        assert np.allclose(here["a_y"] + here["slope"] * (here["b_x"] - here["a_x"]),
+                           here["b_y"])
+        assert (lines["b_x"].to_numpy()[:-1] == lines["a_x"].to_numpy()[1:]).all()
+        assert (lines["b_y"].to_numpy()[:-1] == lines["a_y"].to_numpy()[1:]).all()
+        assert TD.crossings(lines, frames["1D"].iloc[-120:], False) == 0
+        assert all(order.index(o) <= order.index(t)
+                   for o, t in zip(lines["origin"], lines["tf"], strict=True))
+
+
+@pytest.mark.parametrize("side", ["up", "down"])
+def test_the_cascade_draws_one_line_per_chart_each_starting_on_the_one_above(side):
+    """On hand-made 1-minute candles: at most one line per chart, top-down, the daily one from
+    the extreme of the daily candles in view; every line below starts at the price of the line
+    above's point B, inside that point's candle; point B is the angle candle, on the line; no
+    candle of a line's own chart crosses it; a pending ray, if any, comes last. The hand-made
+    market drifts up, so the downward lines are drawn on it turned upside down."""
+    from tests.test_tori_trades_trendline_bounce import daily_of, market, upside_down
+
+    daily, minutes = market(sessions=60)
+    if side == "down":
+        minutes = upside_down(minutes)
+        daily = daily_of(minutes)
+    sessions = TD.clock(daily)
+    frames = {tf: TD.candles(daily, minutes, tf, sessions) for tf in ("1D", "4H", "1H", "15m")}
+    lines = TD.cascade(frames, side, window=40)
+    confirmed = lines[lines["confirmed"].astype(bool)]
+    assert len(confirmed) >= 2
+    assert list(confirmed["tf"]) == list(frames)[:len(confirmed)]
+    assert (lines["confirmed"].astype(bool).to_numpy()[:-1]).all()      # pending: last only
+    view = frames["1D"].iloc[-40:][TD.SIDES[side]]
+    assert lines["a_price"].iloc[0] == (view.max() if side == "down" else view.min())
+    assert (confirmed["b_x"] == confirmed["stop_x"]).all()
+    assert np.allclose(confirmed["a_y"] + confirmed["slope"]
+                       * (confirmed["b_x"] - confirmed["a_x"]), confirmed["b_y"])
+    for above, below in zip(confirmed.iloc[:-1].itertuples(), confirmed.iloc[1:].itertuples(),
+                            strict=True):
+        assert below.a_price == pytest.approx(above.b_price)
+        assert above.b_x <= below.a_x < above.b_x + (1 if above.tf == "1D" else 0.62)
+    for line in confirmed.itertuples():
+        own = frames[line.tf]
+        assert TD.crossings(confirmed[confirmed["tf"] == line.tf], own, False) == 0
+
+
+def test_the_cascade_stops_at_the_first_line_shorter_than_its_chart_minimum():
+    """With a minimum per chart, every line drawn has at least that many candles of its chart
+    between its points A and B; the chain is the same as without one up to the first line too
+    short, which becomes the pending ray, and nothing is drawn below it."""
+    from tests.test_tori_trades_trendline_bounce import market
+
+    daily, minutes = market(sessions=60)
+    sessions = TD.clock(daily)
+    frames = {tf: TD.candles(daily, minutes, tf, sessions) for tf in ("1D", "4H", "1H", "15m")}
+    free = TD.cascade(frames, "up", window=40)
+    free = free[free["confirmed"].astype(bool)]
+    per = {"1D": 1, **{tf: TD.SESSION / m for tf, m in TD.MINUTES.items()}}   # candles a session
+    apart = (free["b_x"] - free["a_x"]) * free["tf"].map(per)
+    assert len(free) >= 2
+    # a minimum just above the second line's length cuts the chain there
+    cut = {free["tf"].iloc[1]: int(np.floor(apart.iloc[1])) + 1}
+    lines = TD.cascade(frames, "up", window=40, minimum=cut)
+    pd.testing.assert_frame_equal(lines.iloc[:1], free.iloc[:1])
+    assert len(lines) == 2 and not lines["confirmed"].astype(bool).iloc[1]
+    assert lines["tf"].iloc[1] == free["tf"].iloc[1]
+    every = TD.cascade(frames, "up", window=40, minimum={"1D": 2, "4H": 2, "1H": 2, "15m": 4})
+    ok = every[every["confirmed"].astype(bool)]
+    need = ok["tf"].map({"1D": 2, "4H": 2, "1H": 2, "15m": 4})
+    assert ((ok["b_x"] - ok["a_x"]) * ok["tf"].map(per) >= need - 1e-9).all()
+
+
+def test_session_edges_count_from_the_open_and_from_the_close():
+    """The first 2 and last 3 of a regular session's 26 fifteen-minute candles, and of a
+    half-day's 14 (it closes at 13:00)."""
+    days = [pd.Timestamp("2025-07-02"), pd.Timestamp("2025-07-03")]          # 07-03: half day
+    index = pd.DatetimeIndex([d + pd.Timedelta(minutes=570 + 15 * i)
+                              for d, n in zip(days, (26, 14), strict=True) for i in range(n)])
+    edge = TD.session_edges(index, "15m", 2, 3)
+    assert edge[:26].nonzero()[0].tolist() == [0, 1, 23, 24, 25]
+    assert edge[26:].nonzero()[0].tolist() == [0, 1, 11, 12, 13]
+
+
+def test_the_cascade_leaves_the_session_edges_out_of_the_fifteen_minute_line():
+    """With ``trim`` (4, 4), the 15-minute line's point B (its angle candle) is never one of a
+    session's first or last four 15-minute candles, its point A is still the price of the
+    line above's point B, and the charts above are unchanged."""
+    from tests.test_tori_trades_trendline_bounce import market
+
+    daily, minutes = market(sessions=60)
+    sessions = TD.clock(daily)
+    frames = {tf: TD.candles(daily, minutes, tf, sessions) for tf in ("1D", "4H", "1H", "15m")}
+    found = False
+    for side in TD.SIDES:
+        free = TD.cascade(frames, side, window=40)
+        lines = TD.cascade(frames, side, window=40, trim=(4, 4))
+        above = lines[lines["tf"] != "15m"]
+        pd.testing.assert_frame_equal(above, free[free["tf"] != "15m"].iloc[:len(above)])
+        mine = lines[lines["tf"] == "15m"]
+        assert not TD.session_edges(pd.DatetimeIndex(mine["b_time"]), "15m", 4, 4).any()
+        if len(mine):
+            assert mine["a_price"].iloc[0] == pytest.approx(above["b_price"].iloc[-1])
+        found = found or len(mine) > 0
+    assert found
+
+
+def test_the_noise_is_the_moving_average_of_the_true_range():
+    """Candle by candle, the mean of the last ``window`` true ranges (fewer at the start); the
+    true range reaches back to the close before when the candle gapped."""
+    c = pd.DataFrame({"high": [11.0, 12.0, 15.0, 13.0], "low": [9.0, 10.0, 13.0, 12.0],
+                      "close": [10.0, 11.0, 14.0, 12.5]})
+    tr = [2.0, 2.0, 4.0, 2.0]                     # the third gapped up from 11: 15 - 11
+    assert TD.noise(c, 2).tolist() == pytest.approx([2.0, 2.0, 3.0, 3.0])
+    assert TD.noise(c, 10).tolist() == pytest.approx(np.cumsum(tr) / np.arange(1, 5))
+
+
+@pytest.mark.parametrize("side", ["up", "down"])
+def test_a_banded_line_lets_candles_reach_in_by_its_band_and_takes_b_inside_it(side):
+    """With a line band, no candle of a line's chart goes beyond it by more than the band at
+    that candle (the band follows the noise), point B lies inside the band, and the next line
+    starts at it; a band of 0 draws exactly the strict lines."""
+    from tests.test_tori_trades_trendline_bounce import daily_of, market, upside_down
+
+    daily, minutes = market(sessions=60)
+    if side == "down":
+        minutes = upside_down(minutes)
+        daily = daily_of(minutes)
+    sessions = TD.clock(daily)
+    frames = {tf: TD.candles(daily, minutes, tf, sessions) for tf in ("1D", "4H", "1H", "15m")}
+    pd.testing.assert_frame_equal(TD.cascade(frames, side, window=40, band=0.0),
+                                  TD.cascade(frames, side, window=40))
+    lines = TD.cascade(frames, side, window=40, band=0.5, noise_window=20)
+    ok = lines[lines["confirmed"].astype(bool)]
+    assert len(ok) >= 2
+    for line in ok.itertuples():
+        own = frames[line.tf]
+        w = 0.5 * TD.noise(own, 20)
+        right = (own["x"] > line.a_x).to_numpy()
+        level = line.a_y + line.slope * (own["x"].to_numpy() - line.a_x)
+        y = own[TD.SIDES[side]].to_numpy()
+        inside = (y - level) if side == "up" else (level - y)       # negative: beyond the line
+        assert (inside[right] >= -w[right] - 1e-9).all()
+        j = own.index.get_loc(line.b_time)
+        assert abs(inside[j]) <= w[j] + 1e-9
+    assert (ok["b_time"].to_numpy()[:-1] <= ok["a_time"].to_numpy()[1:]).all()
 
 
 def test_candles_sit_on_the_session_clock():

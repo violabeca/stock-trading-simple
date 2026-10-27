@@ -18,6 +18,43 @@ why). Give each idea a *why* and, where possible, the falsification that would s
   passes none. The knobs that agree across windows are exit settings, not line settings (README
   "Second run").
 
+## From her second video (2026-10-25)
+
+Her video [*Top Down Analysis Isn't Hard. It's Misunderstood*](https://youtu.be/-emUlKR5n38)
+(2026-10-22, gold) repeats the line rules as built: start at the extreme, as many touches as
+possible with no candle through the line, every new point A is the previous point B, adjust the
+lines on each lower chart. It adds four things:
+
+- **A 30-minute chart** between the 1-hour and the 15-minute chart: monthly, weekly, daily,
+  4-hour, 1-hour, 30-minute, 15-minute. `topdown.TIMEFRAMES` has no 30-minute chart (the first
+  video did not use one). On her gold chart it added nothing. Here it could: the 15-minute
+  screen covers about 6 sessions and the 1-hour screen about 23, so a 30-minute screen (about
+  12) can adjust or add lines between them. Adding it is two entries in `topdown.py`, but it
+  changes every line drawn so far: every cached line and earlier study result would be stale.
+- **Support and resistance, "the bonus step"**: horizontal levels on the trading chart only.
+  - **Where:** places price reached several times and turned around, or where it moved
+    sideways, as close to today's price as possible. Price may poke through such a level.
+  - **In a range:** a ceiling and a floor.
+  - **After a breakout:** one key level, where she watches for a rejection, or a break and a
+    retest.
+  - **How firm:** she calls these rules "more subjective, not as systematic". She uses the
+    levels as context for entries and trade management, not as a signal of their own.
+  - **Prior result here:** `level_flow`'s horizontal levels (a pivot histogram) did no better
+    than a placebo of matched locations (2026-09-19).
+  - **Lives if:** a bounce at a line that sits near a level beats a bounce away from any level,
+    and beats levels moved off hers, on data not yet read.
+- **Direction.** She says the top-down analysis tells "which way the markets are actually
+  moving", but gives no rule for it. The `trend` filter (a moving average) is a stand-in here.
+  A rule in her spirit would be the direction of the latest lines on the higher charts. It is
+  a candidate metric for the regime study (`regimes.py`).
+- **The rest of her system is not public.** She calls the top-down analysis "just one part of
+  my system": entries, trade management, exits and risk are taught in a paid masterclass. The
+  bounce rules here come from her first video's walk-through. "No edge" is a verdict on those
+  public rules, not on everything she trades.
+
+Both videos describe touches as swing lows and swing highs ("simply capturing swing lows" on
+the higher charts). That supports the parked *swing-only touches* below.
+
 ## A slower trading chart
 
 On the 15-minute chart a stop half a typical candle beyond the line is 0.47% of the price, so a

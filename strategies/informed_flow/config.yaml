@@ -41,7 +41,9 @@ data:
 # Study settings. The search SPACE is not here — each parameter declares its own
 # `search:` next to the value it ships, so the two cannot disagree.
 optuna:
-  study: informed-flow-1d-v41   # bump this whenever a `search:` bound, the objectives, the
+  # v42: engine proposals #46-#52 (2026-10-24) change portfolio-mode fills
+  # (call order, working orders, borrow deferral, NYSE sessions); informed-flow-1d-v41 was the old engine.
+  study: informed-flow-1d-v42   # bump this whenever a `search:` bound, the objectives, the
                            # universe, the scored window or the execution model changes: a
                            # journal that mixes two experiments cannot be read. Since v28
                            # (README "Study history" has v3-v28) NOTHING is searched; v29 is the

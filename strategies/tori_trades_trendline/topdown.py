@@ -29,6 +29,12 @@ downward lines lie on the candles' highs, upward lines under their lows.
    steeper ones only this chart can see. A line that ends left of the screen keeps its
    higher-timeframe drawing, unless a candle on the screen crosses it: then it is drawn again from
    its own point A.
+7. **Anchors on the line** (optional, ``on_line``; the user's reading of her rule, 2026-10-27).
+   Point B is the angle candle, so both anchors are candle extremes on the line and every line
+   starts exactly on the one before it. Without it, B is the latest touch within ``touch``.
+8. **Anchor gap** (optional, ``gap``; the user's, not hers). A line drawn on the trading chart
+   counts only when its points A and B lie at least ``gap`` of its candles apart. A shorter one
+   is left as the pending ray, and the chain ends before it.
 
 **Time** runs on one trading-session clock on every chart: session n of the history starts at n,
 and a 15-minute candle opening at 10:00 sits at n + 30/390. Nights, weekends and holidays take no
@@ -58,8 +64,9 @@ OPEN, SESSION = 570, 390         # the regular session opens 09:30 New York and 
 HALF_DAYS = frozenset(["2024-07-03", "2024-11-29", "2024-12-24", "2025-07-03", "2025-11-28",
                        "2025-12-24", "2026-11-27", "2026-12-24"])
 #: Columns of a line table (:func:`top_down`); ``*_y`` are in the scale the line is straight in.
-COLUMNS = ["side", "tf", "confirmed", "a_time", "a_x", "a_y", "a_price", "b_time", "b_x", "b_y",
-           "b_price", "stop_time", "stop_x", "stop_y", "stop_price", "slope", "tol", "pierce"]
+COLUMNS = ["side", "tf", "origin", "confirmed", "a_time", "a_x", "a_y", "a_price", "b_time",
+           "b_x", "b_y", "b_price", "stop_time", "stop_x", "stop_y", "stop_price", "slope", "tol",
+           "pierce"]
 _OHLC = {"open": ("open", "first"), "high": ("high", "max"), "low": ("low", "min"),
          "close": ("close", "last")}
 
@@ -144,7 +151,7 @@ def candles(daily: pd.DataFrame, minutes: pd.DataFrame | None, tf: str,
 
 def top_down(frames: dict[str, pd.DataFrame], side: str, *, log: bool = False,
              touch: float = 0.25, pierce: float = 0.1, confirm: int = 2,
-             screen: int = 150) -> dict[str, pd.DataFrame]:
+             screen: int = 150, gap: int = 0, on_line: bool = False) -> dict[str, pd.DataFrame]:
     """Her top-down analysis for one side: the chain of lines after each chart.
 
     Args:
@@ -157,14 +164,28 @@ def top_down(frames: dict[str, pd.DataFrame], side: str, *, log: bool = False,
         pierce: How far a candle may poke through a line unseen, in typical candle ranges.
         confirm: Candles that must follow a touch before it counts.
         screen: Candles on screen on every chart after the first.
+        gap: The anchor gap (user, 2026-10-27): a line drawn on the LAST chart (the trading
+            chart) needs its points A and B at least this many of that chart's candles apart,
+            on the session clock (16 on the 15-minute chart = 4 hours). A shorter one is not a
+            line yet: it becomes the pending ray, and the chain ends before it, since the next
+            line would start at its point B. 0: no gap.
+        on_line: Point B is the angle candle, the one that stopped the ray (user, 2026-10-27:
+            the anchors are candle extremes ON the line and every line starts on the one before
+            it). Off (the first build): point B is the latest candle within ``touch`` of the
+            line, which may lie up to ``touch`` off it. When a lower chart takes over a line
+            that ends left of its screen, ``on_line`` keeps that line's point B on the lower
+            chart's candle that holds its price, instead of moving it to the latest touch.
 
     Returns:
         ``{chart: lines}``: the lines (:data:`COLUMNS`) as they stand after each chart, in chain
-        order. ``tf`` is the chart a line was last drawn on, ``a_*`` its point A, ``b_*`` its
-        point B (the most recent touch, the next line's point A), ``stop_*`` the candle that
-        stopped the ray, ``slope`` its change per session, ``tol`` and ``pierce`` its touch and
-        poke distances (all three in log price when ``log``). A last row with ``confirmed``
-        False is the pending ray: stopped by a candle still too new, so not a line yet.
+        order. ``tf`` is the chart a line was last drawn on, ``origin`` the chart it was first
+        found on (a line adjusted on a lower chart that still starts in the same candle keeps
+        it), ``a_*`` its point A, ``b_*`` its point B (the next line's point A: the most recent
+        touch, or with ``on_line`` the angle candle), ``stop_*`` the candle that stopped the
+        ray (the angle candle), ``slope`` its change per session, ``tol`` and ``pierce`` its
+        touch and poke distances (all three in log price when ``log``). A last row with
+        ``confirmed`` False is the pending ray: not a line yet (its angle candle is still too
+        new, or its anchors are closer than ``gap``).
     """
     lines: list[dict] = []
     start = known = pending = None
@@ -192,12 +213,120 @@ def top_down(frames: dict[str, pd.DataFrame], side: str, *, log: bool = False,
         if s == 0:
             start = a
         else:
-            a = _last_touch(lines[s - 1], bars, a, side, confirm)
+            if not on_line:
+                a = _last_touch(lines[s - 1], bars, a, side, confirm)
             lines[s - 1] = {**lines[s - 1], "B": a}
-        walked, pending = _walk(bars, a, side, touch * typical, pierce * typical, confirm, tf)
+        apart = (gap * MINUTES.get(tf, SESSION) / SESSION     # in sessions, on the last chart
+                 if k == len(frames) - 1 else 0.0)
+        walked, pending = _walk(bars, a, side, touch * typical, pierce * typical, confirm, tf,
+                                apart, on_line)
+        for new, old in zip(walked, lines[s:], strict=False):   # the shorter decides
+            # her "slight adjustment": a line redrawn here that still starts in the candle its
+            # older drawing started in is that line, so it keeps the chart it was first found on
+            if not old["A"]["x"] <= new["A"]["x"] < old["A"]["x_end"]:
+                break
+            new["origin"] = old.get("origin", old["tf"])
         lines = lines[:s] + walked
         out[tf] = _table(lines, pending, side, log)
     return out
+
+
+def session_edges(index: pd.DatetimeIndex, tf: str, first: int, last: int) -> np.ndarray:
+    """Whether each candle of an intraday chart is one of the first ``first`` or the last
+    ``last`` candles of its session.
+
+    Args:
+        index: The candles' opening times, New York, without a time zone (:func:`candles`).
+        tf: The chart, a key of :data:`MINUTES`.
+        first: Candles from the session's open.
+        last: Candles to the session's close (13:00 on a :data:`HALF_DAYS` session).
+
+    Returns:
+        A boolean array, one value per candle.
+    """
+    size = MINUTES[tf]
+    slot = ((index.hour * 60 + index.minute - OPEN) // size).to_numpy()
+    half = np.isin(index.normalize().strftime("%Y-%m-%d"), list(HALF_DAYS))
+    count = np.where(half, -(-(SESSION - 180) // size), -(-SESSION // size))
+    return (slot < first) | (slot >= count - last)
+
+
+def cascade(frames: dict[str, pd.DataFrame], side: str, *, window: int = 150,
+            confirm: int = 2, minimum: dict[str, int] | None = None,
+            trim: tuple[int, int] = (0, 0), band: float = 0.0, noise_window: int = 150,
+            log: bool = False) -> pd.DataFrame:
+    """One line per chart, top-down (the user's method, 2026-10-27).
+
+    The first chart draws one line, from the extreme of its last ``window`` candles: the lowest
+    low for an upward line, the highest high for a downward one. Every chart below draws one
+    line too, starting at the point B of the line above it, moved onto this chart's candle that
+    holds its price. Each line is the steepest ray from its point A that no candle of its chart
+    crosses (no poke allowance), and its point B is the candle that stops it (its angle candle).
+    So both anchors are candle extremes on the line, and each line starts on the one above.
+
+    Args:
+        frames: Candles of each chart (:func:`candles`) in top-down order, cut at the same
+            moment. A chart that starts later than the one above (the 1-minute history is
+            shorter) leans on the candles above for the time before its first candle.
+        side: ``"down"`` (lines on the highs) or ``"up"`` (lines under the lows).
+        window: Candles of the first chart in view: its line starts at their extreme.
+        confirm: Candles that must follow an angle candle before the line counts.
+        minimum: The shortest line on each chart (user, 2026-10-27): ``{chart: candles}`` that
+            must lie between a line's points A and B on that chart, e.g. ``{"1D": 5, "4H": 4,
+            "1H": 4, "15m": 16}`` (16 on the 15-minute chart = 4 hours). A shorter line is not
+            a line yet: the chain stops there. Skipping it and drawing on from its point B was
+            tried: on NOW it found a line on few more charts (22 against 20 fifteen-minute
+            lines in 160 cases) and the line no longer starts on the one above.
+        trim: ``(first, last)`` (user, 2026-10-27): the LAST chart's line leaves out the first
+            ``first`` and the last ``last`` candles of every session. They can neither stop it
+            nor be its point B, so an opening or closing spike may poke through it. Its point A
+            still comes from the line above, even inside a left-out candle: starting on the
+            nearest candle left in instead moved NOW's 2026-10-05 downward line 2.7 below the
+            1-hour line's B.
+        band: The line band (user, 2026-10-27): a line is a band of half-width ``band`` x the
+            chart's :func:`noise` (its average true range over ``noise_window`` candles, so the
+            band follows the stock's noise candle by candle). A candle may reach into or
+            through the line by up to the band without stopping it, and point B is the latest
+            candle inside the band, which the next chart's line starts from. 0: the exact line,
+            B the angle candle.
+        noise_window: Candles in the noise's moving average.
+        log: Lines straight on a logarithmic price scale.
+
+    Returns:
+        One row per chart that drew a line (:data:`COLUMNS`), top-down; ``tf`` and ``origin``
+        are that chart, ``tol`` the band at its angle candle. A line whose angle candle is still
+        too new, or one shorter than its chart's minimum, is the pending ray (``confirmed``
+        False, the last row): not a line yet, and the charts below it draw nothing.
+    """
+    lines, known, a, pending = [], None, None, None
+    for k, (tf, own) in enumerate(frames.items()):
+        if own.empty:
+            break
+        bars = pd.DataFrame({"x": own["x"], "x_end": own["x_end"],
+                             "y": _y(own[SIDES[side]], log), "tf": tf,
+                             "w": band * noise(own, noise_window, log) if band else 0.0})
+        out = (session_edges(own.index, tf, *trim)        # left out of this chart's line
+               if k == len(frames) - 1 and tf in MINUTES and any(trim)
+               else np.zeros(len(own), bool))
+        if known is not None:                # the time before this chart's first candle
+            before = known[known["x_end"] <= bars["x"].iloc[0]]
+            bars, out = pd.concat([before, bars]), np.r_[np.zeros(len(before), bool), out]
+        known = bars
+        if a is None:
+            view = bars.iloc[-window:]
+            y = view["y"].to_numpy()
+            a = _point(view, int(np.argmax(y) if side == "down" else np.argmin(y)))
+        else:
+            a = _snap(a, bars)
+        apart = (minimum or {}).get(tf, 0) * MINUTES.get(tf, SESSION) / SESSION   # sessions
+        w = bars["w"].to_numpy()[~out]         # the line band at each candle (0: exact)
+        walked, pending = _walk(bars[~out], a, side, w, w, confirm, tf, apart,
+                                on_line=not band, limit=1)
+        if not walked:
+            break
+        lines.append(walked[0])
+        a = walked[0]["B"]
+    return _table(lines, pending, side, log)
 
 
 def price_at(lines: pd.DataFrame, x, log: bool) -> np.ndarray:
@@ -252,14 +381,20 @@ def _gaps(lines: pd.DataFrame, bars: pd.DataFrame, log: bool) -> tuple[np.ndarra
     return x, (level - y[None, :]) if side == "down" else (y[None, :] - level)
 
 
-def _walk(bars: pd.DataFrame, a: dict, side: str, tol: float, pierce: float, confirm: int,
-          tf: str) -> tuple[list[dict], dict | None]:
-    """The chain of lines from point ``a`` over the candles right of it (rules 3 to 5).
+def _walk(bars: pd.DataFrame, a: dict, side: str, tol, pierce, confirm: int,
+          tf: str, gap: float = 0.0, on_line: bool = False,
+          limit: int | None = None) -> tuple[list[dict], dict | None]:
+    """The chain of lines from point ``a`` over the candles right of it (rules 3 to 5); with
+    ``on_line``, point B is the candle that stopped the ray, else the latest touch; at most
+    ``limit`` lines. ``tol`` and ``pierce`` are one distance, or one per candle of ``bars``
+    (the noise band, which follows the stock's noise).
 
     Returns:
-        The lines, and the pending ray (stopped by a candle still too new) or None.
+        The lines, and the pending ray (stopped by a candle still too new, or with its points A
+        and B less than ``gap`` sessions apart) or None.
     """
     x, y = bars["x"].to_numpy(), bars["y"].to_numpy()
+    tol, pierce = (np.broadcast_to(np.asarray(v, dtype=float), x.shape) for v in (tol, pierce))
     last = len(x) - 1 - confirm               # the newest candle a touch may sit on
     lines = []
     while True:
@@ -269,17 +404,22 @@ def _walk(bars: pd.DataFrame, a: dict, side: str, tol: float, pierce: float, con
         dx = x[right] - a["x"]
         slope = (y[right] - a["y"]) / dx
         if side == "down":                    # no candle may poke through by more than pierce
-            best = slope[slope >= ((y[right] - pierce - a["y"]) / dx).max()].min()
+            best = slope[slope >= ((y[right] - pierce[right] - a["y"]) / dx).max()].min()
         else:
-            best = slope[slope <= ((y[right] + pierce - a["y"]) / dx).min()].max()
+            best = slope[slope <= ((y[right] + pierce[right] - a["y"]) / dx).min()].max()
         stop = right[np.flatnonzero(slope == best)[-1]]
-        line = {"tf": tf, "A": a, "slope": float(best), "tol": float(tol),
-                "pierce": float(pierce), "stop": _point(bars, stop)}
+        line = {"tf": tf, "origin": tf, "A": a, "slope": float(best), "tol": float(tol[stop]),
+                "pierce": float(pierce[stop]), "stop": _point(bars, stop)}
         if stop > last:                       # the candle that stops the ray is still too new
             return lines, {**line, "B": line["stop"]}
-        near = right[(_gap(line, x[right], y[right], side) <= tol) & (right <= last)]
-        a = line["B"] = _point(bars, near[-1])
+        near = right[(_gap(line, x[right], y[right], side) <= tol[right]) & (right <= last)]
+        line["B"] = line["stop"] if on_line else _point(bars, near[-1])
+        if line["B"]["x"] - a["x"] < gap - 1e-9:   # anchors too close together: not a line yet
+            return lines, line
+        a = line["B"]
         lines.append(line)
+        if limit is not None and len(lines) >= limit:
+            return lines, None
 
 
 def _last_touch(line: dict, bars: pd.DataFrame, a: dict, side: str, confirm: int) -> dict:
@@ -323,6 +463,24 @@ def _y(price: pd.Series, log: bool) -> pd.Series:
     return np.log(price) if log else price.astype(float)
 
 
+def noise(c: pd.DataFrame, window: int, log: bool = False) -> np.ndarray:
+    """The stock's noise on one chart, candle by candle: the average true range of the last
+    ``window`` candles up to and including each one (fewer at the start), in the lines' scale.
+    Each value uses only its own candle and the ones before it.
+
+    Args:
+        c: Candles of one chart (:func:`candles`), in time order.
+        window: Candles in the moving average.
+        log: In log price (else in price).
+
+    Returns:
+        One value per candle.
+    """
+    high, low, prev = _y(c["high"], log), _y(c["low"], log), _y(c["close"], log).shift()
+    tr = pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
+    return tr.rolling(window, min_periods=1).mean().to_numpy()
+
+
 def _typical(c: pd.DataFrame, log: bool) -> float:
     """The median true range of the candles ``c``, in the lines' scale."""
     high, low, prev = _y(c["high"], log), _y(c["low"], log), _y(c["close"], log).shift()
@@ -334,7 +492,8 @@ def _table(lines: list[dict], pending: dict | None, side: str, log: bool) -> pd.
     """The lines, then the pending ray if any, as a table (:data:`COLUMNS`)."""
     rows = []
     for line in lines + ([pending] if pending else []):
-        row = {"side": side, "tf": line["tf"], "confirmed": line is not pending,
+        row = {"side": side, "tf": line["tf"], "origin": line.get("origin", line["tf"]),
+               "confirmed": line is not pending,
                "slope": line["slope"], "tol": line["tol"], "pierce": line["pierce"]}
         for key, p in (("a", line["A"]), ("b", line["B"]), ("stop", line["stop"])):
             row |= {f"{key}_time": p["time"], f"{key}_x": p["x"], f"{key}_y": p["y"],

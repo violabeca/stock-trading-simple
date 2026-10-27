@@ -1,0 +1,146 @@
+# ===========================================================================
+# peer_reversal — STRATEGY_OVERVIEW.md §6 proposal 5 (2026-10-22): peer-relative short-term
+# reversal, long/short, full size when the market is stressed. Evaluated with the shared lab
+# (strategies/proposals_lab); the pre-registration and every result live in RESEARCH_LOG.md.
+# Every value below is the pre-registered untuned default U0. It is kept so the lab labels
+# (var/proposals_lab/results{,2}/peer_reversal/*.pkl, which store overrides only) stay
+# reproducible. Round 2 (lab v2, 2026-10-23): U0 itself is the final. The round-1 final
+# I4 = U0 + {formation: 21, max_hold: 21, gross_calm: 0} no longer clears the adoption bar.
+# VERDICT: no edge net of costs (RESEARCH_LOG.md §12, confirmed on lab v2 in R2.8).
+# ===========================================================================
+
+data:
+  universe: Liquid500      # headless default only; the lab trades its own point-in-time
+                           # top 500 (T1) and names 501-1000 (T2)
+  bar: 1d
+  start: "2015-01-01"      # 252 bars of cluster warm-up before the first scored period
+  end: null
+  session: regular
+  max_symbols: 500
+  features: [short_interest, fund_shares]   # the borrow tiers only (the lab always adds
+                           # `sector`, which peers: sector reads)
+
+optuna:
+  study: peer-reversal-v1  # bump whenever a `search:` bound or the execution model changes
+  sampler: tpe
+  seed: 42
+  n_trials: 120
+  objectives: [alpha_cagr] # dollar-neutral: excess over a fully invested basket is
+                           # unreachable by construction (optimize.OBJECTIVES)
+  min_trades_per_year: 50
+
+backtest:
+  fill: open               # market-on-open orders, next bar
+  order_notional: 1000     # the lab's yardstick: $1 minimum = 10 bp a leg
+
+params:
+  peers:
+    doc: >-
+      cluster | sector | market. "cluster" = correlation clusters of residual returns (U0);
+      "sector" = the lab's 12 sector codes (control C1); "market" = one group (plain
+      market-relative reversal, premise check only).
+    value: cluster
+  n_clusters:
+    doc: Maximum number of correlation clusters (scipy fcluster maxclust on a Ward linkage).
+    value: 30
+    search: { type: int, low: 10, high: 60, step: 5 }
+  cluster_window:
+    doc: Bars of market-residual daily returns each clustering reads (one year).
+    value: 252
+  reform_every:
+    doc: Bars between re-formations (half a year), anchored at the panel's first bar.
+    value: 126
+  min_coverage:
+    doc: Share of valid returns in the window a name needs to be clustered.
+    value: 0.8
+  min_peers:
+    doc: Other cluster members with a valid return a name needs for a signal.
+    value: 2
+  formation:
+    doc: Bars the move is measured over (one week).
+    value: 5
+    search: { type: int, low: 3, high: 21 }
+  skip:
+    doc: >-
+      Bars between the formation window's last close and the decision bar (1 = measured to
+      the close one day before the decision; avoids bid-ask bounce and print artifacts).
+      Pre-registered, never searched.
+    value: 1
+  scale:
+    doc: >-
+      none | vol. "vol" divides the peer-relative move by the name's own peer-relative daily
+      volatility over scale_window bars (Blitz, Huij, Lansdorp & Verbeek 2013: residual
+      reversal scaled by residual volatility). Off in U0 (iteration I3).
+    value: none
+  scale_window:
+    doc: Bars of the volatility that scale "vol" divides by.
+    value: 63
+  q_in:
+    doc: Entry zone - long at rank <= q_in (bottom tenth), short at rank >= 1 - q_in.
+    value: 0.1
+    search: { type: float, low: 0.05, high: 0.2, step: 0.05 }
+  q_out:
+    doc: >-
+      Exit band - a long leaves when its rank rises above q_out, a short when it falls below
+      1 - q_out (0.5 = back at the peer-relative median: the reversal is done).
+    value: 0.5
+    search: { type: float, low: 0.3, high: 0.7, step: 0.1 }
+  slots:
+    doc: Positions per side (20 long + 20 short).
+    value: 20
+    search: { type: int, low: 10, high: 30, step: 5 }
+  max_hold:
+    doc: >-
+      Bars a position is held after it last ranked in its entry zone (the clock restarts on a
+      fresh extreme).
+    value: 10
+    search: { type: int, low: 5, high: 25 }
+  gross_stress:
+    doc: >-
+      Long + short exposure of slots opened on a stressed bar (the market's 21-bar realized
+      volatility above its trailing 252-bar median). Pre-registered, never searched.
+    value: 0.98
+  gross_calm:
+    doc: >-
+      Long + short exposure of slots opened on a calm bar (half size). The binary switch is
+      pre-registered and never searched; 0 = trade only in stress.
+    value: 0.49
+  vol_window:
+    doc: Bars of the market's realized volatility for the stress switch.
+    value: 21
+  vol_median_window:
+    doc: Bars of the trailing median the realized volatility is compared with.
+    value: 252
+  volume_cap:
+    doc: >-
+      When > 0, a name whose busiest formation bar traded more than this multiple of its
+      normal volume is not entered (information, not price pressure). 0 = off (U0).
+    value: 0.0
+  volume_base:
+    doc: Bars of the median volume ("normal volume") the volume cap compares with.
+    value: 63
+  min_price:
+    doc: Minimum close on the decision bar for a name to be ranked.
+    value: 5.0
+  short_max_si:
+    doc: >-
+      Short interest / shares outstanding above which a name is never shorted (hard to
+      borrow; squeeze risk), as informed_flow_ls_p1.
+    value: 0.3
+  si_mid:
+    doc: Crowding tier for the borrow fee (short interest / shares outstanding).
+    value: 0.1
+  si_high:
+    doc: Upper crowding tier for the borrow fee.
+    value: 0.2
+  borrow_gc:
+    doc: >-
+      Yearly borrow fee below si_mid and where there is no short-interest data (general
+      collateral; informed_flow_ls_p1's tiers).
+    value: 0.005
+  borrow_mid:
+    doc: Yearly borrow fee between si_mid and si_high.
+    value: 0.03
+  borrow_high:
+    doc: Yearly borrow fee above si_high (up to short_max_si).
+    value: 0.1

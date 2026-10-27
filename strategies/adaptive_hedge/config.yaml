@@ -1,0 +1,160 @@
+# ===========================================================================
+# adaptive_hedge — proposal 3 of STRATEGY_OVERVIEW.md §6: informed_flow's long short-interest
+# book plus trend_following's breakdown shorts, one book of 30 equal slots. A short start takes a
+# free slot or displaces the weakest-ranked long, so the short side (and the hedge) grows only
+# when stocks break down. Evaluated through strategies/proposals_lab (RESEARCH_LOG.md); every
+# value below is U0, the pre-registered untuned default. The lab's FINAL candidate (label TUNED,
+# RESEARCH_LOG.md §9; re-measured on lab v2 as TUNEDv2, §13) is U0 + {max_shorts: 20, adx_min: 40,
+# entry_window: 27, atr_mult: 16, atr_window: 48}. The values stay at U0 on purpose: the lab
+# rebuilds every saved label from this file plus its overrides, so moving a default would
+# silently change what "U0" means on a re-run.
+# ===========================================================================
+
+data:
+  universe: Liquid500      # the headless default; the lab trades its rolling point-in-time
+                           # top 500 (T1) and names 501-1000 (T2), each half-year re-formed
+  bar: 1d
+  start: "2015-01-01"      # warm-up: the 252-bar relative strength and the 42-bar average
+  end: null
+  session: regular
+  max_symbols: 500
+  features: [short_interest, fund_shares]
+
+optuna:
+  study: adaptive-hedge-v1 # the lab keeps its own journals (var/proposals_lab/studies)
+  sampler: tpe
+  seed: 42
+  n_trials: 1              # nothing is searched in the shipped config
+  objectives: [alpha_cagr] # a book whose net exposure moves: excess over a fully invested
+                           # basket would reward exposure, alpha charges for the beta run
+  score_from: "2018-07-01" # short interest starts 2018-01: the 42-bar average is warm by March
+  min_trades_per_year: 20
+
+backtest:
+  fill: open               # market-on-open orders, as informed_flow and trend_following
+  order_notional: 1000     # 30 slots of a $30k account: each order ~$1,000
+
+params:
+  # --- the long side: informed_flow v41's rule -------------------------------------------
+  dtc_window:
+    doc: Bars days-to-cover is averaged over before ranking (informed_flow v34+).
+    value: 42
+  neutral_groups:
+    doc: >-
+      Dollar-volume groups the long sleeve is ranked within (days-to-cover has volume in its
+      denominator; informed_flow v31).
+    value: 5
+  q_in:
+    doc: Long entry rank (top decile).
+    value: 0.9
+  q_out:
+    doc: Long exit rank (the hysteresis band, informed_flow v28+).
+    value: 0.8
+  max_hold:
+    doc: Bars a long is held unless it still ranks >= q_in (the clock restarts there).
+    value: 126
+  min_price:
+    doc: Minimum close to be ranked long or shorted.
+    value: 5.0
+  retrim_k:
+    doc: A long that grows to k x its slot is trimmed back (engine concentration cap).
+    value: 2.0
+
+  # --- the book ------------------------------------------------------------------------------
+  slots:
+    doc: Equal slots shared by both sides, each gross / slots of the book (informed_flow's 30).
+    value: 30
+  gross:
+    doc: >-
+      Long plus short exposure as a share of the book. The engine locks short proceeds, so a
+      book with shorts cannot exceed ~100% gross when orders are placed; 0.98 leaves headroom.
+    value: 0.98
+  max_shorts:
+    doc: >-
+      Most shorts held at once; with every slot full, 20 shorts and 10 longs is a net exposure
+      of -33%. 0 = the long side alone (control L0).
+    value: 20
+    search: { type: int, low: 0, high: 20, step: 2 }
+  short_hold:
+    doc: >-
+      A short is bought back once short_hold bars pass without a fresh start on the name (the
+      clock restarts on every new start while held), so the short side holds the names breaking
+      down NOW and its size follows the breadth of breakdowns. 0 = off (U0, TUNED). Iteration 1:
+      rejected (it timed out the 2022 decliners mid-fall; RESEARCH_LOG.md §4; lab v2: T1 −6.3,
+      T3 −11.7, §13.2).
+    value: 0
+  exit_window:
+    doc: >-
+      A short is also bought back on a close above the highest high of the prior exit_window
+      bars, with no ADX confirmation (the Turtle exit): a name whose own trend reversed leaves, a
+      name still falling stays. 0 = off (U0, TUNED). Iteration 2: rejected (a whipsaw: the
+      persistent losers rally to new highs inside the decline; RESEARCH_LOG.md §5; lab v2: T1
+      −4.7, TB −9.9, §13.2).
+    value: 0
+  short_stop:
+    doc: >-
+      The squeeze stop: a short whose close rises this far above its entry close is bought back
+      (the proposal's +50%). 0 = off (U0, TUNED). Iteration 4: rejected (lab v2: T1 −3.2, T2
+      −0.5, T3 −1.2: it covers at the top of the squeeze; RESEARCH_LOG.md §8, §13.2).
+    value: 0.0
+
+  # --- the short side: trend_following v7's short starts ---------------------------------------
+  entry_window:
+    doc: A short start is a close below the lowest low of the prior entry_window bars.
+    value: 9
+    search: { type: int, low: 5, high: 40 }
+  adx_window:
+    doc: Wilder smoothing window of the ADX and the directional indicators.
+    value: 14
+  adx_min:
+    doc: ADX floor a breakdown needs, with -DI above +DI (trend_following v7).
+    value: 34.0
+    search: { type: float, low: 20.0, high: 50.0, step: 2.0 }
+  atr_window:
+    doc: ATR window of the chandelier.
+    value: 37
+    search: { type: int, low: 14, high: 60 }
+  atr_mult:
+    doc: >-
+      Chandelier distance: a short is bought back on a close above the lowest low since entry
+      plus atr_mult x the current ATR (ratcheted, never loosened).
+    value: 14.0
+    search: { type: float, low: 4.0, high: 16.0, step: 1.0 }
+  rs_window:
+    doc: Relative-strength lookback that orders competing short starts (most negative first).
+    value: 252
+  rs_skip:
+    doc: Most recent bars left out of the relative strength (12-1 momentum).
+    value: 21
+  short_filter:
+    doc: >-
+      none | crowded | momentum, applied at entry. crowded = variant B (only the crowded half by
+      days-to-cover: long rank <= 0.5) — iteration 3, rejected (lab v2: −0.1 to −3.8 points on
+      every test, RESEARCH_LOG.md §6, §13.2); momentum = only names with a negative 12-1 month
+      return (not run: the TRAIN premise split said those breakdowns rebounded more).
+    value: none
+
+  # --- borrow (informed_flow_ls_p1's tiers) --------------------------------------------------
+  short_max_si:
+    doc: Short interest / shares outstanding above which a name is never shorted (and covered).
+    value: 0.3
+  si_mid:
+    doc: Crowding tier of the borrow fee (short interest / shares outstanding).
+    value: 0.1
+  si_high:
+    doc: Upper crowding tier of the borrow fee.
+    value: 0.2
+  borrow_gc:
+    doc: Yearly borrow fee below si_mid, and where there is no short-interest data.
+    value: 0.005
+  borrow_mid:
+    doc: Yearly borrow fee between si_mid and si_high.
+    value: 0.03
+  borrow_high:
+    doc: Yearly borrow fee above si_high.
+    value: 0.1
+  hedge:
+    doc: >-
+      Index fund held short in place of every single-name short slot ("" = off). It must be a
+      column of the panel (lab.py run --hedge adds SPY).
+    value: ""

@@ -1,0 +1,138 @@
+# ===========================================================================
+# earnings_drift — post-earnings-announcement drift, dollar-neutral long/short (proposal 6 of
+# STRATEGY_OVERVIEW.md §6, "also considered"). Evaluated in the shared lab
+# (strategies/proposals_lab/, protocol in its README; every step in RESEARCH_LOG.md). The
+# values below are the pre-registered literature default U0 (RESEARCH_LOG §0) plus the review's
+# data fix `cent_max` (U0f, RESEARCH_LOG "Review fixes") unless the log records an adoption.
+# ===========================================================================
+
+data:
+  universe: Liquid500      # the headless default (tsim optimize); the lab trades its own
+                           # rolling point-in-time universes (TESTS in lab.py)
+  bar: 1d
+  start: "2015-01-01"
+  end: null
+  session: regular
+  max_symbols: 500
+  features: []             # no features.py builder serves earnings: a headless run has no
+                           # events and an empty book (an engine proposal would add one)
+  lab_features: [earn_flag, earn_surprise, earn_actual, earn_estimate, earn_day,
+                 short_interest, fund_shares]   # the lab's frames; short interest only for
+                           # the borrow tiers (days-to-cover), fund_shares unused (declared
+                           # for the cross-strategy round)
+
+optuna:
+  study: earnings-drift-v3 # bump whenever a `search:` bound, the objective or the execution
+                           # model changes (the lab's tuner keeps its own journal); v2 = the
+                           # cent_max data fix, v3 = its warm-up rule (round 2, V0a)
+  sampler: tpe
+  seed: 42
+  n_trials: 120
+  objectives: [alpha_cagr] # a dollar-neutral book: excess over a fully invested basket is
+                           # unreachable by construction
+  score_from: "2016-07-01"
+  min_trades_per_year: 20
+
+backtest:
+  fill: open               # market-on-open orders, the day after the usable bar
+  order_notional: 1000     # 30 + 30 slots of a ~$60k book: ~$1,000 an order
+
+params:
+  surprise:
+    doc: >-
+      price = (EPS actual - estimate) / close before the report session (Livnat & Mendenhall
+      2006; the classic_signals measure); pct = yfinance's % surprise, which explodes for
+      near-zero estimates.
+    value: price
+    search: { type: categorical, choices: [price, pct] }
+  w_ear:
+    doc: >-
+      EAR's share of the event score (0 = the surprise alone, 1 = the reaction alone; 0.5 = the
+      pre-registered mean of the two ranks, Brandt et al. 2008).
+    value: 0.5
+    search: { type: float, low: 0.0, high: 1.0, step: 0.25 }
+  ear_end:
+    doc: >-
+      The reaction window [close before the report session, close ear_end sessions after it];
+      1 covers before-the-open and after-the-close reports. At most 2 (the usable bar).
+    value: 1
+    search: { type: int, low: 0, high: 2 }
+  trail:
+    doc: Bars of past events every rank is taken against (point-in-time thresholds).
+    value: 252
+    search: { type: int, low: 126, high: 504, step: 126 }
+  min_events:
+    doc: Scored events the trailing window needs before it ranks anything.
+    value: 100
+  q:
+    doc: The top / bottom share of the trailing scores that goes long / short (a fifth).
+    value: 0.2
+    search: { type: float, low: 0.1, high: 0.4, step: 0.05 }
+  hold:
+    doc: Sessions a position is held (Bernard & Thomas's 60-day drift window).
+    value: 60
+    search: { type: int, low: 10, high: 120, step: 10 }
+  slots:
+    doc: Positions per side; each slot is gross x side share / slots of the book.
+    value: 30
+    search: { type: int, low: 10, high: 50, step: 10 }
+  gross:
+    doc: >-
+      Long plus short exposure at full slots. The engine locks short proceeds, so gross cannot
+      exceed ~100% when orders are placed; 0.98 leaves headroom for fees.
+    value: 0.98
+  long_share:
+    doc: The long side's share of gross (0.5 = dollar-neutral).
+    value: 0.5
+  sides:
+    doc: both | long | short (the one-side books are diagnostics).
+    value: both
+  dtc_mid:
+    doc: >-
+      Days-to-cover above which a short pays borrow_mid (~the top 7% of TRAIN-era name-days).
+      Days-to-cover, not short interest / shares: that ratio leaks future splits in the lab's
+      data (RESEARCH_LOG §0).
+    value: 7.0
+  dtc_high:
+    doc: Days-to-cover above which a short pays borrow_high (~the top 3%).
+    value: 10.0
+  short_max_dtc:
+    doc: >-
+      Days-to-cover above which a name is never shorted (hard to borrow, squeeze risk; ~the top
+      0.5%); a held short reaching it is bought back.
+    value: 15.0
+  borrow_gc:
+    doc: >-
+      Yearly borrow fee below dtc_mid and where there is no short-interest data (all of E0).
+      informed_flow_ls_p1's rates (D'Avolio 2002; Muravyev, Pearson & Pollet 2022).
+    value: 0.005
+  borrow_mid:
+    doc: Yearly borrow fee between dtc_mid and dtc_high.
+    value: 0.03
+  borrow_high:
+    doc: Yearly borrow fee above dtc_high (up to short_max_dtc).
+    value: 0.1
+  min_price:
+    doc: Minimum close at the decision bar.
+    value: 5.0
+  retrim_k:
+    doc: A long that grows to k x its slot is trimmed back (engine concentration cap; longs).
+    value: 2.0
+  crowd:
+    doc: >-
+      all | crowded | uncrowded. Iteration I2 (RESEARCH_LOG §6): open a position only for a name
+      whose days-to-cover is above (crowded) / at most (uncrowded) the bar's median among the
+      panel's names; no short-interest data = allowed. Held names are re-decided as usual.
+    value: all
+  cent_max:
+    doc: >-
+      The surprise is used only where one cent of EPS (0.01 / close before the report under
+      price, 0.01 / |estimate| under pct) is at most this share of the trailing P20-P80 spread
+      of the surprise measure; elsewhere the event ranks on its reaction alone. yfinance stores
+      EPS on TODAY's split basis rounded to the cent, so a name that split later has tiny,
+      coarse EPS before it (NVDA 2016 actual = estimate = 0.01): without this rule the
+      precision of the surprise depends on future splits (review fix, RESEARCH_LOG "Review
+      fixes" R0; pre-registered, not searched). A trailing window too small to judge (a
+      panel's first ~90 events, January 2015 in the lab) counts as coarse as well (round 2,
+      V0a); .inf switches the rule off.
+    value: 0.25

@@ -1,5 +1,7 @@
 """Panel invariants and configuration loading (no database)."""
 
+import numpy as np
+import pandas as pd
 import pytest
 import yaml
 
@@ -90,3 +92,34 @@ def test_panel_freq_parses_any_minute_bar():
     assert bar_freq("15m") == "15min" and bar_freq("2m") == "2min" and bar_freq("1d") == "1D"
     with pytest.raises(KeyError):
         bar_freq("weekly")
+
+
+def test_us_sessions_only_drops_holiday_rows_no_us_stock_trades():
+    """#50: a listing that also trades abroad put US holidays into a panel's calendar."""
+    from trading_simple.data import us_sessions_only
+    days = pd.to_datetime(["2026-07-01", "2026-07-02", "2026-07-03", "2026-07-06",
+                           "2026-07-07"]).tz_localize("UTC")
+    sessions = days.delete(2)                       # 2026-07-03: Independence Day observed
+    keep = us_sessions_only(days, sessions[:-1], daily=True)     # 07-07 newer than SPY's last
+    assert keep.tolist() == [True, True, False, True, True]
+    guard = us_sessions_only(days, sessions, daily=True,
+                             priced=np.array([1.0, 1.0, 0.9, 1.0, 1.0]))  # most names traded
+    assert guard.all()                             # a gap in SPY's history, not a holiday
+    minutes = pd.to_datetime(["2026-07-02 19:59", "2026-07-03 14:30",
+                              "2026-07-06 13:30"]).tz_localize("UTC")
+    assert us_sessions_only(minutes, sessions, daily=False).tolist() == [True, False, True]
+
+
+def test_a_refresh_that_would_splice_two_adjustment_bases_is_caught():
+    """#52: SPY's stored series jumped +3.43% on 2023-10-17, where unadjusted IBKR rows met
+    yfinance history adjusted for three later years of dividends."""
+    from datetime import datetime
+
+    from trading_simple.db import SPLICE_TOL, PriceBar, splice_step
+    ibkr = PriceBar("SPY", "1d", datetime(2023, 10, 17), 436.0, 438.0, 434.0, 436.0, 436.0,
+                    7e7, "ibkr")
+    yf_stored = (436.04, 421.1)                      # close, adj_close (ratio 0.966)
+    assert splice_step(yf_stored, ibkr) > 0.03 > SPLICE_TOL
+    assert splice_step((436.0, 436.0), ibkr) == 0.0  # same basis: no step
+    assert splice_step(None, ibkr) == 0.0            # nothing stored yet
+

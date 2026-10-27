@@ -9,9 +9,10 @@ consistent price space.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import Engine, text
 
@@ -112,7 +113,9 @@ def load_panel(
             time, never by backfilling 5m/15m separately.
 
     Returns:
-        A :class:`Panel` with adjusted OHLC, volume, and a sorted UTC index.
+        A :class:`Panel` with adjusted OHLC, volume, and a sorted UTC index. A US panel keeps
+        NYSE sessions only (:func:`us_sessions_only`): a listing that also trades on US
+        holidays cannot add rows on which no US stock has a price.
 
     Raises:
         ValueError: On an unknown ``session``, when no data matches, or when
@@ -150,7 +153,77 @@ def load_panel(
         tz=resolve_exchange(symbols[0], exchanges).tz,
         rth=wide("rth").astype(bool) if session == "both" else None,
     )
+    if resolve_exchange(symbols[0], exchanges).code == "US":
+        sessions = _us_sessions(engine, start, end)
+        keep = (us_sessions_only(panel.close.index, sessions, daily=bar == "1d")
+                if len(sessions) else np.ones(len(panel.close), dtype=bool))
+        if not keep.all():                  # only then the guard: share of US names priced
+            us = [c for c in panel.close.columns if resolve_exchange(c, exchanges).code == "US"]
+            priced = np.ones(len(keep))
+            priced[~keep] = panel.close.loc[~keep, us].notna().mean(axis=1).to_numpy()
+            keep = us_sessions_only(panel.close.index, sessions, daily=bar == "1d",
+                                    priced=priced)
+            if not keep.all():
+                panel = _rows(panel, keep)
     return resample_panel(panel, resample) if resample else panel
+
+
+def _us_sessions(engine: Engine, start, end) -> pd.DatetimeIndex:
+    """NYSE session dates around ``[start, end]``: the days SPY has a stored daily bar."""
+    sql = text("""
+        SELECT ts FROM prices_ohlcv
+        WHERE symbol = 'SPY' AND bar = '1d'
+          AND ts >= CAST(:start AS timestamptz) - interval '7 days'
+          AND ts <= COALESCE(CAST(:end AS timestamptz) + interval '7 days', ts)
+        ORDER BY ts
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"start": pd.Timestamp(start),
+                                  "end": pd.Timestamp(end) if end else None}).fetchall()
+    return pd.DatetimeIndex([pd.Timestamp(r[0]) for r in rows])
+
+
+def us_sessions_only(index: pd.DatetimeIndex, sessions: pd.DatetimeIndex, *, daily: bool,
+                     priced: np.ndarray | None = None,
+                     tz: str = "America/New_York") -> np.ndarray:
+    """Which rows of a US panel fall on NYSE sessions (engine proposal #50).
+
+    A panel's calendar is the union of its names' bars, so a listing that also trades
+    abroad (ALC, CFR) put US holidays into it, rows on which no US stock has a price: a book
+    that reads a missing price as "ineligible" exits everything there and rebuilds the next
+    day. A row is dropped when its date is not one of ``sessions`` (SPY's stored daily bars)
+    and, as a guard against a gap in SPY's own history, fewer than half of the panel's
+    US-listed names have a bar on it. Rows outside the span ``sessions`` covers are kept, so
+    a bar newer than SPY's last stored one is never lost.
+
+    Args:
+        index: The panel's UTC index.
+        sessions: SPY's daily bar timestamps (00:00 UTC of each trade date).
+        daily: Daily bars are stored at 00:00 UTC of their trade date, so their session
+            date is the UTC date; an intraday bar's is its New York date.
+        priced: Per row, the share of the panel's US-listed names with a bar (``None``:
+            no guard).
+        tz: The US venue's time zone.
+
+    Returns:
+        A boolean mask, ``True`` for a row to keep.
+    """
+    days = index.tz_convert("UTC" if daily else tz).tz_localize(None).normalize()
+    known = pd.DatetimeIndex(sessions).tz_convert("UTC").tz_localize(None).normalize()
+    inside = (days >= known.min()) & (days <= known.max())
+    off = inside & ~days.isin(known)
+    if priced is not None:
+        off &= np.asarray(priced) < 0.5
+    return ~np.asarray(off)
+
+
+def _rows(panel: Panel, keep: np.ndarray) -> Panel:
+    """The panel on the rows ``keep`` marks (every frame, the session mask included)."""
+    def cut(frame):
+        return None if frame is None else frame.loc[keep]
+
+    return replace(panel, close=cut(panel.close), open_=cut(panel.open_), high=cut(panel.high),
+                   low=cut(panel.low), volume=cut(panel.volume), rth=cut(panel.rth))
 
 
 def resample_panel(panel: Panel, minutes: int) -> Panel:

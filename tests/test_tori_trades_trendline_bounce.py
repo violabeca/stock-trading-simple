@@ -4,7 +4,8 @@ cut; every trade follows the rules it reports (the signal candle came to the lin
 its side, the stop starts beyond the line and only moves in the trade's favour, each exit happened
 for its stated reason at the stated price); shorts on a market turned upside down make exactly
 the longs' trades; the wallet compounds trade by trade; without the session refresh the lines are
-only drawn again after a trade or a broken line.
+only drawn again after a trade or a broken line; ``own_lines`` trades only 15-minute lines and
+the anchor gap keeps every 15-minute line's points A and B apart.
 """
 
 import importlib.util
@@ -153,16 +154,20 @@ def test_every_trade_follows_the_rules(run):
             assert d * (c[k] - line(k)) < -t.give and t.exit == o[t.exit_k]
 
 
-@pytest.mark.parametrize("entry", ["next_open", "limit"])
-def test_shorts_on_an_upside_down_market_make_the_longs_trades(entry):
+@pytest.mark.parametrize(("entry", "method", "bands"),
+                         [("next_open", "walk", 0.0), ("limit", "walk", 0.0),
+                          ("next_open", "cascade", 0.0), ("next_open", "cascade", 0.25)])
+def test_shorts_on_an_upside_down_market_make_the_longs_trades(entry, method, bands):
     """Mirror every price (p -> 300 - p): downward lines become upward lines, highs become lows,
     so the short-only replay of the mirror must trade exactly when and how the long-only replay
-    of the original does (same candles, same R), cost-free, with either entry."""
-    daily, minutes = market()
-    longs = B.replay(daily, minutes, start=START, costs=FREE, sides="long",
-                     entry=entry)["trades"]
+    of the original does (same candles, same R), cost-free, with either entry and either way of
+    drawing the lines (the cascade trades rarely: it gets a longer market)."""
+    daily, minutes = market() if method == "walk" else market(sessions=120, seed=5)
+    knobs = {"entry": entry, "method": method, "screen": 40 if method == "cascade" else 150,
+             "line_band": bands, "price_band": bands, "noise_window": 20}
+    longs = B.replay(daily, minutes, start=START, costs=FREE, sides="long", **knobs)["trades"]
     shorts = B.replay(upside_down(daily), upside_down(minutes), start=START, costs=FREE,
-                      sides="short", entry=entry)["trades"]
+                      sides="short", **knobs)["trades"]
     assert len(longs) >= 3
     for col in ("entry time", "exit time", "line A"):
         assert shorts[col].tolist() == longs[col].tolist()
@@ -226,6 +231,158 @@ def test_target_skip_open_and_reward_keep_to_their_rules():
         ahead = d * (other["a_y"] + other["slope"] * (x[s] - other["a_x"]) - c[s])
         ahead = ahead[ahead > 0]
         assert not len(ahead) or ahead.min() >= 1.5 * risk - 1e-9
+
+
+def test_own_lines_and_the_anchor_gap_keep_to_their_rules():
+    """``own_lines``: every trade bounced off a line drawn on the 15-minute chart.
+    ``anchor_gap`` 16: every 15-minute line drawn at any setup has its points A and B at least
+    16 candles (4 hours) apart, while without the gap some are closer (the knob bites)."""
+    daily, minutes = market()
+    free = B.replay(daily, minutes, start=START, costs=FREE, sides="both")
+    result = B.replay(daily, minutes, start=START, costs=FREE, sides="both", own_lines=True,
+                      anchor_gap=16)
+    trades = result["trades"]
+    assert len(trades) >= 3 and set(trades["line drawn on"]) == {"15m"}
+
+    def apart(drawn):
+        """Candles between points A and B of every 15-minute line of every setup."""
+        lines = pd.concat([v for setup in drawn for v in setup.values()])
+        lines = lines[lines["tf"] == "15m"]
+        return (lines["b_x"] - lines["a_x"]) * 26
+
+    assert (apart(result["lines"]) >= 16 - 1e-9).all()
+    assert (apart(free["lines"]) < 16).any()
+    for t in trades.itertuples(index=False):
+        drawn = result["lines"][t.setup][t.side]
+        assert ((drawn["a_time"] == t[trades.columns.get_loc("line A")])
+                & (drawn["tf"] == "15m")).any()
+
+
+def test_the_cascade_trades_only_its_one_fifteen_minute_line():
+    """``method="cascade"`` with 15-minute lines only: every setup holds at most one line per
+    chart and side, each trade bounced off its setup's 15-minute line, and every line is at
+    least its chart's minimum long. Its one 15-minute line is often far from price, so it
+    trades rarely: it gets a longer market."""
+    daily, minutes = market(sessions=120, seed=5)
+    least = {"1D": 3, "4H": 2, "1H": 2, "15m": 8}
+    result = B.replay(daily, minutes, start=START, costs=FREE, sides="both", method="cascade",
+                      minimum=least, own_lines=True, screen=40)
+    trades = result["trades"]
+    assert len(trades) >= 2 and set(trades["line drawn on"]) == {"15m"}
+    per = {"1D": 1, **{tf: TD.SESSION / m for tf, m in TD.MINUTES.items()}}
+    for setup in result["lines"]:
+        for lines in setup.values():
+            assert lines["tf"].is_unique
+            assert ((lines["b_x"] - lines["a_x"]) * lines["tf"].map(per)
+                    >= lines["tf"].map(least) - 1e-9).all()
+    for t in trades.itertuples(index=False):
+        drawn = result["lines"][t.setup][t.side]
+        mine = drawn[drawn["tf"] == "15m"]
+        assert len(mine) == 1 and mine["a_time"].iloc[0] == t[trades.columns.get_loc("line A")]
+
+
+@pytest.mark.parametrize("entry", ["next_open", "limit"])
+def test_no_position_opens_or_closes_on_the_session_edges(entry):
+    """``trade_trim`` (3, 3): without it some trades open or close on a session's first or last
+    three 15-minute candles; with it no signal, entry or exit does (a close beyond the line on
+    them exits at the first candle after them; a trade still open at the data's end is only
+    valued there). With ``draw_trim`` too, trades still bounce off the 15-minute line."""
+    daily, minutes = market(sessions=120, seed=5)
+    knobs = {"entry": entry, "method": "cascade", "screen": 40, "own_lines": True}
+
+    def on_edges(times):
+        return TD.session_edges(pd.DatetimeIndex(times), "15m", 3, 3)
+
+    free = B.replay(daily, minutes, start=START, costs=FREE, sides="long", **knobs)["trades"]
+    assert on_edges(free["entry time"]).any() or on_edges(free["exit time"]).any()
+    for draw in ((0, 0), (2, 2)):
+        trades = B.replay(daily, minutes, start=START, costs=FREE, sides="long",
+                          trade_trim=(3, 3), draw_trim=draw, **knobs)["trades"]
+        assert len(trades) >= 3 and set(trades["line drawn on"]) == {"15m"}
+        done = trades[trades["reason"] != "still open at the last candle"]
+        assert not on_edges(trades["signal time"]).any()
+        assert not on_edges(trades["entry time"]).any()
+        assert not on_edges(done["exit time"]).any()
+
+
+def test_a_watched_ray_trades_only_once_its_angle_candle_is_confirmed():
+    """``watch``: some trades bounce off a 15-minute ray that was still pending when the lines
+    were drawn (its angle candle among the newest ``confirm``); every trade's signal comes at
+    least ``confirm`` candles after its line's angle candle. Without ``watch`` no trade uses a
+    line pending at its setup."""
+    daily, minutes = market(sessions=120, seed=5)
+    chart = TD.candles(daily, minutes, "15m", TD.clock(daily))
+    knobs = {"method": "cascade", "screen": 40, "own_lines": True, "confirm": 2}
+
+    def pending_at_setup(result):
+        """Per trade: was its line's angle candle too new when the lines were drawn?"""
+        t, setups = result["trades"], result["setups"]
+        made = chart.index.get_indexer(setups["time"].iloc[t["setup"]])
+        angle = chart.index.get_indexer(t["line B"])
+        return angle > made - 2, angle, chart.index.get_indexer(t["signal time"])
+
+    plain = B.replay(daily, minutes, start=START, costs=FREE, sides="both", **knobs)
+    assert len(plain["trades"]) and not pending_at_setup(plain)[0].any()
+    watched = B.replay(daily, minutes, start=START, costs=FREE, sides="both", watch=True,
+                       **knobs)
+    late, angle, signal = pending_at_setup(watched)
+    assert late.any()
+    assert (signal >= angle + 2).all()
+
+
+@pytest.mark.parametrize("sides", ["long", "short"])
+def test_a_bounce_is_confirmed_by_hold_closes_on_the_lines_side(sides):
+    """``hold`` 2: every trade enters at the open three candles after its signal candle, and
+    the two candles in between closed on the line's side; with ``hold`` 0 some trades take a
+    bounce that the next candles did not confirm."""
+    daily, minutes = market()
+    if sides == "short":
+        daily, minutes = upside_down(daily), upside_down(minutes)
+    chart = TD.candles(daily, minutes, "15m", TD.clock(daily))
+    c, x = chart["close"].to_numpy(), chart["x"].to_numpy()
+
+    def held(trades, n):
+        """Per trade: did the ``n`` candles after its signal close on its line's side?"""
+        out = []
+        for t in trades.itertuples(index=False):
+            d = 1 if t.side == "long" else -1
+            s = chart.index.get_loc(t[trades.columns.get_loc("signal time")])
+            after = np.arange(s + 1, s + 1 + n)
+            line = t.a_y + t.slope * (x[after] - t.a_x)
+            out.append(bool((d * (c[after] - line) >= 0).all()))
+        return np.array(out)
+
+    plain = B.replay(daily, minutes, start=START, costs=FREE, sides=sides)["trades"]
+    held2 = B.replay(daily, minutes, start=START, costs=FREE, sides=sides, hold=2)["trades"]
+    assert len(held2) >= 2 and not held(plain, 2).all()
+    assert held(held2, 2).all()
+    signal = chart.index.get_indexer(held2["signal time"])
+    assert (held2["entry_k"].to_numpy() == signal + 3).all()
+
+
+def test_with_noise_bands_trades_keep_to_the_contact_zone():
+    """Line band 0.3 and price band 0.2, the noise over 20 candles: every signal candle reached
+    into the zone (0.5 x the noise known at its open) around its line and closed on the line's
+    side; every first stop lies beyond the zone; every exit on a close came after a close
+    beyond the zone (out at the next open)."""
+    daily, minutes = market(sessions=120, seed=5)
+    chart = TD.candles(daily, minutes, "15m", TD.clock(daily))
+    n = TD.noise(chart, 20)
+    zone = 0.5 * np.r_[n[:1], n[:-1]]
+    lo, c, x = (chart[k].to_numpy() for k in ("low", "close", "x"))
+    result = B.replay(daily, minutes, start=START, costs=FREE, sides="long", method="cascade",
+                      screen=40, own_lines=True, line_band=0.3, price_band=0.2,
+                      noise_window=20)
+    trades = result["trades"]
+    assert len(trades) >= 3
+    for t in trades.rename(columns=lambda name: name.replace(" ", "_")).itertuples():
+        s = chart.index.get_loc(t.signal_time)
+        line = t.a_y + t.slope * (x[s] - t.a_x)
+        assert lo[s] - line <= zone[s] + 1e-9 and c[s] >= line - 1e-9
+        assert t.initial_stop <= t.a_y + t.slope * (x[t.entry_k] - t.a_x) - zone[s] + 1e-9
+        if t.reason == "closed below the line":
+            k = t.exit_k - 1
+            assert c[k] < t.a_y + t.slope * (x[k] - t.a_x) - zone[k] + 1e-9
 
 
 def test_limit_entries_fill_at_the_line():

@@ -6,6 +6,8 @@ notebooks); where a doc and an older research note disagree, the doc wins. Many 
 after engine fixes (wallet `lock_cash` 2026-09-27, portfolio `lock_cash` 2026-10-19) and have not been re-run:
 a number below then comes from the older version named next to it.*
 
+*Update 2026-10-24: proposals 2-5, two of the four "also considered" ideas (earnings drift and cross-asset ETF trend) and five cross-strategies were built and judged in one harness. Proposal 1 was judged in its own harness; see its status note under §6. Their results are in `PROPOSALS_RESULTS.md`, and the status notes under §6 and the list after the §1 table summarize them.*
+
 ---
 
 ## 1. The short answer
@@ -26,6 +28,21 @@ its costs, or has not been run on the current engine.
 
 Three folders appear twice: a failed strategy with a real by-product. `baseline` is the buy-and-hold hurdle,
 not a strategy; `_template` and `informed_flow_ls_dev` are scaffolding.
+
+**Added 2026-10-24 (`PROPOSALS_RESULTS.md`):**
+
+- **Works, confirmed on locked names:** `xs_si_mom_composite` (short interest × residual momentum).
+- **Works to some degree:**
+  - `adaptive_hedge`: open tests only; it fails names 1501-2000;
+  - `xs_portable_alpha`: lower risk, but not a higher return than buy-and-hold.
+- **Passes the open tests, fails on locked names:** `xs_three_book`.
+- **Hypothesis rejected:** `xs_cross_leg`.
+- **Fails the training gate only:** `resid_momentum`. It has a real 2022-25 edge by every other gate and is a
+  useful component.
+- **No edge:**
+  - `quality_junk`, `peer_reversal`, `earnings_drift`, `xs_three_premia`;
+  - `etf_trend`, crash protection only.
+- **Infrastructure:** `proposals_lab` is the shared harness; `informed_flow_ls_p1` is proposal 1's research copy.
 
 The pattern behind the verdicts is consistent across hundreds of tests:
 
@@ -596,6 +613,15 @@ scheduled rebalances, not daily, or every holding is re-traded every day.
   - Turnover; the bands are there to keep it near 100 trades a year.
   - Survivorship makes the short leg look worse than it would have been, which is conservative.
 - **Effort:** low to medium. A new folder; no engine change.
+- **Status (2026-10-24, `strategies/resid_momentum`, `PROPOSALS_RESULTS.md` §5): fails the training gate,
+  so it is neither "works" nor "works to some degree".**
+  - Its 2016-21 alpha is −1.4% (P 0.37): E0 −8.2%, TB +6.5%, T3 −2.9%.
+  - It passes the other seven gates. The edge is a 2022-25 regime: T1 +8.7% (P 0.98), names 501-1000 +5.5%,
+    names 1001-1500 +6.2%. 2026-H2 was negative on all three. All four bear episodes were beaten.
+  - Residual ranking plus the volatility scale keep raw momentum's T1 alpha at 38% of its drawdown (−9.5%
+    vs −25.1%). The scale alone halves it.
+  - The TRAIN-tuned point trailed the untuned default by 3.3 points on T1.
+  - It lives on as the second signal of `xs_si_mom_composite`, the program's survivor.
 
 ### Proposal 3: the adaptive hedge, long the short-interest book plus breakdown shorts that appear only in falling markets
 
@@ -636,6 +662,14 @@ scheduled rebalances, not daily, or every holding is re-traded every day.
   - High-days-to-cover shorts are squeeze candidates.
   - The two parts were each validated alone, never together.
 - **Effort:** medium. A new folder that copies both rule sets; no engine change.
+- **Status (2026-10-24, `strategies/adaptive_hedge`): works to some degree on the open tests, fails on the
+  smallest names.**
+  - The tuned final made TRAIN +5.7%, T1 +11.4% (P 0.985) and names 501-1000 +4.3%. On names 1001-1500
+    (locked) it made +4.2% (P 0.84).
+  - Falling markets: COVID +20.7%, 2022 +25.9%.
+  - The adaptive mechanism failed: the shorts earn by being on all the time, and every adaptive variant lost.
+  - Its CAGR is 5.9% a year (2018-26) against buy-and-hold's 13.8%.
+  - On names 1501-2000 (locked, read once) alpha was −4.8%, with a −57% drawdown.
 
 ### Proposal 4: quality minus junk, beta-neutral
 
@@ -674,6 +708,10 @@ scheduled rebalances, not daily, or every holding is re-traded every day.
   - Low volatility lagged badly in the 2023-24 rally, and even beta-neutral it can lose then.
   - Fundamentals coverage must be checked per bar: thin data goes quiet, it does not fail.
 - **Effort:** low. Existing features only; no engine change.
+- **Status (2026-10-24, `strategies/quality_junk`): no edge.**
+  - The untuned book: T1 −0.4% (P 0.51, the median of shuffled books), names 501-1000 −0.05%.
+  - The tuned pick: T1 +0.6%, T2 +0.0%, and 1.1 points below the default on names 1001-1500.
+  - Its bear-market cushion is largely net short beta: two-thirds for the default, half for the tuned pick.
 
 ### Proposal 5: peer-relative short-term reversal that leans in when markets are stressed
 
@@ -715,6 +753,11 @@ scheduled rebalances, not daily, or every holding is re-traded every day.
   - Reversal has decayed in large caps since the 2000s.
   - Four stress episodes are few, so the switch must not be tuned.
 - **Effort:** medium. The clustering runs inside `signals()`; no engine change.
+- **Status (2026-10-24, `strategies/peer_reversal`): no edge.**
+  - Alpha: TRAIN −7.7%, T1 −3.5%, names 501-1000 −6.5%, names 1001-1500 −2.9%.
+  - On T1 its selection beat random names by about 3 points a year (suggestive, not established). That is
+    half of the ~6 points a year its ~3,100 orders cost.
+  - The stress switch adds nothing, and sector peers beat the correlation clusters.
 
 ### Also considered, and why not in the five
 
@@ -727,10 +770,17 @@ scheduled rebalances, not daily, or every holding is re-traded every day.
 
   That same builder would also unlock ideas parked in `gap_and_go`, `momentum_swing` and `burst_scan`, which
   makes it worth proposing anyway.
+  - **Status (2026-10-24, `strategies/earnings_drift`, built on yfinance reports): no edge.** TRAIN −3.3%,
+    T1 +2.2% (P 0.81), names 501-1000 −0.8%, names 1001-1500 −3.4%. Fills 50 bp worse take T1 to −2.5%.
 - **Cross-asset ETF trend** (stocks, bonds, gold, cash) is the textbook crisis-alpha strategy, and yfinance
   can backfill it to 1993, covering 2000-02 and 2008. It is not stock selection, the DB lacks the ETFs, and
   this repo's market-timing evidence is negative. It is still the right test bench if a timing overlay is
   ever wanted.
+  - **Status (2026-10-24, `strategies/etf_trend`, 23 ETFs backfilled from yfinance): no alpha; a crash
+    protector.**
+    - Alpha vs SPY: +0.02% a year in 2016-26, and +0.11% in 2000-03 (locked).
+    - Its 2004-15 alpha of +5.25% is ~70% the 2008 crash.
+    - It beat SPY in every bear episode (2008-09 +4.6% vs −54.6%), but lost 1.1% in SPY's average down month.
 - **Options as protection or alpha.** Straddles and puts cost what the moves are worth; cheap vs dear is the
   size of the spread; the engine cannot trade options, and the chain history is one trial year.
 - **Anything intraday.** Direction is unpredictable, costs dominate, and the 1-minute history contains no
@@ -744,6 +794,35 @@ scheduled rebalances, not daily, or every holding is re-traded every day.
    warning that "one sleeve is one factor".
 3. **Proposal 3,** once proposal 1's bear test is read.
 4. **Proposal 5,** last, because costs are its main risk.
+
+### What came of it (2026-10-24): the cross-strategies
+
+Proposals 2-5 and two of the four "also considered" ideas (earnings drift, cross-asset ETF trend) were
+built and judged in one harness, `strategies/proposals_lab`. Then five cross-strategies combined what
+worked. Full report: `PROPOSALS_RESULTS.md`.
+
+- **One survivor: `xs_si_mom_composite`.** It is a dollar-neutral 15 + 15 book ranked on short interest plus
+  residual momentum (proposals 1 and 2 merged at the signal level), with nothing tuned. It passed every
+  gate on the open tests.
+- **Its locked confirmation, declared in advance:** names 1501-2000 +8.6% alpha (P 0.963, +6.5% with late
+  fills), and names 1001-1500 +12.4% (P 0.997).
+- **Bear markets:** it made money in the 2022 bear and in Feb-Apr 2025 on all four name sets (2022: +4.5% to
+  +15.4% while those markets lost 16-25%).
+  - Its protection depends on its beta when a fall begins.
+  - On the top 500 that beta has run net long since 2025-H2 (ex-ante +0.65 in 2026). It lost 7.0% in Q4
+    2018 in that configuration.
+  - On smaller names the beta stayed between −0.34 and +0.36.
+- **Buy-and-hold:** it does not beat it in strong bull years. 2018-26 on the top 500: 8.9% a year against
+  13.7% equal-weight and 15.0% for SPY. Against SPY in 2022-26 it won only on the top 500.
+- **The other four designs:**
+  - three books in one account: passes the open tests, fails names 1501-2000;
+  - SI longs with momentum shorts: hypothesis rejected;
+  - a SPY core plus the overlay: 10.1% a year with about 0.4 of buy-and-hold's drawdown, still below
+    buy-and-hold;
+  - adding profitability: costs most of the alpha.
+
+The quality factor (proposal 4) has no edge here, so the three-sleeve book suggested above was tested
+with profitability instead (`xs_three_premia`). It failed.
 
 ---
 

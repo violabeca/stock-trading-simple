@@ -1,0 +1,169 @@
+# ===========================================================================
+# resid_momentum — crash-protected residual momentum, long/short (STRATEGY_OVERVIEW.md §6,
+# proposal 2; proposals lab 2026-10-22). Every value below is the PRE-REGISTERED literature
+# default (RESEARCH_LOG.md §0): nothing here was tuned. One execution fix: `gross` 0.98 -> 0.90,
+# decided on order counts before any return was read (RESEARCH_LOG "Review fixes" R0-R1 and
+# "Round 2" R2.1: at 0.98 the engine cannot hold the last long buys of a full book). The lab
+# (strategies/proposals_lab, v2) trades a rolling point-in-time top 500 (and names 501-1000) and
+# scores every period warm.
+# ===========================================================================
+
+data:
+  universe: Liquid500      # the headless default (tsim optimize); the lab builds its own panels
+  bar: 1d
+  start: "2015-01-01"      # 252-bar beta + 12-month formation: the first ranks exist ~2016-01
+  end: null
+  session: regular
+  max_symbols: 500
+  features: [short_interest, fund_shares]   # the borrow tiers only (the signal is price only)
+
+optuna:
+  study: resid-momentum-v1 # the lab tunes with its own journals (var/proposals_lab/studies2)
+  sampler: tpe
+  seed: 42
+  n_trials: 120
+  objectives: [alpha_cagr] # dollar-neutral, beta near 0: excess over a fully invested basket
+                           # is unreachable by construction (optimize.OBJECTIVES)
+  score_from: "2016-07-01"
+  min_trades_per_year: 20
+
+backtest:
+  fill: open               # live = market-on-open orders
+  # The lab's common order size ($1 minimum = 10 bp a leg). NOT "$1,000 orders on $40k": the
+  # vol scale (~0.7) and the scale's partial resizes make real orders smaller. Measured on U0v2
+  # (RESEARCH_LOG R2.6, research.py orders): a $40k book's median order is $420-900 by test, so
+  # $1,000 is the median order of a ~$45k-95k account (T1: ~$90k). On $40k the minimum costs
+  # 0.04-0.36% of the book a year more, which the 2x-cost runs (-0.45 to -0.5 pt) bound.
+  order_notional: 1000
+
+params:
+  score:
+    doc: >-
+      residual | raw. "residual" ranks the sum of the residual returns e = r - beta * m over the
+      formation window divided by their standard deviation (Blitz, Huij & Martens 2011); "raw"
+      is the 12-1 total return, the pre-registered control arm.
+    value: residual
+  lookback:
+    doc: Bars back to the start of the formation window (252 = 12 months).
+    value: 252
+    search: { type: int, low: 126, high: 252, step: 21 }
+  skip:
+    doc: >-
+      Most recent bars left out of the formation window (21 = the "-1" of 12-1: one month of
+      short-term reversal skipped).
+    value: 21
+    search: { type: categorical, choices: [5, 10, 21] }
+  beta_window:
+    doc: Bars of the trailing OLS beta of each name to the equal-weight market (known at t).
+    value: 252
+    search: { type: categorical, choices: [126, 252] }
+  factors:
+    doc: >-
+      market | market+sector. market+sector adds a second regressor, the equal-weight return of
+      the name's OTHER sector members (lab sector codes), so the residual also drops the sector's
+      own trend (industry momentum, Moskowitz & Grinblatt 1999). Iteration I1 (RESEARCH_LOG §4).
+    value: market
+  min_sector:
+    doc: >-
+      Other priced members a sector needs on a bar for its regressor (else the market stands in
+      for it there, and a name whose sector is always too small keeps the market-only residual).
+    value: 5
+  min_obs:
+    doc: Share of the formation and beta windows that must be observed for a name to be ranked.
+    value: 0.8
+  q_in:
+    doc: Long entry rank (the short side enters at 1 - q_in).
+    value: 0.9
+    search: { type: float, low: 0.85, high: 0.95, step: 0.05 }
+  q_out:
+    doc: Long exit rank (the short side leaves above 1 - q_out).
+    value: 0.8
+    search: { type: float, low: 0.6, high: 0.8, step: 0.1 }
+  slots:
+    doc: Positions per side (20 + 20).
+    value: 20
+    search: { type: int, low: 10, high: 30, step: 5 }
+  gross:
+    doc: >-
+      Long plus short exposure at full scale. The engine locks short proceeds, so a long/short
+      book cannot exceed ~100% gross when orders are placed. Pre-registered 0.98; 0.90 since the
+      review (RESEARCH_LOG "Review fixes" R1, "Round 2" R2.1): vectorbt's free cash leaves out a
+      winning short's gain twice, while targets are shares of the marked book, so at 0.98 the
+      last long buys of a rebalance run out of cash and are never sent again (lab v2: E0 0.71%
+      of the gross never held, 6 longs rejected in T3). At 0.90 the lab's runner holds every
+      target on every OPEN test (0 rejected or partly filled orders).
+    value: 0.9
+  long_share:
+    doc: The long side's share of gross (0.5 = dollar-neutral).
+    value: 0.5
+  vol_target:
+    doc: >-
+      Crash protection (Barroso & Santa-Clara 2015): every slot is scaled by min(1, vol_target /
+      the unscaled book's trailing realized volatility), decided at month ends only. 0 = off
+      (the C_res and C_raw control arms).
+    value: 0.1
+    search: { type: float, low: 0.06, high: 0.2, step: 0.02 }
+  vol_window:
+    doc: Bars of the unscaled book's realized volatility (126 = six months, as in the paper).
+    value: 126
+    search: { type: categorical, choices: [63, 126, 252] }
+  vol_step:
+    doc: >-
+      The scale is rounded to this step, so it changes rarely (every change re-trades every
+      holding: the engine trades a name only when its target changes).
+    value: 0.25
+  min_scale:
+    doc: The smallest book scale (the book is never switched off entirely).
+    value: 0.25
+  min_price:
+    doc: Minimum close to be ranked, and to count in the equal-weight market return.
+    value: 5.0
+  min_history:
+    doc: Minimum bars of history to be ranked.
+    value: 252
+  short_max_si:
+    doc: >-
+      Short interest / shares outstanding above which a name is never shorted (hard to borrow;
+      a held short above it is covered at the next month end). As informed_flow_ls_p1.
+    value: 0.3
+  si_mid:
+    doc: Crowding tier of the borrow fee (short interest / shares outstanding).
+    value: 0.1
+  si_high:
+    doc: Upper crowding tier of the borrow fee.
+    value: 0.2
+  borrow_gc:
+    doc: >-
+      Yearly borrow fee below si_mid, and wherever there is no short-interest data (before
+      2018-01). informed_flow_ls_p1's assumption (general collateral ~0.25-0.5%: D'Avolio 2002).
+    value: 0.005
+  borrow_mid:
+    doc: Yearly borrow fee between si_mid and si_high.
+    value: 0.03
+  borrow_high:
+    doc: Yearly borrow fee above si_high (up to short_max_si).
+    value: 0.1
+  retrim_k:
+    doc: >-
+      A long that grows to k x its slot is trimmed back (the engine's concentration cap, longs
+      only; 0 = off). As informed_flow_ls_p1.
+    value: 2.0
+  sizing:
+    doc: >-
+      equal | beta. "beta" (informed_flow_ls_p1's rule) scales a slot at entry by the median
+      beta / the name's beta (between 1/max_size and max_size), frozen while held, so both sides
+      carry about the same market risk. Iteration I2 (RESEARCH_LOG §5).
+    value: equal
+  max_size:
+    doc: Bounds of "beta" sizing (a slot between 1/max_size and max_size of its equal size).
+    value: 1.5
+  phased:
+    doc: >-
+      false (§0's execution, the default since round 2): every order at the first open after a
+      month end. true: what closes or shrinks trades at the first open, what opens or grows at
+      the second. Only the SHARED engine needs it (a headless `tsim` run): its call_seq="auto"
+      places a bar's new shorts before the covers that fund them under locked short proceeds,
+      so a new short is rejected or part-filled and never re-sent. The lab's runner (v2,
+      lab.run_portfolio) orders covers first, so phasing changes nothing there but a session's
+      delay (RESEARCH_LOG "Review fixes" R0, "Round 2" R2.1).
+    value: false

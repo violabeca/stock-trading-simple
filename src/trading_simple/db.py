@@ -283,6 +283,72 @@ def upsert_prices(engine: Engine, bars: list[PriceBar]) -> int:
     return _executemany(engine, sql, [asdict(b) for b in bars])
 
 
+#: A daily refresh whose adj_close / close ratio steps by more than this against the stored
+#: bars it meets splices two adjustment bases (engine proposal #52). Below it: rounding, or a
+#: dividend going ex between two neighbouring bars that do not overlap.
+SPLICE_TOL = 0.005
+
+
+def splice_step(stored: tuple[float, float] | None, bar: PriceBar) -> float:
+    """Relative step of the adjustment ratio ``adj_close / close`` from a stored bar to a new one.
+
+    Args:
+        stored: ``(close, adj_close)`` of the stored daily bar the new one meets, or ``None``.
+        bar: The new bar.
+
+    Returns:
+        ``|ratio_new / ratio_stored − 1|``; 0.0 when either ratio is unknown.
+    """
+    if stored is None or not all((stored[0], stored[1], bar.close, bar.adj_close)):
+        return 0.0
+    close, adj = float(stored[0]), float(stored[1])
+    return abs((bar.adj_close / bar.close) / (adj / close) - 1.0)
+
+
+def adjustment_splice(engine: Engine, bars: list[PriceBar]) -> float:
+    """The largest step a daily refresh would put into its symbol's stored adjusted history.
+
+    Adjusted closes are a basis, not a fact: yfinance rescales a symbol's whole history after
+    every dividend, and IBKR stores ``adj_close = close``. Rows from two downloads (or two
+    providers) that meet therefore step at the junction. SPY's stored series jumped +3.43% on
+    2023-10-17, where unadjusted IBKR rows met yfinance history adjusted for three later years
+    of dividends, and every adjusted backtest read the jump as a return. The new bars are
+    compared at both ends with the stored bar they meet: on the same date when the ranges
+    overlap (an exact test), else with the neighbouring bar.
+
+    Args:
+        engine: Database engine.
+        bars: One symbol's new daily bars.
+
+    Returns:
+        The larger of the two junction steps (:func:`splice_step`); 0.0 if nothing is stored.
+    """
+    if not bars:
+        return 0.0
+    bars = sorted(bars, key=lambda b: b.ts)
+    first, last = bars[0], bars[-1]
+    sql = """
+        SELECT close, adj_close FROM prices_ohlcv
+        WHERE symbol = :symbol AND bar = '1d' AND ts {op} :ts ORDER BY ts {order} LIMIT 1
+    """
+    with engine.connect() as conn:
+        before = conn.execute(text(sql.format(op="<=", order="DESC")),
+                              {"symbol": first.symbol, "ts": first.ts}).fetchone()
+        after = conn.execute(text(sql.format(op=">=", order="ASC")),
+                             {"symbol": last.symbol, "ts": last.ts}).fetchone()
+    return max(splice_step(tuple(before) if before else None, first),
+               splice_step(tuple(after) if after else None, last))
+
+
+def stored_span(engine: Engine, symbol: str, bar: str = "1d") -> tuple[datetime, datetime] | None:
+    """First and last stored bar timestamps of one symbol and bar size, or ``None``."""
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT min(ts), max(ts) FROM prices_ohlcv "
+                                "WHERE symbol = :symbol AND bar = :bar"),
+                           {"symbol": symbol, "bar": bar}).fetchone()
+    return (row[0], row[1]) if row and row[0] is not None else None
+
+
 def upsert_insider(engine: Engine, trades: list[InsiderTrade]) -> int:
     """Insert insider trades, ignoring duplicates (key: ``insider_trades_uq``).
 

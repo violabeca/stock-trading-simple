@@ -1,0 +1,128 @@
+# ===========================================================================
+# xs_cross_leg — cross-leg book: short-interest (SI) longs, residual-momentum (MOM) shorts
+# (proposals lab, cross-strategy round, 2026-10-23). A research folder judged in
+# strategies/proposals_lab (lab v2): RESEARCH_LOG.md holds the pre-registration and every
+# number. strategy.py is a thin wrapper of strategies/xs_si_mom_composite/strategy.py (pinned
+# by SHA-256); every value below is a component's shipped or untuned one (informed_flow_ls_p1
+# v6 for the book and SI, resid_momentum U0v2 for MOM). The only design choice is which signal
+# trades which side. Nothing here was tuned (C_U0). The reverse cross C_rev (long_sleeves mom,
+# short_sleeves si) is the built-in falsification control.
+# ===========================================================================
+
+data:
+  universe: Liquid500      # the headless default (tsim optimize); the lab builds its own panels
+  bar: 1d
+  start: "2015-01-01"      # MOM needs a 252-bar beta + a 252-bar formation window first
+  end: null
+  session: regular
+  max_symbols: 500
+  features: [short_interest, fund_shares]   # the lab adds `sector` (unused here)
+
+optuna:
+  study: xs-cross-leg-v1   # the lab runs its own books (var/proposals_lab/results2)
+  sampler: tpe
+  seed: 42
+  n_trials: 1              # nothing is searched: the one trial records the config
+  objectives: [alpha_cagr] # dollar-neutral, beta near 0 (optimize.OBJECTIVES)
+  score_from: "2018-07-01" # short interest starts 2018-01; the 42-bar average is warm by then
+  min_trades_per_year: 20
+
+backtest:
+  fill: open               # live = market-on-open orders
+  order_notional: 1000     # a ~$33k account: 30 slots of 3% (15 a side)
+
+params:
+  long_sleeves:
+    doc: >-
+      Sleeve(s) of the long side's ranking ("+"-joined subset of si, mom, prof). si = the
+      design (SI's long rule is its best-replicated part); the reverse cross C_rev sets mom.
+    value: si
+  short_sleeves:
+    doc: >-
+      Sleeve(s) of the short side's ranking. mom = the design (MOM's short leg is its most
+      significant one on T1). Different from long_sleeves: longs are chosen first from the long
+      score, then shorts from the short score masked where a name is held long.
+    value: mom
+  w_si:
+    doc: Weight of the short-interest rank inside a side that lists si (one sleeve a side here).
+    value: 1.0
+  w_mom:
+    doc: Weight of the residual-momentum rank inside a side that lists mom.
+    value: 1.0
+  w_prof:
+    doc: Weight of the profitability rank (unused here, since no side lists prof).
+    value: 1.0
+  combine:
+    doc: >-
+      rank (one ranking per side: the design). book (the composite's C_mix control) needs equal
+      sleeves on both sides, so it is invalid here.
+    value: rank
+  short_gate:
+    doc: '"" (off) | prof (the composite''s junk gate on shorts; not used by this design).'
+    value: ""
+  neutral:
+    doc: '"" (off) | sector (the composite''s sector-neutral ranks; not used by this design).'
+    value: ""
+  gross:
+    doc: >-
+      Long plus short exposure as a share of the book. 0.90, not p1's 0.98: shorts lock cash,
+      and a winning short's locked gain leaves the last buys of a full book short of cash
+      (resid_momentum R2.1); the execution audit moves it to 0.85 if orders are refused.
+    value: 0.9
+  slots:
+    doc: Positions per side (15 + 15, informed_flow_ls_p1 v6); 3.0% of the book a slot.
+    value: 15
+  q_in:
+    doc: Long entry rank (a short enters at 1 - q_in = 0.10 of the MOM score).
+    value: 0.9
+  q_out:
+    doc: Long exit rank (a short leaves above 1 - q_out = 0.20).
+    value: 0.8
+  max_hold:
+    doc: Bars a position is held unless it still ranks in its entry zone (the clock restarts).
+    value: 126
+  score_smooth:
+    doc: Bars a side's score is averaged over before it is re-ranked (p1 v6's 5).
+    value: 5
+  dtc_window:
+    doc: Bars days-to-cover is averaged over before ranking (informed_flow since v34).
+    value: 42
+  neutral_groups:
+    doc: Dollar-volume groups the SI rank is taken within (days-to-cover's liquidity lean).
+    value: 5
+  short_stop:
+    doc: >-
+      The squeeze stop: a short whose close rises this far above its entry close is bought
+      back and not shorted again until its rank has left the short zone once (p1 v6: 1.0).
+    value: 1.0
+  short_max_si:
+    doc: Short interest / shares outstanding above which a name is never shorted (or kept).
+    value: 0.3
+  si_mid:
+    doc: Crowding tier of the borrow fee (short interest / shares outstanding).
+    value: 0.1
+  si_high:
+    doc: Upper crowding tier of the borrow fee.
+    value: 0.2
+  borrow_gc:
+    doc: Yearly borrow fee below si_mid (general collateral, D'Avolio 2002).
+    value: 0.005
+  borrow_mid:
+    doc: Yearly borrow fee between si_mid and si_high.
+    value: 0.03
+  borrow_high:
+    doc: Yearly borrow fee above si_high (up to short_max_si).
+    value: 0.1
+  min_price:
+    doc: Minimum close to be ranked (and to count in MOM's equal-weight market).
+    value: 5.0
+  retrim_k:
+    doc: A long that grows to k x its slot is trimmed back (the engine's cap, longs only).
+    value: 2.0
+  short_sizing:
+    doc: >-
+      equal | beta. equal = the design (the core's book). beta = iteration I2b (RESEARCH_LOG
+      §0.7): each short slot scaled at entry by the bar's median beta / the name's 126-bar beta,
+      clipped to 1/1.5 .. 1.5 and frozen while held; the short side's nominal gross is capped
+      at gross / 2; longs stay equal.
+    value: equal

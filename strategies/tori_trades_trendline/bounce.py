@@ -53,6 +53,62 @@ fills inside that candle (at the open when price opened inside the band; never w
 beyond the line). The trend filter reads the candle's open instead of the signal close. On the
 fill candle the stop may still be hit after the fill (assumed: the worst case, at the stop), and
 the target is only checked from the next candle.
+
+Two more, off by default (user, 2026-10-27). ``own_lines`` trades only the lines drawn on the
+trading chart. A trade bounces off the line closest to price, the last line of the top-down
+chain, unless ``min_span`` skips that one. The last line is a trading-chart line whenever the
+walk drew one. So this means: when the trading chart drew no line on a side, that side does not
+trade (on NOW with tune.py's trial 417 and no trend filter, 28 of 280 trades were on a 1-hour,
+4-hour, daily or weekly line). ``anchor_gap`` is
+``topdown.top_down``'s ``gap``: a line drawn on the trading chart needs its points A and B at
+least that many of its candles apart (16 on the 15-minute chart = 4 hours). A shorter one is
+not a line yet, and the chain ends before it.
+
+``method="cascade"`` (user, 2026-10-27; the default stays ``"walk"``) draws the lines the
+user's way, ``topdown.cascade``: one line per side on each of the daily, 4-hour, 1-hour and
+trading charts, each starting at the point B of the one above. The daily one starts at the
+extreme of the last ``screen`` daily candles. Every line is strict (no candle crosses it, B is
+its angle candle), and it is not a line yet when its A and B are closer than its chart's
+``minimum`` (``anchor_gap`` for the trading chart). ``touch``, ``pierce`` and ``on_line`` do not
+apply to it.
+
+Two session-edge knobs (user, 2026-10-27), both off by default, count candles of the trading
+chart from each session's open and close (a half-day closes at 13:00). ``draw_trim = (first,
+last)`` leaves those candles out of the cascade's trading-chart line (``topdown.cascade``'s
+``trim``). ``trade_trim = (first, last)`` opens and closes no position on them: no signal, no
+fill, no stop or target fill, no exit on a close beyond the line. A stop crossed during them
+fills on the first candle after them (at its open when price is already beyond it); the stop
+still trails on them.
+
+``watch`` (user, 2026-10-27; cascade only, off by default). While waiting, the lines are
+redrawn only when a candle breaks a line without giving a signal (and after every trade and at
+every session's close), never after every candle. After such a break the cascade's new
+trading-chart line is usually still pending: the breaking candle is its own angle candle, too new
+to count. Without ``watch`` the side then waits for the next session's close, as it did after
+all 16 breaks on NOW. With ``watch`` that pending ray is kept. It becomes a line by itself once
+``confirm`` candles have followed its angle candle, and a candle reaching through it before then
+changes it, so the lines are redrawn. Only a ray that is pending because its angle candle is too
+new is watched; one too short for the chart's minimum never becomes a line.
+
+``hold`` (user, 2026-10-27; next-open entries, 0 by default) confirms a bounce. After the
+signal candle (it came to the line and closed on its side), the next ``hold`` candles must close
+on the line's side too; the entry is at the open after the last of them. A close beyond the line
+among them means the bounce failed: no trade, and since the line broke, the lines are drawn
+again. While a bounce waits for its confirmation no other signal is taken and the session-close
+redraw waits, so the confirmation can run on into the next session.
+
+Noise bands (user, 2026-10-27; off by default). The stock's noise is the moving average of the
+true range (``topdown.noise``: ``noise_window`` candles of each chart), recomputed at every
+candle. ``line_band`` draws every line of the cascade as a band of ``line_band`` x its chart's
+noise (``topdown.cascade``'s ``band``). ``price_band`` adds the price's own uncertainty: around
+the traded line lies a contact zone of (``line_band`` + ``price_band``) x the trading chart's
+noise, as known at each candle's open. With bands, the zone replaces the entry gap and the close
+break, and pushes the stop out:
+- a signal is a candle reaching into the zone that closes on the line's side of it;
+- a break (and a failed bounce, and the exit on a close) is a close beyond the zone;
+- a close inside the zone, beyond the line, is noise: neither a signal nor a break;
+- the stop sits ``room`` typical candles beyond the zone;
+- a watched ray changes (a break) when a candle reaches beyond its line band.
 """
 
 from __future__ import annotations
@@ -179,7 +235,12 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
            confirm: int = 2, screen: int = 150, band: float = 0.25, room: float = 0.5,
            give: float = 0.0, shift: float = 0.0, refresh: bool = True, trend: int = 0,
            min_span: float = 0.0, target: float = 0.0, skip_open: int = 0,
-           reward: float = 0.0, entry: str = "next_open", cash: float = 10_000.0,
+           reward: float = 0.0, entry: str = "next_open", own_lines: bool = False,
+           anchor_gap: int = 0, on_line: bool = False, method: str = "walk",
+           minimum: dict[str, int] | None = None, draw_trim: tuple[int, int] = (0, 0),
+           trade_trim: tuple[int, int] = (0, 0), watch: bool = False, hold: int = 0,
+           line_band: float = 0.0, price_band: float = 0.0, noise_window: int = 150,
+           cash: float = 10_000.0,
            cache: dict | None = None, book: Chartbook | None = None) -> dict:
     """Trade her bounce from ``start`` to the last candle.
 
@@ -211,10 +272,34 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
         entry: ``"next_open"`` (a candle comes to the line and closes on its side: in at the
             next open) or ``"limit"`` (a resting order at the line plus ``band``, filled inside
             the candle that reaches it; at the open when price opened in the band).
+        own_lines: Trade only the lines drawn on the trading chart: no trading-chart line on a
+            side, no trade on that side.
+        anchor_gap: A line drawn on the trading chart needs its points A and B at least this
+            many of its candles apart (``topdown.top_down``'s ``gap``; 0: none).
+        on_line: Point B is the angle candle, on the line, and every line starts exactly on the
+            one before it (``topdown.top_down``'s ``on_line``); else B is the latest touch.
+        method: ``"walk"`` (her chain, ``topdown.top_down``: as many lines as each chart
+            allows) or ``"cascade"`` (one line per chart, ``topdown.cascade``).
+        minimum: With the cascade, ``{chart: candles}`` a line of that chart needs between its
+            points A and B (``anchor_gap``, if set, is the trading chart's).
+        draw_trim: With the cascade, ``(first, last)`` candles of every session left out of
+            the trading chart's line.
+        trade_trim: ``(first, last)`` candles of every session on which no position is opened
+            or closed (a stop crossed then fills on the first candle after them).
+        watch: With the cascade, keep the trading chart's pending ray (its angle candle too
+            new) as a line that may trade once ``confirm`` candles have followed its angle
+            candle; a candle reaching through it before then redraws the lines.
+        hold: Next-open entries: candles after the signal candle that must also close on the
+            line's side before the entry (0: in at the next open, her rule).
+        line_band: With the cascade, every line is a band of this many times its chart's noise.
+        price_band: The price's own band, in the trading chart's noise: with ``line_band`` it
+            makes the contact zone that replaces ``band`` and ``give`` (0 and 0: no bands).
+        noise_window: Candles in the noise's moving average.
         cash: The wallet at the start.
         cache: A dict that keeps the lines drawn at each candle, to share between replays of
             the same data and line knobs (``tf``, ``log``, ``touch``, ``pierce``, ``confirm``,
-            ``screen``): a sweep over the trading knobs then draws every setup once.
+            ``screen``, ``anchor_gap``, ``on_line``, ``method``, ``minimum``): a sweep over the
+            trading knobs then draws every setup once.
         book: A :class:`Chartbook` of the same ``daily`` and ``minutes`` holding every chart up
             to ``tf``, to share between replays (it builds the charts once); without it each
             setup builds them from the minutes (:func:`snapshot`). Same results either way.
@@ -225,14 +310,14 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
         ``a_y``, ``slope`` are the action line as traded, shift included; ``band``, ``room`` and
         ``give`` in the lines' scale), ``setups`` (every time the lines were drawn, and why),
         ``lines`` (every line drawn at each setup, by its number: ``{"long": upward lines,
-        "short": downward lines}``, both kinds whatever ``sides`` trades, before ``min_span``
-        and unshifted),
+        "short": downward lines}``, both kinds whatever ``sides`` trades, before ``own_lines``,
+        ``min_span`` and the shift),
         ``stops`` (the stop at the close of every candle in a trade), ``equity`` (strategy and
         buy-and-hold, marked at every close) and ``summary``.
 
     Raises:
-        ValueError: On an unknown ``sides``, or when ``start`` leaves no candle before it or
-            none to trade.
+        ValueError: On an unknown ``sides``, ``entry`` or ``method``, or when ``start`` leaves
+            no candle before it or none to trade.
     """
     from trading_simple.backtest import leg_costs
 
@@ -240,6 +325,8 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
         raise ValueError(f"sides must be long, short or both, got {sides!r}")
     if entry not in ("next_open", "limit"):
         raise ValueError(f"entry must be next_open or limit, got {entry!r}")
+    if method not in ("walk", "cascade"):
+        raise ValueError(f"method must be walk or cascade, got {method!r}")
     traded = ["long", "short"] if sides == "both" else [sides]
     sessions = td.clock(daily)
     order = list(td.TIMEFRAMES)
@@ -256,10 +343,19 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
     favour = {"long": hi, "short": lo}           # the side that reaches a target
     slot = ((chart.index.hour * 60 + chart.index.minute - td.OPEN)
             // td.MINUTES[tf]).to_numpy()        # the candle's place in its session, 0 first
+    quiet = (td.session_edges(chart.index, tf, *trade_trim) if any(trade_trim)
+             else np.zeros(len(chart), bool))    # no position opened or closed on these
+    banded = bool(line_band or price_band)
+    known = td.noise(chart, noise_window, log) if banded else np.zeros(len(chart))
+    known = np.r_[known[:1], known[:-1]]         # the noise as known at each candle's open
+    zone = (line_band + price_band) * known      # the contact zone around the traded line
+    wline = line_band * known                    # the line band alone
     size, last = pd.Timedelta(minutes=td.MINUTES[tf]), len(chart) - 1
     average = (daily["close"].rolling(trend).mean().shift(1)    # closes before the session
                .reindex(chart.index.normalize()).to_numpy() if trend else None)
-    knobs = {"log": log, "touch": touch, "pierce": pierce, "confirm": confirm, "screen": screen}
+    knobs = {"log": log, "touch": touch, "pierce": pierce, "confirm": confirm, "screen": screen,
+             "gap": anchor_gap, "on_line": on_line}
+    steps = {**(minimum or {}), **({tf: anchor_gap} if anchor_gap else {})}
     setups, drawn, trades, stops = [], [], [], []
 
     def y(v):
@@ -273,39 +369,62 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
     def set_up(k, reason):
         """The traded sides' lines as of the close of candle ``k``, the typical candle, and
         each side's lines as arrays (point A's clock position and value, slope)."""
-        key = (k, tf, log, touch, pierce, confirm, screen)
+        key = (k, tf, log, touch, pierce, confirm, screen, anchor_gap, on_line, method,
+               tuple(sorted(steps.items())), tuple(draw_trim), line_band, noise_window)
         if cache is None or key not in cache:
             cutoff = (chart.index[k] + size).tz_localize(td.NY)
             frames = (book.at(cutoff) if book is not None
                       else snapshot(daily, minutes, cutoff, charts, sessions))
             kinds = {}
             for kind in ("up", "down"):
-                every = td.top_down(frames, kind, **knobs)[tf]
-                kinds[kind] = every[every["confirmed"].astype(bool)].reset_index(drop=True)
+                if method == "cascade":           # one line per chart, from the daily one
+                    every = td.cascade({c: frames[c] for c in charts[charts.index("1D"):]},
+                                       kind, window=screen, confirm=confirm, minimum=steps,
+                                       trim=tuple(draw_trim), band=line_band,
+                                       noise_window=noise_window, log=log)
+                else:
+                    every = td.top_down(frames, kind, **knobs)[tf]
+                kinds[kind] = every.reset_index(drop=True)      # a pending ray comes last
             found = kinds, td._typical(frames[tf].iloc[-screen:], log)
             if cache is not None:
                 cache[key] = found
         else:
             found = cache[key]
-        lines = {side: found[0][SIDES[side][0]] for side in traded}
+        shown = {}                               # each kind's lines, the watched ray included
+        for side, (kind, _) in SIDES.items():
+            v = found[0][kind]
+            ok = v["confirmed"].astype(bool).to_numpy().copy()
+            ready = np.zeros(len(v))             # the first candle a line may give a signal on
+            if (watch and method == "cascade" and side in traded and len(v) and not ok[-1]
+                    and v["tf"].iloc[-1] == tf and v["stop_time"].iloc[-1] in chart.index):
+                ray, j = v.iloc[-1], chart.index.get_loc(v["stop_time"].iloc[-1])
+                apart = (ray["b_x"] - ray["a_x"]) * td.SESSION / td.MINUTES[tf]
+                if j > k - confirm and apart >= steps.get(tf, 0) - 1e-9:   # only too new
+                    ok[-1], ready[-1] = True, j + confirm + (entry == "limit")
+            shown[side] = v[ok].assign(ready=ready[ok]).reset_index(drop=True)
+        lines = {side: shown[side] for side in traded}
+        if own_lines:                            # the trading chart's own lines only
+            lines = {side: v[v["tf"] == tf].reset_index(drop=True) for side, v in lines.items()}
         if min_span:
             lines = {side: v[(v["b_x"] - v["a_x"]) >= min_span].reset_index(drop=True)
                      for side, v in lines.items()}
         setups.append({"setup": len(setups), "time": chart.index[k], "x": x[k],
                        "reason": reason, **{f"{side} lines": len(lines[side])
                                             for side in traded}})
-        drawn.append({side: found[0][kind] for side, (kind, _) in SIDES.items()})
-        geo = {side: tuple(v[col].to_numpy(float) for col in ("a_x", "a_y", "slope"))
+        drawn.append({side: v.drop(columns="ready") for side, v in shown.items()})
+        geo = {side: tuple(v[col].to_numpy(float) for col in ("a_x", "a_y", "slope", "ready"))
                for side, v in lines.items()}
         # the lines of the other kind, for ``reward``: downward lines over a long, upward under
-        # a short (every one drawn, whatever ``min_span``)
-        opposite = {side: tuple(found[0]["down" if side == "long" else "up"][col].to_numpy(float)
-                                for col in ("a_x", "a_y", "slope")) for side in traded}
+        # a short (every confirmed one drawn, whatever ``min_span``)
+        opposite = {side: tuple(shown["short" if side == "long" else "long"].query("confirmed")
+                                [col].to_numpy(float) for col in ("a_x", "a_y", "slope"))
+                    for side in traded}
         return lines, found[1], (geo, opposite)
 
-    def enter(k, side, line, stop, typical, moved, fill=None):
+    def enter(k, side, line, stop, typical, moved, fill=None, signal=None):
         """Open a position with the whole wallet during candle ``k``: at its open, or at
-        ``fill`` (a limit order filled inside the candle)."""
+        ``fill`` (a limit order filled inside the candle); ``signal`` is the candle that came
+        to the line (the one before ``k`` by default)."""
         paid = o[k] if fill is None else fill
         fee, slip = leg_costs(costs, price=paid, notional=wallet)
         d = SIDES[side][1]
@@ -314,7 +433,8 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
         return {"side": side, "d": d, "setup": len(setups) - 1, "line": line, "moved": moved,
                 "ax": float(line["a_x"]), "ay": float(line["a_y"]) + moved,
                 "slope": float(line["slope"]), "target": goal, "entry": paid,
-                "signal": k if fill is not None else k - 1, "fresh": fill is not None,
+                "signal": (signal if signal is not None else k if fill is not None else k - 1),
+                "fresh": fill is not None,
                 "k": k, "stop": stop, "stop0": stop, "typical": typical, "cost": wallet,
                 "shares": shares,
                 "proceeds": 0.0 if d > 0 else shares * paid * (1 - slip) * (1 - fee)}
@@ -343,38 +463,45 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
             "return": wallet / pos["cost"] - 1, "candles": k - pos["k"] + 1,
             "entry_k": pos["k"], "exit_k": k, "a_x": line["a_x"],
             "a_y": line["a_y"] + pos["moved"], "slope": line["slope"],
-            "band": band * pos["typical"], "room": room * pos["typical"],
+            "band": pos["reach"], "room": room * pos["typical"],
             "give": give * pos["typical"]})
         return wallet
 
     lines, typical, (geo, opposite) = set_up(first - 1, START)
     wallet, pos, enter_at, close_why, value = float(cash), None, None, None, []
+    bounce = None              # a signal waiting for ``hold`` closes: (side, line, candle, left)
     for k in range(first, last + 1):
-        if close_why is not None:                # closed beyond the line: out at this open
+        if close_why is not None and not quiet[k]:   # closed beyond the line: out at this open
             wallet, pos, close_why = leave(k, o[k], close_why), None, None
         if enter_at is not None:
-            side, i = enter_at
+            side, i, touched = enter_at
             enter_at, line, d = None, lines[side].iloc[i], SIDES[side][1]
             moved = d * shift * typical
-            ax, ay, slope = geo[side]
-            stop = ay[i] + slope[i] * (x[k] - ax[i]) + moved - d * room * typical
+            ax, ay, slope, _ = geo[side]
+            stop = (ay[i] + slope[i] * (x[k] - ax[i]) + moved
+                    - d * (room * typical + zone[touched]))
             if d * (y(o[k]) - stop) > 0:         # an open beyond the stop is no trade
-                pos, wallet = enter(k, side, line, stop, typical, moved), 0.0
+                pos, wallet = enter(k, side, line, stop, typical, moved, signal=touched), 0.0
+                pos["reach"] = zone[touched] if banded else band * typical
         if pos is None and entry == "limit":
             # a resting limit order at every traded line, the entry gap beyond it: price fills
             # the first one it meets inside this candle (at the open when it opened in the band)
             fills, broke = [], False
             for side in traded:
-                ax, ay, slope = geo[side]
+                ax, ay, slope, ready = geo[side]
                 if not len(ax):
                     continue
                 d = SIDES[side][1]
                 at = ay + slope * (x[k] - ax) + d * shift * typical
-                broke = broke or bool((d * (y(c[k]) - at) < 0).any())
-                if (trend and not d * (o[k] - average[k]) > 0) or slot[k] < skip_open:
+                early = k < ready                 # a watched ray not confirmed yet
+                broke = (broke or bool((d * (y(c[k]) - at) < -zone[k]).any())
+                         or bool((early & (d * (y(extreme[side][k]) - at) < -wline[k])).any()))
+                if ((trend and not d * (o[k] - average[k]) > 0) or slot[k] < skip_open
+                        or quiet[k]):
                     continue
-                level = at + d * band * typical
-                live = (d * (y(o[k]) - at) > 0) & (d * (y(extreme[side][k]) - level) <= 0)
+                level = at + d * (zone[k] if banded else band * typical)
+                live = ((d * (y(o[k]) - at) > 0) & (d * (y(extreme[side][k]) - level) <= 0)
+                        & ~early)
                 if not live.any():
                     continue
                 i = int(np.argmax(np.where(live, d * level, -np.inf)))
@@ -383,7 +510,7 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
                     oax, oay, oslope = opposite[side]
                     ahead = d * (oay + oslope * (x[k] - oax) - paid)
                     ahead = ahead[ahead > 0]
-                    if ahead.size and ahead.min() < reward * (d * (paid - at[i])
+                    if ahead.size and ahead.min() < reward * (d * (paid - at[i]) + zone[k]
                                                               + room * typical):
                         continue
                 fills.append((side, i, paid))
@@ -391,11 +518,12 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
                 side, i, paid = fills[0]
                 line, d = lines[side].iloc[i], SIDES[side][1]
                 moved = d * shift * typical
-                ax, ay, slope = geo[side]
-                stop = ay[i] + slope[i] * (x[k] - ax[i]) + moved - d * room * typical
+                ax, ay, slope, _ = geo[side]
+                stop = (ay[i] + slope[i] * (x[k] - ax[i]) + moved
+                        - d * (room * typical + zone[k]))
                 if d * (paid - stop) > 0:
                     pos = enter(k, side, line, stop, typical, moved, fill=price(paid))
-                    wallet = 0.0
+                    pos["reach"], wallet = (zone[k] if banded else band * typical), 0.0
             if pos is None:
                 closing = (k < last
                            and chart.index[k + 1].normalize() != chart.index[k].normalize())
@@ -403,26 +531,45 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
                     lines, typical, (geo, opposite) = set_up(k, BROKEN)
                 elif closing and (refresh or not any(len(v) for v in lines.values())):
                     lines, typical, (geo, opposite) = set_up(k, SESSION)
+        elif pos is None and bounce is not None:
+            # a bounce waits for its confirmation: this candle must close on the line's side too
+            side, i, touched, left = bounce
+            ax, ay, slope, _ = geo[side]
+            d = SIDES[side][1]
+            at = ay[i] + slope[i] * (x[k] - ax[i]) + d * shift * typical
+            if d * (y(c[k]) - at) < -zone[k]:     # back beyond the line: the bounce failed
+                bounce = None
+                lines, typical, (geo, opposite) = set_up(k, BROKEN)
+            elif left > 1:
+                bounce = (side, i, touched, left - 1)
+            else:                                 # confirmed: in at the next open
+                bounce = None
+                if k < last and not quiet[k + 1]:
+                    enter_at = (side, i, touched)
         elif pos is None:
             signals, broke = [], False
             for side in traded:
-                ax, ay, slope = geo[side]
+                ax, ay, slope, ready = geo[side]
                 if not len(ax):
                     continue
                 d = SIDES[side][1]
                 at = ay + slope * (x[k] - ax) + d * shift * typical
-                if (d * (y(c[k]) - at) < 0).any():
-                    broke = True
-                    continue
-                hit = d * (y(extreme[side][k]) - at) <= band * typical
+                early = k < ready                 # a watched ray not confirmed yet
+                if ((d * (y(c[k]) - at) < -zone[k]).any()
+                        or (early & (d * (y(extreme[side][k]) - at) < -wline[k])).any()):
+                    broke = True                  # a close beyond a line, or a reach through
+                    continue                      # a watched ray: draw the lines again
+                reach = zone[k] if banded else band * typical
+                hit = ((d * (y(extreme[side][k]) - at) <= reach) & (d * (y(c[k]) - at) >= 0)
+                       & ~early)                  # reached the line, closed on its side
                 if trend and not d * (c[k] - average[k]) > 0:    # against the trend (or unknown)
                     continue
-                if slot[k] < skip_open:                          # too early in the session
+                if slot[k] < skip_open or quiet[k]:     # too early or late in the session
                     continue
                 if hit.any():
                     i = int(np.argmax(np.where(hit, d * at, -np.inf)))
                     if reward:                    # room to the nearest line of the other kind
-                        risk = d * (y(c[k]) - at[i]) + room * typical
+                        risk = d * (y(c[k]) - at[i]) + room * typical + zone[k]
                         oax, oay, oslope = opposite[side]
                         ahead = d * (oay + oslope * (x[k] - oax) - y(c[k]))
                         ahead = ahead[ahead > 0]
@@ -432,8 +579,10 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
             closing = k < last and chart.index[k + 1].normalize() != chart.index[k].normalize()
             if broke:
                 lines, typical, (geo, opposite) = set_up(k, BROKEN)
-            elif len(signals) == 1 and k < last:
-                enter_at = signals[0]
+            elif len(signals) == 1 and hold:
+                bounce = (*signals[0], k, hold)   # wait for ``hold`` closes on its side
+            elif len(signals) == 1 and k < last and not quiet[k + 1]:
+                enter_at = (*signals[0], k)
             elif closing and (refresh or not any(len(v) for v in lines.values())):
                 lines, typical, (geo, opposite) = set_up(k, SESSION)
         if pos is not None:
@@ -441,26 +590,29 @@ def replay(daily: pd.DataFrame, minutes: pd.DataFrame, *, start, costs, tf: str 
             # fill (assumed: the worst case), but a target is not trusted before the next candle
             d, side, fresh = pos["d"], pos["side"], pos["fresh"] and pos["k"] == k
             at = pos["ay"] + pos["slope"] * (x[k] - pos["ax"])
-            if d * (y(extreme[side][k]) - pos["stop"]) <= 0:
+            free = not quiet[k]                   # an exit may happen on this candle
+            if free and d * (y(extreme[side][k]) - pos["stop"]) <= 0:
                 fill = price(pos["stop"])
                 if not fresh:                     # a gap past the stop fills at the open
                     fill = min(o[k], fill) if d > 0 else max(o[k], fill)
                 wallet, pos = leave(k, fill, "stop hit"), None
                 lines, typical, (geo, opposite) = set_up(k, STOPPED)
-            elif (pos["target"] is not None and not fresh
+            elif (free and pos["target"] is not None and not fresh
                   and d * (y(favour[side][k]) - pos["target"]) >= 0):
                 fill = price(pos["target"])               # a gap past it fills at the open
                 fill = max(o[k], fill) if d > 0 else min(o[k], fill)
                 wallet, pos = leave(k, fill, "target hit"), None
                 lines, typical, (geo, opposite) = set_up(k, TARGET)
-            elif d * (y(c[k]) - at) < -give * pos["typical"]:
+            elif free and close_why is None and d * (y(c[k]) - at) < -(
+                    zone[k] if banded else give * pos["typical"]):
                 close_why = CLOSED_BEYOND[side]
                 lines, typical, (geo, opposite) = set_up(k, CLOSED)
             else:
                 j = k - confirm                  # a swing, confirmed by `confirm` candles
                 ext = extreme[side]
                 if j >= pos["k"] and d * ext[j] <= (d * ext[max(j - confirm, 0):k + 1]).min():
-                    new = d * min(d * y(ext[j]), d * at) - d * room * pos["typical"]
+                    new = (d * min(d * y(ext[j]), d * at - zone[k])
+                           - d * room * pos["typical"])
                     if d * (new - pos["stop"]) > 0:
                         pos["stop"] = new
             if pos is not None:

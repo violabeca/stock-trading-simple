@@ -118,9 +118,23 @@ def backfill(
 
     Prints one ``prices SYM BAR: N bars`` line per symbol and a final
     ``prices: N rows written`` — the notebook helpers parse these.
+
+    Daily bars are checked for an adjustment splice first (engine proposal #52,
+    :func:`~trading_simple.db.adjustment_splice`): a yfinance refresh whose adjustment
+    basis no longer matches the stored rows re-downloads the symbol's whole stored span,
+    so it stays one series. An IBKR refresh that would put unadjusted bars onto adjusted
+    history is refused for that symbol (IBKR has no adjusted close).
     """
     from trading_simple.config import load_settings
-    from trading_simple.db import Security, make_engine, upsert_prices, upsert_securities
+    from trading_simple.db import (
+        SPLICE_TOL,
+        Security,
+        adjustment_splice,
+        make_engine,
+        stored_span,
+        upsert_prices,
+        upsert_securities,
+    )
 
     logging.basicConfig(level=logging.WARNING)
     settings = load_settings()
@@ -141,6 +155,12 @@ def backfill(
 
         def store(sym: str, bars: list) -> None:
             nonlocal total
+            step = adjustment_splice(engine, bars) if bar == "1d" else 0.0
+            if step > SPLICE_TOL:
+                typer.echo(f"prices {sym} {bar}: 0 bars (refused: unadjusted IBKR bars would "
+                           f"step the stored adjusted history by {step:.2%}; refresh {sym}'s "
+                           "daily bars with --provider yfinance)")
+                return
             total += upsert_prices(engine, bars) if bars else 0
             typer.echo(f"prices {sym} {bar}: {len(bars)} bars")
 
@@ -155,6 +175,14 @@ def backfill(
         for sym in syms:
             try:
                 bars = fetch_daily(sym, start, end, exchanges=settings.exchanges)
+                step = adjustment_splice(engine, bars)
+                span = stored_span(engine, sym) if step > SPLICE_TOL else None
+                if span:                    # one adjustment basis: re-download all of it
+                    first = min(start, span[0].date())
+                    last = max(end, span[1].date())
+                    typer.echo(f"prices {sym} {bar}: adjustment basis moved {step:.2%} "
+                               f"against the stored rows; re-downloading {first} -> {last}")
+                    bars = fetch_daily(sym, first, last, exchanges=settings.exchanges)
             except RuntimeError as exc:
                 typer.echo(f"prices {sym} {bar}: 0 bars ({exc})")
                 continue

@@ -44,6 +44,29 @@ The full rules are in the docstring of [topdown.py](topdown.py). In short:
    reaching onto the screen are redrawn on the precise candles, and the steeper lines only this
    chart can see are added. Lines that end left of the screen keep their higher-chart drawing,
    unless a candle on the screen goes through one.
+7. **Anchors on the line** (optional, yours, 2026-10-27; `on_line`, off in `topdown.py` and
+   `bounce.py`, on in the notebooks together with no poke allowance). Point B is the angle
+   candle, so both anchors are candle extremes exactly on the line. No candle crosses a line,
+   and every line starts exactly at the previous line's point B.
+   - **Why:** before, B was the latest candle within *close enough*, so it could sit off the
+     line. On NOW that was up to 0.25 typical candles with her defaults and 1 to 7 with #417's,
+     and a poke of 0.1 (0.6) typical candles was allowed.
+   - **On a lower chart:** a line taken over from a higher chart keeps its point B on the
+     lower chart's candle that holds the same price. It sits 0.01 to 0.08 typical candles off
+     the line, because that candle lies later in the higher chart's candle.
+   - **Short lines:** the strict rules draw more lines (122 against 84 on 12 NOW dates). Very
+     short ones stay rare (5 of 122 under 2 candles, mostly a 1-hour line from the January 2025
+     all-time high).
+8. **Anchor gap** (optional, yours, 2026-10-27; `gap`, off by default). A line drawn on the
+   trading chart counts only when its points A and B are at least *gap* of its candles apart.
+   A shorter one stays a pending ray, and the chain ends before it.
+
+Every line also records its `origin`: the chart it was first found on. A line a lower chart
+only adjusts (it still starts in the same candle) keeps it, while `tf` says where it was last
+drawn. Both notebooks style a line by its origin: blue upward (long), orange downward (short).
+Monthly and weekly lines are a deeper shade (monthly solid, weekly dash-dot), daily solid,
+4-hour long dashes, 1-hour short dashes, 15-minute dots. So a line looks the same in every
+chart, and a key sits at the top of the charts.
 
 Time runs on one trading-session clock on every chart (session *n* starts at *n*; nights,
 weekends and holidays take no room), so a line keeps one slope on every chart. A monthly candle
@@ -139,6 +162,23 @@ Judgment calls of the trade:
   candle only shows that the line held when it closes.
 - **The whole wallet in every trade.** Her example sizes by the dollars at risk (one contract,
   a $420 or $42 stop); here every trade is the same size, so a trade's R and its return differ.
+- **Which line is traded.** The line closest to price, which is always the last line of the
+  top-down chain, unless `min_span` skips it. Then price passes through it to an older line.
+  - **The last line's chart:** it is a 15-minute line whenever the 15-minute chart drew one.
+  - **On NOW** (#417 without its trend filter, checked 2026-10-27): 87% of longs and 86% of
+    shorts traded the closest line. 34 of the 38 exceptions were lines shorter than #417's
+    `min_span` (4.79 sessions between A and B). 28 of the 280 trades were on 1-hour, 4-hour,
+    daily or weekly lines.
+  - **With the two rules below and `min_span` 0:** 99% and 100% traded the closest 15-minute
+    line.
+
+Two knobs added on 2026-10-27 at your request, both off in `bounce.replay` (so earlier studies
+replay unchanged) and on in the regimes notebook:
+
+| Knob | Notebook | What it does |
+|---|---|---|
+| `own_lines` | on | trade only lines drawn on the trading chart; a side with no 15-minute line does not trade |
+| `anchor_gap` | 16 | a 15-minute line needs its points A and B at least this many 15-minute bars apart (16 = 4 hours). A shorter one is not a line yet: it stays a pending ray, and the chain ends before it, since the next line would start at its point B. Lines of the higher charts are not affected |
 
 ## The 21-stock study (2026-10-19): no edge
 
@@ -480,6 +520,281 @@ Trials: random 224, each TPE study 168–224, NSGA-II 168. Every study stopped a
 That holds over three windows and two tuning runs, with 2025 read once. 2025 is now read for
 these nine stocks.
 
+## The trades one by one, and when it pays (`regimes.py`, 2026-10-23)
+
+**The notebook** `tori_trades_trendline_regimes_marimo.py` replays one setting on one stock's
+whole 1-minute history, each side alone, and has two parts.
+
+**Three rules on top of every preset** (2026-10-27, all switchable, all on):
+- **Strict anchors** (`strict`: no poke allowance, `on_line`; see "How the lines are drawn",
+  rule 7).
+- **15-minute lines only** (`own_lines`).
+- **An anchor gap of 16 bars** (4 hours) for a 15-minute line (`anchor_gap`; see "The trade").
+
+On NOW (#417 without its trend filter, 15-minute lines only, gap 16), strict anchors changed
+the longs from 129 trades at −6.2 bp to 88 at +9.8 bp (+8.6% compounded), and the shorts from
+120 at −18.4 bp to 90 at −36.2 bp. That is one stock and one window, with knobs tuned under the
+old rules: not evidence either way.
+
+**Part 1, the trades** (your request, 2026-10-27):
+- **§1 The trade log.** Every long and every short trade, ranked by return after costs and
+  split into profit fifths. Each row carries the line it bounced off (the chart it was drawn
+  on, its points A and B) and the setup: when the lines were drawn, why, and how many upward and
+  downward lines stood then (`regimes.trade_log`).
+- **Picking trades.** The best 5 of each side are picked; the number, the order (best or worst
+  first) and the picks can be changed in the tables.
+- **Download.** Every line at every trade's setup is one table (`regimes.lines_log`).
+- **§2 The picked trades, two charts each.**
+  - **The big picture (top, 2026-10-27).** Daily candles from 120 sessions before the entry (a
+    slider), with every line that stood at the setup. Each line is drawn in the style of the
+    chart of the top-down walk it came from, heavier the higher the chart: monthly to daily
+    solid, 4-hour dashed, 1-hour dash-dotted, 15-minute dotted. The traded line is bold, and the
+    detailed chart's window is shaded. A line of text counts the lines per chart.
+  - **The detail (below).** The 15-minute candles from the point A of the line the trade
+    bounced off, or from a few sessions before the entry if that is earlier, to a few sessions
+    after the exit (sliders, 3 and 2 by default). Only that line's anchors are marked. An
+    anchor before the 15-minute history starts cannot be shown: the chart then starts at the
+    line's next anchor, and the text under the trade says so. On NOW the window runs from
+    about 150 to 5,000 candles. The chart draws every line that stood at the setup, upward and
+    downward, the traded line's anchors (◆ A, ★ the candle that stopped the ray, ◇ B), the
+    entry gap, the traded line, the moment the lines were drawn, the entry, the stop at every
+    close and the exit, and tells the trade in words.
+- **Legends** sit under every chart in two columns. The figure grows with the legend's rows, so
+  the legend never covers the axis labels.
+
+**Part 2, profitable time ranges** (§3–§6), below.
+
+**The question** (yours, 2026-10-23): instead of a setting that pays on average, can a
+measurable sign tell, better than luck, that a stock is moving into a stretch where the bounce
+pays? Step one, in `tori_trades_trendline_regimes_marimo.py`: find every time range where one
+fixed, somewhat promising setting made money, long and short, and show the ranges with the
+setting. NOW comes first.
+
+**The setting** is a preset, with every knob and its meaning shown in the notebook:
+- **Default: #417 without its trend filter.** It was the one setting that held from Jan–Jul to
+  Aug–Sep 2026 on a real sample, then lost in 2025.
+- **Why the trend filter is off:** a trend filter is itself a regime metric, a candidate for
+  the next step, not something to build into the labels. On NOW it leaves the longs no trade
+  after November 2025. Without it the random trials did no worse.
+- **Other presets:**
+  - #417 as tuned;
+  - v1's #139, where her lines beat moved lines;
+  - her defaults.
+
+**How a range is found:**
+- **Each side is replayed alone** over the stock's whole 1-minute history (NOW: from
+  2024-12-26). In one wallet, a short holding the money would hide a long stretch.
+- **A side's record** is its return after costs, compounded trade by trade. A zigzag cuts it
+  into legs: a rising leg ends once the record falls by the *reversal* (default 2%) from its
+  high, a falling leg once it rises by the reversal from its low.
+- **A profitable range** is a rising leg of at least *min trades* (default 3), from its first
+  entry to its last exit.
+- **Every leg is listed**, with the stock's own move over it. Losing legs are the contrast the
+  next step needs.
+- **The ranges are hindsight labels:** the target. A metric that is to predict them must be
+  read before a range starts.
+
+**Luck test.** Every record rises some of the time, so a range alone proves nothing.
+- **The draws:** keep every trade's size and time and deal its wins and losses out again
+  2,000 times (the signs shuffled).
+- **What it reads:** persistence. That is the correlation of a trade with the next one and
+  with the average of the five before it, and the number of win/loss streaks.
+- **Why not the zigzag's own numbers:** they make a poor test. Ten wins then ten losses spend
+  no more trades in profitable ranges than 40% of random deals do, because any record rises
+  about half the time.
+
+**First read, NOW** (#417 without its trend filter, 2024-12-27 to 2026-10-16, a 2% reversal,
+3 trades). Over the window, buy-and-hold lost 35%.
+
+| Side | Trades | Won | Net per trade | Compounded | Profitable ranges | Trades inside them |
+|---|---|---|---|---|---|---|
+| Long | 147 | 43% | −5.2 bp | −8% | 5 | 59 (40%) |
+| Short | 130 | 41% | −19.6 bp | −23% | 6 | 41 (32%) |
+
+- **The largest ranges:**
+  - **L6:** Nov 2025 to Mar 2026, 22 trades, 17 won, +12.5%, while the stock fell 32%.
+  - **L10:** Jul to Sep 2026, 14 trades, +7.0%, while the stock rose 44%.
+  - **S12:** May to Jun 2026, 11 trades, +5.8%.
+- **The worst leg:** S13, Jul to Aug 2026, −18% while the stock rallied 33%.
+- **The long ranges came in a falling and in a rising market.** The stock's direction over a
+  range does not sort them.
+- **No clustering on either side.** The luck test's chance by luck is 0.10 to 0.46 for every
+  statistic: a trade's result says nothing about the next one's. On NOW the strategy's own
+  recent record cannot announce a range, so a predictor would have to come from the market.
+- **Other presets on NOW:**
+  - **v1 #139:** long 74 trades, −18.8 bp; short 72 trades, −1.6 bp.
+  - **#417 as tuned (trend filter on):** the longs make no trade after November 2025, and
+    the shorts none before April 2025.
+
+## The lines at one moment, one line per chart (`tori_trades_trendline_topdown_marimo.py`, 2026-10-27)
+
+You asked to step back and check how the lines are drawn and how a setup is made. Then you
+specified the method: per side, **one line per chart**, top-down
+(`topdown.cascade`):
+
+1. **Daily.** One upward and one downward line, from the extreme of the daily candles in view
+   (a slider, 150 by default): the lowest low for the upward line, the highest high for the
+   downward one.
+2. **4-hour, 1-hour, 15-minute.** Each line starts at the point B of the line above it, moved
+   onto this chart's candle that holds the same price.
+3. **Every line** is the steepest ray from its point A that no candle of its chart crosses.
+   Its point B is the candle that stops it (the angle candle), so both anchors are candle
+   extremes on the line.
+4. **Not a line yet.** A line whose angle candle is among the newest *confirm* candles is a
+   pending ray. So is a line shorter than its chart's minimum, counted in that chart's candles
+   between A and B. The defaults are daily 5, 4-hour 4, 1-hour 4 and 15-minute 16 (the last
+   two are 4 hours each). The charts below a pending ray draw nothing.
+   - **Why a minimum on every line:** 29% of the 4-hour lines and 18% of the 15-minute lines on
+     NOW (80 closes) spanned one candle.
+   - **Why stop rather than skip:** skipping a short line and drawing on from its B found a line
+     on few more charts (22 against 20 fifteen-minute lines in 160 cases). It also loses the
+     exact start on the line above.
+5. **The setup.** A side trades only when its 15-minute line exists.
+
+**Why the full walk drew several lines per chart.** In her videos she draws as many lines as
+she can on every chart until she reaches today's price. The full walk (`topdown.top_down`) does
+the same.
+
+**The trade replay.**
+- **The switch:** `bounce.replay(method="cascade", minimum=...)` trades the cascade; the
+  default stays `"walk"`, so earlier studies replay unchanged.
+- **The trading notebook** uses the cascade by default, with the minimum sliders (its
+  15-minute minimum is the anchor gap).
+- **It trades rarely:** its single 15-minute line is often far from price. On NOW (Dec 2024 to
+  Oct 2026):
+  - with #417's knobs: 4 longs and 14 shorts;
+  - with #417's own `min_span` (4.79 sessions) off: 13 and 30;
+  - with `confirm` 2 as well: 21 longs at −2.3 bp a trade and 34 shorts at +30.8 bp.
+
+  That is one stock, a falling one, so it is no evidence.
+
+**The notebook.** It takes a stock, a date and a time of day (on the 15-minute grid, the close
+by default). It cuts the charts exactly as the trade replay does (`Chartbook.at`; the higher
+charts' last candle may still be forming).
+
+- **Section 1** names the 15-minute line each side would trade, or where the chain stopped.
+  It also gives the line's distance to the last close, and every line of each side in a table.
+- **Section 2** draws the daily, 4-hour, 1-hour and 15-minute charts. Each shows its own line
+  and the lines above it. Each lower chart starts just before the point A of its line, so both
+  anchors are in view.
+
+**Line styles** are the same in every chart:
+- **Color:** blue upward (long), orange downward (short).
+- **Daily:** solid.
+- **4-hour:** long dashes.
+- **1-hour:** short dashes.
+- **15-minute:** dots.
+- **Pending ray:** thin dash-dot.
+- **The traded line:** tinted.
+
+**First reads on NOW:**
+- **2026-10-23 close:**
+  - long: the 15-minute line from 29 Sep through 16 Oct;
+  - no short: the highest high in view is the newest candle.
+- **2026-03-31:** no long (the 15-minute line is pending); the short's 15-minute line runs from
+  9 Mar to 19 Mar.
+- **Very short lines are possible:** a 1-day daily line from the 11 Dec high to the 12 Dec
+  high, 7 cents lower, and a 4-hour line one candle long.
+
+**Section 3, walk forward** (2026-10-27). It trades these lines over the stock's whole
+1-minute history: `bounce.replay(method="cascade")`, each side alone, with the line settings of
+sections 1–2 (no #417 knobs: `min_span` 0).
+- **The trade:** her rules by default: a candle comes to the 15-minute line and closes on its
+  side, in at the next open; the stop is 0.5 typical candles beyond the line and follows each
+  swing; out on the stop or a close beyond the line; no target. Entry, entry gap, stop room
+  and a target in R are sliders.
+- **What it shows:** each side's result, every trade in a table, and the top *N* (5) trades of
+  each side on the 15-minute chart. Each chart has the lines that stood at the setup, the
+  traded line tinted with its anchors, the entry, the stop at every close and the exit.
+- **First read, NOW** (2024-12-27 to 2026-10-23; buy-and-hold −27%):
+  - **longs:** 8 trades, 12% won, −26 bp a trade;
+  - **shorts:** 16 trades, 44% won, +213 bp a trade (+37% compounded). They are a few trades
+    riding NOW's fall along their line, such as 26 Jan to 26 Feb 2026.
+
+  That is one falling stock, few trades and lines judged on that same stock: no evidence yet.
+
+**When the walk forward redraws the lines** (2026-10-27): never after every candle.
+- **While waiting:** when a candle breaks the 15-minute line without giving a signal (it
+  closes beyond it), and at every session's close.
+- **In a trade:** never; the trade keeps its line, and the lines are redrawn when it ends.
+
+**Watch** (`bounce.replay(watch=True)`, on in the walk forward). After a break, the new
+15-minute line is usually still pending, because the breaking candle is its own angle candle.
+Before, the side then waited for the session's close; on NOW it did after all 16 breaks.
+- **What watch does:** it keeps that pending line. The line trades once *confirm* candles have
+  followed its angle candle. A candle reaching through it before then counts as a break.
+- **On NOW** (her trade rules): longs went from 10 trades to 32 (+29 bp a trade), shorts from 16
+  to 36 (+90 bp). About two thirds of them are on a watched line (one stock, no evidence).
+
+**Bounce confirmation** (`bounce.replay(hold=N)`, next-open entries, 0 by default; a slider in
+the walk forward):
+- **The rule:** after the bounce candle, the next N candles must close on the line's side, and
+  the entry is at the open after the last of them. A close beyond the line among them means the
+  bounce failed: no trade, and the lines are drawn again.
+- **Your example, 10 Aug 2026 (NOW):** the 10:15 candle poked 0.11 below the line and closed
+  above it. Every one of the next 16 candles also closed above this steep line, until 14:15.
+  So with N = 1 or 2 it still trades, only later: in at 10:45 (125.79) or 11:00 (125.78)
+  instead of 10:30 (124.93).
+- **On NOW** (watch on): with N = 1, longs went from 32 trades at +29 bp to 15 at +73 bp, and
+  shorts from 36 at +90 bp to 25 at +95 bp. With N = 2: 13 longs at +80 bp, 23 shorts at
+  +85 bp (one stock).
+
+**Session-edge knobs** (2026-10-27, both off by default; counted in 15-minute candles from a
+session's open and close, a half-day closing at 13:00):
+- **Drawing, (x1, y1):** the 15-minute line leaves out the first x1 and last y1 candles of
+  every session (`topdown.cascade`'s `trim`, `bounce.replay`'s `draw_trim`). They can neither
+  stop it nor be its point B, so a spike there may poke through it. Its point A still comes
+  from the 1-hour line's B, even inside a left-out candle. Starting on the nearest candle left
+  in instead moved NOW's 2026-10-05 downward line from 139.57 to about 136.85, nearly flat and
+  off the line above. The 15-minute chart shows the left-out candles faded.
+- **Trading, (x2, y2):** no position is opened or closed on the first x2 or last y2 candles of
+  a session (`bounce.replay`'s `trade_trim`): no signal, no fill, no stop or target fill, and
+  no exit on a close beyond the line. A stop crossed then fills on the first candle after them
+  (at its open when price is already past it). The stop still trails on them. The trade charts
+  show those candles faded.
+- **On NOW, with both at 2 and 2:** longs went from 8 trades at −26 bp to 8 at −38 bp; shorts
+  from 16 at +213 bp to 10 at +20 bp (one stock).
+- **Highlights** (purple, your request) mark the candles a rule kept from mattering:
+  - **the 15-minute chart:** a left-out candle whose low (high) reaches or crosses a
+    15-minute line right of its point A. It would have stopped that line.
+  - **the trade charts:** a no-trade candle where a signal would have opened the trade, or
+    where the stop or a close beyond the line would have ended it.
+
+**Noise bands** (2026-10-27, your proposal request; off by default, a switch in the notebook).
+The lines were razor sharp: a candle 1 cent through a line stopped it, and a low 1 cent short of
+the entry gap was no signal. With bands on, every line and the price get a width sized by the
+stock's own noise:
+- **The noise** of a chart is the moving average of its candles' true range over the last *L*
+  candles (`topdown.noise`; the noise window, 150 by default). It is recomputed at every candle
+  of every chart, so the bands widen in a wild market and narrow in a quiet one.
+- **Line band** (*k_line*, 0.25 by default). A line is a band of ± *k_line* × its chart's noise
+  (`topdown.cascade(band=...)`, `bounce.replay(line_band=...)`). A candle may reach into the
+  band without stopping the line. Point B is the latest candle inside the band, not the one
+  that would have stopped an exact line.
+- **Price band** (*k_price*, 0.25 by default). The price's own uncertainty. With the line band
+  it makes the **contact zone** around the traded 15-minute line: ± (*k_line* + *k_price*) ×
+  the 15-minute noise as known at each candle's open (`bounce.replay(price_band=...)`).
+- **Signal:** a candle reaches into the zone and closes on the line's side. The zone replaces
+  the entry gap; a limit order rests at the zone's edge.
+- **Break:** a close beyond the zone. A close inside the zone but beyond the line is noise: no
+  signal and no break. A trade exits on a close beyond the zone, too.
+- **Stop:** the stop room beyond the zone, and the trailing stop keeps the zone's distance from
+  the line.
+- **The notebook** draws every confirmed line with its band (a translucent strip whose width
+  follows the noise) and the contact zone around the traded line (dotted edges), in section 2
+  and in the trade charts.
+- **First read, NOW** (defaults: watch on, no bounce confirmation, no trims, bands 0.25 and
+  0.25 on 150 candles): longs went from 32 trades at +29 bp to 30 at +8 bp (+1% compounded);
+  shorts from 36 at +90 bp to 49 at +51 bp (+25%). One stock, so no evidence.
+
+**Settings first** (2026-10-27, your request). Every knob sits at the top of the notebook, one
+per row with what it does beside it: the stock, the moment, the lines, the noise bands and the
+trade. Only the stock comes before the candles load, because the date picker needs to know the
+stored days.
+
+The first visual notebook (`tori_trades_trendline_marimo.py`) is left as it was: her full walk
+at a date's close, in tabs.
+
 ## Files
 
 | File | What |
@@ -490,8 +805,12 @@ these nine stocks.
 | `optimize.py` | every knob tuned on 11 stocks at once: 11 studies, held-out validation, fANOVA |
 | `groups_test.py` | 200 stocks in 10 price-character groups: her lines against moved lines |
 | `tune.py` | nine stocks, 15-minute, normalized knobs, trap-derived metrics, validation on Aug–Sep 2026, a one-shot 2025 check |
+| `regimes.py` | one setting's profitable time ranges on one stock, long and short: presets, the zigzag, the luck test |
 | `tori_trades_trendline_marimo.py` | the visual notebook (the lines) |
 | `tori_trades_trendline_trading_marimo.py` | the trading notebook |
+| `tori_trades_trendline_topdown_marimo.py` | one line per chart at a chosen moment (`topdown.cascade`): daily, 4-hour, 1-hour and 15-minute, both sides, and the setup a long and a short would trade |
+| `tori_trades_trendline_regimes_marimo.py` | every trade logged with its lines, ranked by profit; the picked trades in context; profitable ranges |
 | `IDEAS.md` | parked ideas |
 | `tests/test_tori_trades_trendline.py` | the lines on hand-made candles (no database) |
 | `tests/test_tori_trades_trendline_bounce.py` | the trade on hand-made candles: look-ahead, rules, the mirror |
+| `tests/test_tori_trades_trendline_regimes.py` | the zigzag, the legs, the luck test, the cached replay |
